@@ -12,7 +12,6 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/text v0.31.0
-	gosimview/kn5conv v0.0.0-00010101000000-000000000000
 )
 
 require (

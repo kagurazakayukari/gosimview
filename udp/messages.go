@@ -1,4 +1,4 @@
-// This file is part of SimView Extension
+// This file is part of GoSimView
 // Copyright (C) 2026 KagurazakaYukari
 //
 // This program is dual-licensed under the GNU Affero General Public License v3.0

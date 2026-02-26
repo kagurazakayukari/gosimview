@@ -84,7 +84,7 @@ SimView-Manual.pdf
 
 # 忽略第三方库目录
 ac-server-udp-client-0.0.8/
-asetto-corsa-server-udp2ws-master/
+assetto-corsa-server-udp2ws-master/
 
 # 忽略脚本文件
 commit.ps1

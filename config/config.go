@@ -1,4 +1,4 @@
-// This file is part of SimView Extension
+// This file is part of GoSimView
 // Copyright (C) 2026 KagurazakaYukari
 //
 // This program is dual-licensed under the GNU Affero General Public License v3.0
@@ -291,5 +291,14 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	// 映射覆盖配置
 	config.Overrides.CarClass = getMapStringValue(config.Overrides.RawConfig, "car.class")
 	config.Overrides.UserCountry = getMapStringValue(config.Overrides.RawConfig, "user.country")
+
+	// 初始化空映射，避免nil指针错误
+	if config.Overrides.CarClass == nil {
+		config.Overrides.CarClass = make(map[string]string)
+	}
+	if config.Overrides.UserCountry == nil {
+		config.Overrides.UserCountry = make(map[string]string)
+	}
+
 	return config, nil
 }

@@ -1,54 +1,60 @@
 # GoSimView
 
-## Overview
+A complete reverse-engineered rewrite of SimView in Go, providing data processing, analysis, and visualization for Assetto Corsa racing simulator.
 
-GoSimView is a complete reverse-engineered rewrite of SimView in Go programming language. It provides a comprehensive solution for Assetto Corsa racing simulator data processing, analysis, and visualization.
+### Motivation
+Created initially out of frustration with naming conflicts between User and Team in team events, this project evolved into a complete rewrite due to sudden interest in the codebase and because the original author became unresponsive. 
 
-## Prerequisites
+## Quick Start
 
-- Go 1.25 or later
+### Prerequisites
+- Go 1.25+
 - MySQL database
 - Assetto Corsa game server
 
-## Usage
+### Installation
+1. Clone this repository
+2. Install dependencies: `go mod download`
+3. Obtain required external files (see below)
+4. Configure: Edit `config/config.toml`
+5. Run: `go run http/http_main.go` (for HTTP server) and `go run writer/writer_main.go` (for UDP data processing)
 
-### Configuration
+### Required External Files
 
-The application uses a TOML configuration file (`config/config.toml`) to manage various settings including database connection, server ports, and UDP settings.
+GoSimView requires additional files from the original SimView package to function properly. These files are not included in this repository for legal reasons.
 
-### API Endpoints
+#### How to Obtain
+1. Download the original SimView package from: [https://www.overtake.gg/downloads/simview.35249/](https://www.overtake.gg/downloads/simview.35249/)
+2. Extract the package contents
+3. Copy the following files to your GoSimView installation:
+   - `config/` (configuration file)
+   - `html/` directory (web UI files)
+   - `data/` directory (database schema)
 
-GoSimView provides a comprehensive RESTful API for accessing race data. Detailed API documentation will be available in the future.
+#### Database Setup
+1. Create a MySQL database
+2. Import the SQL schema from the original SimView package
+3. Update `config/config.toml` with your database credentials
 
 ## License
 
-GoSimView is dual-licensed under:
+GoSimView is dual-licensed:
 
-1. **GNU Affero General Public License v3.0 (AGPLv3)**
-   - For open-source use
-   - Source code must be made available when used over a network
-   - See LICENSE.md for details
+1. **AGPLv3** - For open-source use. Source code must be made available when used over a network.
+2. **Commercial License** - For proprietary use. No open-source requirements. Contact Kagurazakayukari for details.
 
-2. **Commercial License**
-   - For proprietary use cases
-   - No requirement to open-source modifications
-   - Additional support and maintenance options
-   - Contact Kagurazakayukari for licensing details
+See LICENSE.md for full license information.
 
 ## Disclaimer
 
-GoSimView is an independent project and is not affiliated with or endorsed by the original SimView developers or Kunos Simulazioni. This project is a reverse-engineered implementation based on publicly available information.
-
-The original SimView software can be obtained from [https://www.overtake.gg/downloads/simview.35249/](https://www.overtake.gg/downloads/simview.35249/). The original version provides the necessary HTML, TOML, and SQL files required for operation. Users are responsible for obtaining these files from official sources.
+GoSimView is an independent project not affiliated with the original SimView developers or Kunos Simulazioni. It's a reverse-engineered implementation based on publicly available information.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
+Contributions are welcome! Submit issues, feature requests, or pull requests.
 
 ## Contact
 
-For commercial licensing inquiries or support, please contact Kagurazakayukari.
-
----
+For commercial licensing or support: Kagurazakayukari
 
 © 2026 Kagurazakayukari. All rights reserved.
