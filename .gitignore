@@ -1,0 +1,83 @@
+# 忽略日志文件
+logs/
+
+# 忽略二进制文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 忽略config目录中的配置文件
+config/*.toml
+
+# 包含data目录
+!data/
+
+# 包含go.mod和go.sum
+!go.mod
+!go.sum
+
+# 忽略SQL文件
+*.sql
+
+# 忽略临时文件
+*.tmp
+*.temp
+
+# 忽略IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 忽略压缩文件
+*.tar.gz
+*.tar.bz2
+*.gz
+
+# 忽略前端资源
+html/
+
+# 忽略缓存文件
+simviewcache/
+
+# 忽略AI模型文件
+*.ai
+
+# 忽略Lua脚本
+trackDetails.lua
+
+# 忽略JSON数据文件（除了必要的配置）
+*.json
+*.txt
+
+# 忽略可执行文件
+SimViewHttp.exe
+SimViewTool.exe
+SimViewWriter.exe
+simview-backend.exe
+
+# 忽略压缩包
+*.zip
+
+# 忽略kn5-obj-converter
+kn5-obj-converter-main/
+
+# 忽略replay目录
+udp/replay/
+
+# 忽略其他不需要的文件
+58688
+COPYING
+SimView-Manual.pdf
+
+# 包含udp目录
+!udp/
+
+# 包含http目录
+!http/
+
+# 忽略.trae目录
+.trae/
