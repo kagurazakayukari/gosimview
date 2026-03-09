@@ -32,6 +32,7 @@ func calculateMaxSpeed(laps []udp.CarUpdate) float64 {
 
 // generateLapTelemetry 创建符合LapTelemetry格式的二进制文件
 func generateLapTelemetry(carID int, trackLength int32, telemetryData []udp.CarUpdate) ([]byte, error) {
+	fmt.Printf("生成车辆 %d 的遥测数据，赛道长度: %d\n", carID, trackLength)
 	// 使用内存缓冲区替代文件存储
 	var buffer bytes.Buffer
 

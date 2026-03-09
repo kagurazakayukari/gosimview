@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -250,7 +251,7 @@ func (w *DBWriter) tableExists(tableName string) bool {
 // UpdateSessionStint 更新SessionStint记录
 func (w *DBWriter) UpdateSessionStint(ss *SessionStint) (int64, error) {
 	query := "UPDATE session_stint SET end_time = ? WHERE session_stint_id = ?"
-	result, err := w.DB.Exec(query, ss.EndTime, ss.SessionStintID)
+	result, err := w.DB.Exec(query, ss.FinishedAt, ss.ID)
 	if err != nil {
 		return 0, fmt.Errorf("更新SessionStint失败: %v", err)
 	}
@@ -325,24 +326,246 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 
 // LoadEntryList 加载参赛列表
 func (w *DBWriter) LoadEntryList(gamePath string) error {
-	entryListPath := filepath.Join(gamePath, "entry_list.ini")
-	if _, err := os.Stat(entryListPath); os.IsNotExist(err) {
-		return fmt.Errorf("entry_list.ini文件不存在: %s", entryListPath)
-	}
-
-	cfg, err := ini.Load(entryListPath)
+	entryListPath := filepath.Join(gamePath, "cfg", "entry_list.ini")
+	// 加载INI文件
+	entrylist, err := ini.Load(entryListPath)
 	if err != nil {
-		return fmt.Errorf("加载entry_list.ini失败: %v", err)
+		fatalLogger.Fatalf("无法加载entry_list.ini: %v", err)
 	}
 
-	// 处理条目列表
-	for _, section := range cfg.Sections() {
+	carSections := make([]*ini.Section, 0)
+	for _, section := range entrylist.Sections() {
 		if strings.HasPrefix(section.Name(), "CAR_") {
-			// 处理车辆配置
-			// 可以在这里添加车辆配置到全局列表或进行其他处理
+			carSections = append(carSections, section)
 		}
 	}
 
+	if len(carSections) == 0 {
+		fatalLogger.Fatalf("entry_list.ini缺少[CAR_*]部分")
+	}
+
+	// 检查CAR_节索引连续性
+	indices := make([]int, len(carSections))
+	for i, section := range carSections {
+		name := section.Name()
+		indexStr := strings.TrimPrefix(name, "CAR_")
+		index, err := strconv.Atoi(indexStr)
+		if err != nil {
+			fatalLogger.Fatalf("无效的CAR_节名称: %s", name)
+		}
+		indices[i] = index
+	}
+	sort.Ints(indices)
+	for i := 1; i < len(indices); i++ {
+		if indices[i] != indices[i-1]+1 {
+			fatalLogger.Fatalf("CAR_节索引不连续: 找到 %d 和 %d", indices[i-1], indices[i])
+		}
+	}
+
+	// 验证每个CAR节
+	for i := 0; i < len(carSections); i++ {
+		section := carSections[i]
+		driver := EntryListDriver{
+			Name:       section.Key("DRIVERNAME").MustString("test"),
+			Team:       section.Key("TEAM").MustString(""),
+			Car:        section.Key("MODEL").MustString(""),
+			Number:     "",
+			Skin:       section.Key("SKIN").MustString(""),
+			Ballast:    section.Key("BALLAST").MustInt(0),
+			Restrictor: section.Key("RESTRICTOR").MustInt(0),
+			GUID:       section.Key("GUID").MustString(""),
+		}
+
+		// 验证必填字段
+		if !cfg.ACServer.Event.Team.Enable && driver.Name == "" {
+			fatalLogger.Fatalf("%s缺少DRIVERNAME字段", section.Name())
+		}
+		if driver.Car == "" {
+			fatalLogger.Fatalf("%s缺少MODEL字段", section.Name())
+		}
+		if driver.Ballast < 0 {
+			fatalLogger.Fatalf("%s BALLAST不能为负数", section.Name())
+		}
+		if driver.Restrictor < 0 {
+			fatalLogger.Fatalf("%s RESTRICTOR不能为负数", section.Name())
+		}
+
+		config := &Car{
+			Name: driver.Car,
+		}
+		if globalCars == nil {
+			globalCars = make(map[int]*Car)
+		}
+		carID, err := w.FindOrCreateCarID(config)
+		if err == nil {
+			globalCars[carID] = config
+		}
+		if err != nil {
+			fatalLogger.Fatalf("获取CarID失败: %v", err)
+		}
+		config.ID = carID
+		// 获取完整的车辆信息
+		if w.SimulateSQL {
+			row := w.DB.QueryRow("SELECT display_name, manufacturer, car_class FROM car WHERE car_id = ?", 1)
+			if err := row.Scan(&config.DisplayName, &config.Manufacturer, &config.CarClass); err != nil {
+				fatalLogger.Fatalf("模拟SQL模式下获取车辆详细信息失败: %v", err)
+			}
+		} else {
+			row := w.DB.QueryRow("SELECT display_name, manufacturer, car_class FROM car WHERE car_id = ?", carID)
+			if err := row.Scan(&config.DisplayName, &config.Manufacturer, &config.CarClass); err != nil {
+				fatalLogger.Fatalf("警告: 获取车辆 %s 详细信息失败: %v", driver.Car, err)
+			}
+		}
+		globalCars[carID] = config
+		if err != nil {
+			fatalLogger.Fatalf("获取CarID失败: %v", err)
+		}
+		// Process user data if GUID is present
+		var userIDs []int
+		var userInserted = false
+
+		if driver.GUID != "" {
+			// 分割GUID列表
+			guids := strings.Split(driver.GUID, ";")
+			if len(guids) < 2 && cfg.ACServer.Event.Team.Enable {
+				fatalLogger.Fatalf("车队成员需要至少2个有效的GUID，当前只找到%d个", len(guids))
+			}
+			for _, guid := range guids {
+				guid = strings.TrimSpace(guid)
+				if guid != "" && driver.Name != "" && len(guid) == 17 && strings.HasPrefix(guid, "7656") {
+					steam64ID, err := strconv.ParseInt(guid, 10, 64)
+					if err != nil {
+						fatalLogger.Fatalf("无效的GUID %s: %v", guid, err)
+					}
+					user := &User{
+						Steam64ID: steam64ID,
+						Name:      driver.Name,
+					}
+					userID, newUser, err := w.FindOrCreateUser(user)
+					if err != nil {
+						fatalLogger.Fatalf("创建/查询用户 %s 失败: %v", driver.Name, err)
+					}
+					if newUser {
+						logger.Printf("新用户 %s (ID: %d)", driver.Name, userID)
+					}
+					userIDs = append(userIDs, userID)
+					userInserted = true
+				}
+			}
+		}
+
+		if cfg.ACServer.Event.Team.Enable && driver.Team == "" {
+			fatalLogger.Fatalf("%s缺少TEAM字段", section.Name())
+		}
+
+		if driver.Skin == "" {
+			fatalLogger.Fatalf("%s缺少SKIN字段", section.Name())
+		}
+		// 团队事件处理
+		if cfg.ACServer.Event.Team.Enable && driver.GUID != "" {
+			// 先定义并赋值teamName和teamNo变量
+			var teamName string
+			if cfg.ACServer.Event.Team.UseNumber {
+				parts := strings.Split(driver.Team, "|")
+				if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+					teamName = parts[1]
+				} else {
+					fatalLogger.Fatalf("无效的车队格式 %s: %s. 预期 'no.|Team Name'", driver.Name, driver.Team)
+				}
+			} else {
+				teamName = driver.Team
+			}
+
+			teamNo, err := strconv.Atoi(driver.Number)
+			if err != nil {
+				fatalLogger.Fatalf("车队车号转换失败: %v", err)
+			}
+			if teamNo <= 0 {
+				fatalLogger.Fatalf("%s NUMBER字段必须是正整数: %s", section.Name(), driver.Number)
+			}
+
+			// 创建团队
+			team := &Team{
+				Name:       teamName,
+				TeamNo:     teamNo,
+				EventID:    globalEvent.ID,
+				CarID:      carID,
+				LiveryName: driver.Skin,
+				Active:     1,
+				CreatedAt:  time.Now().UTC(),
+			}
+			teamID, err := w.FindOrCreateTeam(team)
+			if err == nil {
+				globalTeams[teamID] = team
+			}
+			if err != nil {
+				fatalLogger.Fatalf("创建车队 '%s' 失败: %v", teamName, err)
+			}
+
+			// 获取现有团队成员
+			existingUserIDs := make(map[int]bool)
+			rows, err := w.DB.Query("SELECT user_id FROM team_member WHERE team_id = ?", teamID)
+			if err != nil {
+				fatalLogger.Fatalf("查询团队成员失败: %v", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var userID int
+				if err := rows.Scan(&userID); err != nil {
+					fatalLogger.Fatalf("扫描团队成员失败: %v", err)
+				}
+				existingUserIDs[userID] = true
+			}
+
+			// 将不在新列表中的成员标记为非活动
+			if len(existingUserIDs) > 0 {
+				for uid := range existingUserIDs {
+					found := false
+					for _, newUID := range userIDs {
+						if uid == newUID {
+							found = true
+							break
+						}
+					}
+					if !found {
+						_, err := w.DB.Exec("UPDATE team_member SET active = 0 WHERE team_id = ? AND user_id = ?", teamID, uid)
+						if err != nil {
+							fatalLogger.Fatalf("更新成员状态失败: %v", err)
+						}
+					}
+				}
+			}
+
+			// 创建或更新团队成员
+			if userInserted && len(userIDs) > 0 {
+				for _, userID := range userIDs {
+					teamMember := &TeamMember{
+						TeamID:    teamID,
+						UserID:    userID,
+						Role:      "",
+						Active:    1,
+						CreatedAt: time.Now().UTC(),
+					}
+					memberID, err := w.FindOrCreateTeamMember(teamMember)
+					if err != nil {
+						fatalLogger.Fatalf("创建团队成员失败: %v", err)
+					}
+					teamMember.ID = memberID
+					globalTeamMembers[teamMember.ID] = teamMember
+				}
+			}
+		}
+		entryListMutex.Lock()
+		if len(globalEntryList) <= i {
+			globalEntryList = make(map[int]EntryListDriver)
+			for j := 0; j <= i; j++ {
+				globalEntryList[j] = EntryListDriver{}
+			}
+		}
+		globalEntryList[i] = driver
+		entryListMutex.Unlock()
+	}
+	logger.Println("entry_list.ini文件验证成功")
 	return nil
 }
 
@@ -390,7 +613,7 @@ func (w *DBWriter) CreateSession(session *Session) (int64, error) {
 func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 	query := `INSERT INTO session_stint (session_id, team_member_id, user_id, car_id, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?)`
 
-	result, err := w.executeSQL(query, stint.SessionID, stint.TeamMemberID, stint.UserID, stint.CarID, stint.StartTime, stint.EndTime)
+	result, err := w.executeSQL(query, stint.SessionID, stint.TeamMemberID, stint.UserID, stint.CarID, stint.StartedAt, stint.FinishedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -400,10 +623,10 @@ func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		stint.SessionStintID = stintID
+		stint.ID = int(stintID)
 	}
 
-	return stint.SessionStintID, nil
+	return int64(stint.ID), nil
 }
 
 // CreateStintLap 创建StintLap
@@ -420,10 +643,10 @@ func (w *DBWriter) CreateStintLap(lap *StintLap) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		lap.StintLapID = lapID
+		lap.ID = int(lapID)
 	}
 
-	return lap.StintLapID, nil
+	return int64(lap.ID), nil
 }
 
 // CreateLapTelemetry 创建LapTelemetry
@@ -533,4 +756,333 @@ func (w *DBWriter) UpdateSessionFinishTime(sessionID int64, finishTime time.Time
 	query := "UPDATE session SET finish_time = ?, is_finished = 1 WHERE session_id = ?"
 	_, err := w.executeSQL(query, finishTime, sessionID)
 	return err
+}
+
+// FindOrCreateUser 根据Steam64ID查找或创建用户
+func (w *DBWriter) FindOrCreateUser(user *User) (int, bool, error) {
+	// 先查找用户
+	var foundUser User
+	query := "SELECT user_id, name, prev_name, steam64_id, country FROM user WHERE steam64_id = ?"
+	err := w.DB.QueryRow(query, user.Steam64ID).Scan(&foundUser.UserID, &foundUser.Name, &foundUser.PrevName, &foundUser.Steam64ID, &foundUser.Country)
+	if err == nil {
+		// 用户已存在，返回用户ID和false
+		return foundUser.UserID, false, nil
+	}
+
+	if err != sql.ErrNoRows {
+		// 非"未找到"错误，返回错误
+		return 0, false, fmt.Errorf("查询用户失败: %v", err)
+	}
+
+	// 用户不存在，创建新用户
+	insertQuery := "INSERT INTO user (name, steam64_id) VALUES (?, ?)"
+	result, err := w.executeSQL(insertQuery, user.Name, user.Steam64ID)
+	if err != nil {
+		return 0, false, fmt.Errorf("创建用户失败: %v", err)
+	}
+
+	userID, err := result.LastInsertId()
+	if err != nil {
+		return 0, false, fmt.Errorf("获取用户ID失败: %v", err)
+	}
+
+	return int(userID), true, nil
+}
+
+// InsertStintLap 插入StintLap记录（包装CreateStintLap）
+func (w *DBWriter) InsertStintLap(lap *StintLap) (int, error) {
+	lapID, err := w.CreateStintLap(lap)
+	if err != nil {
+		return 0, err
+	}
+	return int(lapID), nil
+}
+
+// InsertSessionFeed 插入SessionFeed记录（包装CreateSessionFeed）
+func (w *DBWriter) InsertSessionFeed(feed *SessionFeed) error {
+	_, err := w.CreateSessionFeed(feed)
+	return err
+}
+
+// FindLatestSessionByEventID 查找指定事件的最新会话
+func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
+	session := &Session{}
+	query := `SELECT session_id, event_id, type, name, track_time, start_time, duration_min, elapsed_ms, laps, weather, air_temp, road_temp, start_grip, current_grip, is_finished, finish_time, last_activity, http_port 
+			 FROM session 
+			 WHERE event_id = ? 
+			 ORDER BY start_time DESC 
+			 LIMIT 1`
+	err := w.DB.QueryRow(query, eventID).Scan(
+		&session.ID, &session.EventID, &session.Type, &session.Name, &session.TrackTime,
+		&session.StartTime, &session.DurationMin, &session.ElapsedMs, &session.Laps,
+		&session.Weather, &session.AirTemp, &session.RoadTemp, &session.StartGrip,
+		&session.CurrentGrip, &session.IsFinished, &session.FinishTime, &session.LastActivity, &session.HTTPPort,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查找最新会话失败: %v", err)
+	}
+	return session, nil
+}
+
+// FindSessionStintsBySessionID 查找指定会话的所有Stint
+func (w *DBWriter) FindSessionStintsBySessionID(sessionID int64) ([]*SessionStint, error) {
+	query := `SELECT id, user_id, team_member_id, session_id, car_id, game_car_id, laps, valid_laps, best_lap_id, is_finished, started_at, finished_at 
+			 FROM session_stint 
+			 WHERE session_id = ?`
+	rows, err := w.DB.Query(query, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("查询Stint失败: %v", err)
+	}
+	defer rows.Close()
+
+	var stints []*SessionStint
+	for rows.Next() {
+		stint := &SessionStint{}
+		err := rows.Scan(
+			&stint.ID, &stint.UserID, &stint.TeamMemberID, &stint.SessionID, &stint.CarID,
+			&stint.GameCarID, &stint.Laps, &stint.ValidLaps, &stint.BestLapID, &stint.IsFinished,
+			&stint.StartedAt, &stint.FinishedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("扫描Stint失败: %v", err)
+		}
+		stints = append(stints, stint)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历Stint失败: %v", err)
+	}
+
+	return stints, nil
+}
+
+// UpdateSession 更新会话信息
+func (w *DBWriter) UpdateSession(session *Session) error {
+	query := `UPDATE session SET is_finished = ?, finish_time = ?, last_activity = ? 
+			 WHERE session_id = ?`
+	_, err := w.executeSQL(query, session.IsFinished, session.FinishTime, session.LastActivity, session.ID)
+	if err != nil {
+		return fmt.Errorf("更新会话失败: %v", err)
+	}
+	return nil
+}
+
+// FindStintLapsByStintID 查找指定Stint的所有圈速
+func (w *DBWriter) FindStintLapsByStintID(stintID int) ([]*StintLap, error) {
+	query := `SELECT id, stint_id, sector1, sector2, sector3, grip, tyre, time, cuts, crashes, car_crashes, max_speed, avg_speed, finished_at 
+			 FROM stint_lap 
+			 WHERE stint_id = ?`
+	rows, err := w.DB.Query(query, stintID)
+	if err != nil {
+		return nil, fmt.Errorf("查询圈速失败: %v", err)
+	}
+	defer rows.Close()
+
+	var laps []*StintLap
+	for rows.Next() {
+		lap := &StintLap{}
+		err := rows.Scan(
+			&lap.ID, &lap.StintID, &lap.Sector1, &lap.Sector2, &lap.Sector3,
+			&lap.Grip, &lap.Tyre, &lap.Time, &lap.Cuts, &lap.Crashes,
+			&lap.CarCrashes, &lap.MaxSpeed, &lap.AvgSpeed, &lap.FinishedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("扫描圈速失败: %v", err)
+		}
+		laps = append(laps, lap)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历圈速失败: %v", err)
+	}
+
+	return laps, nil
+}
+
+// FindStintLapByStintIDAndTime 根据StintID和时间查找圈速
+func (w *DBWriter) FindStintLapByStintIDAndTime(stintID int, time int) (bool, error) {
+	query := "SELECT COUNT(*) FROM stint_lap WHERE stint_id = ? AND time = ?"
+	var count int
+	err := w.DB.QueryRow(query, stintID, time).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("查询圈速存在性失败: %v", err)
+	}
+	return count > 0, nil
+}
+
+// FindOrCreateTrackConfigID 查找或创建赛道配置ID
+func (w *DBWriter) FindOrCreateTrackConfigID(trackConfig *TrackConfig) (int, error) {
+	// 先查找赛道配置
+	var configID int
+	query := "SELECT track_config_id FROM track_config WHERE track_name = ? AND config_name = ?"
+	err := w.DB.QueryRow(query, trackConfig.TrackName, trackConfig.ConfigName).Scan(&configID)
+	if err == nil {
+		// 配置已存在，返回ID
+		return configID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		// 非"未找到"错误，返回错误
+		return 0, fmt.Errorf("查询赛道配置失败: %v", err)
+	}
+
+	// 配置不存在，创建新配置
+	insertQuery := "INSERT INTO track_config (track_name, config_name, display_name) VALUES (?, ?, ?)"
+	result, err := w.executeSQL(insertQuery, trackConfig.TrackName, trackConfig.ConfigName, fmt.Sprintf("%s %s", trackConfig.TrackName, trackConfig.ConfigName))
+	if err != nil {
+		return 0, fmt.Errorf("创建赛道配置失败: %v", err)
+	}
+
+	newConfigID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("获取赛道配置ID失败: %v", err)
+	}
+
+	return int(newConfigID), nil
+}
+
+// FindOrCreateCarID 查找或创建车辆ID
+func (w *DBWriter) FindOrCreateCarID(config *Car) (int, error) {
+	// 先查找车辆
+	var carID int
+	query := "SELECT car_id FROM car WHERE name = ?"
+	err := w.DB.QueryRow(query, config.Name).Scan(&carID)
+	if err == nil {
+		// 车辆已存在，返回ID
+		return carID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		// 非"未找到"错误，返回错误
+		return 0, fmt.Errorf("查询车辆失败: %v", err)
+	}
+
+	// 车辆不存在，创建新车辆
+	insertQuery := "INSERT INTO car (name) VALUES (?)"
+	result, err := w.executeSQL(insertQuery, config.Name)
+	if err != nil {
+		return 0, fmt.Errorf("创建车辆失败: %v", err)
+	}
+
+	newCarID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("获取车辆ID失败: %v", err)
+	}
+
+	return int(newCarID), nil
+}
+
+// FindOrCreateTeam 查找或创建团队
+func (w *DBWriter) FindOrCreateTeam(team *Team) (int, error) {
+	// 先查找团队
+	var teamID int
+	query := "SELECT team_id FROM team WHERE event_id = ? AND name = ?"
+	err := w.DB.QueryRow(query, team.EventID, team.Name).Scan(&teamID)
+	if err == nil {
+		// 团队已存在，返回ID
+		return teamID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		// 非"未找到"错误，返回错误
+		return 0, fmt.Errorf("查询团队失败: %v", err)
+	}
+
+	// 团队不存在，创建新团队
+	insertQuery := "INSERT INTO team (event_id, name) VALUES (?, ?)"
+	result, err := w.executeSQL(insertQuery, team.EventID, team.Name)
+	if err != nil {
+		return 0, fmt.Errorf("创建团队失败: %v", err)
+	}
+
+	newTeamID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("获取团队ID失败: %v", err)
+	}
+
+	return int(newTeamID), nil
+}
+
+// FindOrCreateTeamMember 查找或创建团队成员
+func (w *DBWriter) FindOrCreateTeamMember(teamMember *TeamMember) (int, error) {
+	// 先查找团队成员
+	var teamMemberID int
+	query := "SELECT team_member_id FROM team_member WHERE team_id = ? AND user_id = ?"
+	err := w.DB.QueryRow(query, teamMember.TeamID, teamMember.UserID).Scan(&teamMemberID)
+	if err == nil {
+		// 团队成员已存在，返回ID
+		return teamMemberID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		// 非"未找到"错误，返回错误
+		return 0, fmt.Errorf("查询团队成员失败: %v", err)
+	}
+
+	// 团队成员不存在，创建新团队成员
+	insertQuery := "INSERT INTO team_member (team_id, user_id) VALUES (?, ?)"
+	result, err := w.executeSQL(insertQuery, teamMember.TeamID, teamMember.UserID)
+	if err != nil {
+		return 0, fmt.Errorf("创建团队成员失败: %v", err)
+	}
+
+	newTeamMemberID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("获取团队成员ID失败: %v", err)
+	}
+
+	return int(newTeamMemberID), nil
+}
+
+// FindEventByName 根据名称查找事件
+func (w *DBWriter) FindEventByName(name string) (*Event, error) {
+	event := &Event{}
+	query := `SELECT event_id, name, server_name, track_config_id, practice_duration, quali_duration, race_duration, race_duration_type, race_extra_laps, reverse_grid_positions, team_event, active 
+			 FROM event 
+			 WHERE name = ?`
+	err := w.DB.QueryRow(query, name).Scan(
+		&event.ID, &event.Name, &event.ServerName, &event.TrackConfigID,
+		&event.PracticeDuration, &event.QualiDuration, &event.RaceDuration,
+		&event.RaceDurationType, &event.RaceExtraLaps, &event.ReverseGridPositions,
+		&event.TeamEvent, &event.Active,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+// InsertEvent 插入事件记录（包装CreateEvent）
+func (w *DBWriter) InsertEvent(event *Event) error {
+	_, err := w.CreateEvent(event)
+	return err
+}
+
+// UpdateEvent 更新事件信息
+func (w *DBWriter) UpdateEvent(event *Event) error {
+	query := `UPDATE event SET name = ?, server_name = ?, track_config_id = ?, team_event = ?, active = ?, livery_preview = ?, use_number = ? 
+			 WHERE event_id = ?`
+	_, err := w.executeSQL(query, event.Name, event.ServerName, event.TrackConfigID, event.TeamEvent, event.Active, event.LiveryPreview, event.UseNumber, event.ID)
+	if err != nil {
+		return fmt.Errorf("更新事件失败: %v", err)
+	}
+	return nil
+}
+
+// InsertSession 插入会话记录（包装CreateSession）
+func (w *DBWriter) InsertSession(session *Session) (int64, error) {
+	return w.CreateSession(session)
+}
+
+// InsertLapTelemetry 插入圈速遥测数据
+func (w *DBWriter) InsertLapTelemetry(lapID int, telemetry []byte) error {
+	query := "INSERT INTO lap_telemetry (lap_id, telemetry) VALUES (?, ?)"
+	_, err := w.executeSQL(query, lapID, telemetry)
+	if err != nil {
+		return fmt.Errorf("插入遥测数据失败: %v", err)
+	}
+	return nil
 }

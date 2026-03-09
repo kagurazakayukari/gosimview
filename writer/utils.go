@@ -103,7 +103,79 @@ func initLogger() {
 	fatalLogger = log.New(multiWriter, "[SimView][FATAL] ", log.Ldate|log.Ltime|log.Lshortfile)
 }
 
-// getLogFileName 获取日志文件名
-func getLogFileName(prefix string) string {
-	return fmt.Sprintf("%s_%s.log", prefix, time.Now().Format("2006-01-02-15-04-05"))
+// pointInPolygon 判断点是否在多边形内（射线法）
+func pointInPolygon(point [2]float32, polygon [][3]float32) bool {
+	if len(polygon) < 3 {
+		return false
+	}
+	inside := false
+	n := len(polygon)
+
+	for i, j := 0, n-1; i < n; j, i = i, i+1 {
+		iPoint := polygon[i]
+		jPoint := polygon[j]
+
+		// 检查点是否在多边形顶点上
+		if (iPoint[0] == point[0] && iPoint[2] == point[1]) ||
+			(jPoint[0] == point[0] && jPoint[2] == point[1]) {
+			return true
+		}
+
+		// 检查边是否与射线相交
+		if (iPoint[2] > point[1]) != (jPoint[2] > point[1]) {
+			xIntersect := (point[1]-iPoint[2])*(jPoint[0]-iPoint[0])/(jPoint[2]-iPoint[2]) + iPoint[0]
+			if point[0] < xIntersect {
+				inside = !inside
+			}
+		}
+	}
+	return inside
+}
+
+// 根据车辆ID获取用户ID (非团队赛事)
+func getUserIDByCarID(carID int) uint32 {
+	entryListMutex.Lock()
+	defer entryListMutex.Unlock()
+	if driver, exists := globalEntryList[carID]; exists {
+		// 通过驾驶员名称查找或创建用户
+		userID, _, _ := globalDBWriter.FindOrCreateUser(&User{Name: driver.Name})
+		return uint32(userID)
+	}
+	return 0
+}
+
+// 根据车辆ID获取团队ID
+func getTeamIDByCarID(carID int) uint32 {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	for _, team := range globalTeams {
+		if team.CarID == carID && team.Active == 1 {
+			return uint32(team.ID)
+		}
+	}
+	return 0 // 未找到时返回0
+}
+
+// 根据团队ID获取团队名称
+func getTeamNameByID(teamID int) string {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	for _, team := range globalTeams {
+		if team.ID == teamID && team.Active == 1 {
+			return team.Name
+		}
+	}
+	return "" // 未找到时返回空字符串
+}
+
+// 根据用户ID获取用户名
+func getUserNameByID(userID int) string {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	for _, user := range globalUsers {
+		if user.UserID == userID {
+			return user.Name
+		}
+	}
+	return "" // 未找到时返回空字符串
 }
