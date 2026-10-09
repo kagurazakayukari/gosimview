@@ -13,7 +13,7 @@ import (
 // 设置HTTP路由
 func setupRoutes() {
 	// 静态文件服务
-	fs = http.FileServer(http.Dir("html"))
+	fs = http.FileServer(http.Dir(docRoot))
 	// 创建自定义处理器处理所有HTML文件和静态资源
 	http.HandleFunc("/", methodMiddleware(rootHandler, "GET"))
 	http.HandleFunc("/analysis/", methodMiddleware(analysisHandler, "GET"))

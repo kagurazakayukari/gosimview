@@ -8,6 +8,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +23,14 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// mockResult 模拟模式下返回的占位结果。
+// 调用方会对 executeSQL 的返回值直接调 LastInsertId/RowsAffected，
+// 若模拟模式返回 nil 会造成空指针 panic，这里给出安全占位。
+type mockResult struct{}
+
+func (mockResult) LastInsertId() (int64, error) { return 0, nil }
+func (mockResult) RowsAffected() (int64, error) { return 0, nil }
+
 // DBWriter 数据库操作结构体
 type DBWriter struct {
 	DB             *sql.DB
@@ -35,8 +44,8 @@ type DBWriter struct {
 	Session        *Session
 }
 
-// NewDBWriter 创建新的DBWriter实例
-func NewDBWriter(dsn string) (*DBWriter, error) {
+// NewDBWriter 创建新的DBWriter实例。simulate 为 true 时不向数据库写入（仅记录 SQL）。
+func NewDBWriter(dsn string, simulate bool) (*DBWriter, error) {
 	// 打开数据库连接
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -68,7 +77,7 @@ func NewDBWriter(dsn string) (*DBWriter, error) {
 	dbWriter := &DBWriter{
 		DB:          db,
 		Logger:      log.New(logFile, "[DBWriter] ", log.Ldate|log.Ltime|log.Lshortfile),
-		SimulateSQL: true, // 默认开启SQL模拟模式
+		SimulateSQL: simulate,
 	}
 
 	// 执行SQL schema文件（如果存在）
@@ -79,11 +88,10 @@ func NewDBWriter(dsn string) (*DBWriter, error) {
 
 // executeSQLSchema 执行SQL schema文件
 func (w *DBWriter) executeSQLSchema() {
-	// 只在data目录下查找SQL文件
-	dataSQLFiles, err := filepath.Glob("data/*.sql")
-	if err != nil {
-		w.Logger.Printf("查找data目录下的SQL文件失败: %v", err)
-		return
+	// 只在data目录下查找SQL文件（支持从仓库根或 simview/ 下启动）
+	dataSQLFiles, _ := filepath.Glob("data/*.sql")
+	if len(dataSQLFiles) == 0 {
+		dataSQLFiles, _ = filepath.Glob("simview/data/*.sql")
 	}
 
 	var sqlFile string
@@ -250,7 +258,7 @@ func (w *DBWriter) tableExists(tableName string) bool {
 
 // UpdateSessionStint 更新SessionStint记录
 func (w *DBWriter) UpdateSessionStint(ss *SessionStint) (int64, error) {
-	query := "UPDATE session_stint SET end_time = ? WHERE session_stint_id = ?"
+	query := "UPDATE session_stint SET finished_at = ? WHERE session_stint_id = ?"
 	result, err := w.DB.Exec(query, ss.FinishedAt, ss.ID)
 	if err != nil {
 		return 0, fmt.Errorf("更新SessionStint失败: %v", err)
@@ -271,10 +279,9 @@ func (w *DBWriter) executeSQL(query string, args ...interface{}) (sql.Result, er
 	w.Logger.Printf("执行SQL: %s, 参数: %v", query, args)
 
 	if w.SimulateSQL {
-		// 模拟SQL执行
+		// 模拟SQL执行：不写库，返回安全占位结果
 		w.Logger.Println("SQL模拟模式已开启，跳过实际执行")
-		// 返回模拟结果
-		return nil, nil
+		return mockResult{}, nil
 	}
 
 	// 执行SQL语句
@@ -304,21 +311,40 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 		return fmt.Errorf("加载server_cfg.ini失败: %v", err)
 	}
 
+	// 从 server_cfg.ini 解析各 session 时长（取不到则为默认值）
+	practiceDuration := cfg.Section("PRACTICE").Key("TIME").MustInt(-1)
+	qualiDuration := cfg.Section("QUALIFY").Key("TIME").MustInt(-1)
+	raceLaps := cfg.Section("RACE").Key("LAPS").MustInt(0)
+	raceTime := cfg.Section("RACE").Key("TIME").MustInt(-1)
+	raceDuration := raceTime
+	raceDurationType := 0
+	if raceLaps > 0 {
+		raceDuration = raceLaps
+		raceDurationType = 1 // 1 = 按圈数
+	}
+
 	w.ServerCfg = &ServerConfig{
-		Name:                cfg.Section("SERVER").Key("NAME").String(),
-		Slots:               cfg.Section("SERVER").Key("SLOTS").MustInt(16),
-		Port:                cfg.Section("SERVER").Key("UDP_PORT").MustInt(9600),
-		HTTP:                cfg.Section("HTTP").Key("HOST").String(),
-		HTTPPort:            cfg.Section("HTTP").Key("PORT").MustInt(8081),
-		AdminPassword:       cfg.Section("SERVER").Key("ADMIN_PASSWORD").String(),
-		Password:            cfg.Section("SERVER").Key("PASSWORD").String(),
-		MaxCarSlots:         cfg.Section("SERVER").Key("MAX_CAR_SLOTS").MustInt(50),
-		IdleTimeout:         cfg.Section("SERVER").Key("IDLE_TIMEOUT").MustInt(120),
-		VoteTimeout:         cfg.Section("SERVER").Key("VOTE_TIMEOUT").MustInt(60),
-		QualifyStandingType: cfg.Section("SERVER").Key("QUALIFY_STANDING_TYPE").MustInt(0),
-		PitWindowStart:      cfg.Section("PIT").Key("PIT_WINDOW_START").MustInt(-1),
-		PitWindowEnd:        cfg.Section("PIT").Key("PIT_WINDOW_END").MustInt(-1),
-		ShortFormationLap:   cfg.Section("SERVER").Key("SHORT_FORMATION_LAP").MustInt(0),
+		Name:                 cfg.Section("SERVER").Key("NAME").String(),
+		Slots:                cfg.Section("SERVER").Key("SLOTS").MustInt(16),
+		Port:                 cfg.Section("SERVER").Key("UDP_PORT").MustInt(9600),
+		HTTP:                 cfg.Section("HTTP").Key("HOST").String(),
+		HTTPPort:             cfg.Section("HTTP").Key("PORT").MustInt(8081),
+		AdminPassword:        cfg.Section("SERVER").Key("ADMIN_PASSWORD").String(),
+		Password:             cfg.Section("SERVER").Key("PASSWORD").String(),
+		MaxCarSlots:          cfg.Section("SERVER").Key("MAX_CAR_SLOTS").MustInt(50),
+		IdleTimeout:          cfg.Section("SERVER").Key("IDLE_TIMEOUT").MustInt(120),
+		VoteTimeout:          cfg.Section("SERVER").Key("VOTE_TIMEOUT").MustInt(60),
+		QualifyStandingType:  cfg.Section("SERVER").Key("QUALIFY_STANDING_TYPE").MustInt(0),
+		PitWindowStart:       cfg.Section("PIT").Key("PIT_WINDOW_START").MustInt(-1),
+		PitWindowEnd:         cfg.Section("PIT").Key("PIT_WINDOW_END").MustInt(-1),
+		ShortFormationLap:    cfg.Section("SERVER").Key("SHORT_FORMATION_LAP").MustInt(0),
+		PracticeDuration:     practiceDuration,
+		QualiDuration:        qualiDuration,
+		RaceDuration:         raceDuration,
+		RaceDurationType:     raceDurationType,
+		RaceWaitTime:         cfg.Section("RACE").Key("WAIT_TIME").MustInt(0),
+		RaceExtraLaps:        cfg.Section("SERVER").Key("RACE_EXTRA_LAPS").MustInt(0),
+		ReverseGridPositions: cfg.Section("SERVER").Key("REVERSED_GRID_RACE_POSITIONS").MustInt(0),
 	}
 
 	return nil
@@ -391,7 +417,12 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		}
 
 		config := &Car{
-			Name: driver.Car,
+			Name:         driver.Car,
+			DisplayName:  driver.Car,
+			Manufacturer: "N/A",
+		}
+		if cls, ok := cfg.Overrides.CarClass[driver.Car]; ok {
+			config.CarClass = cls
 		}
 		if globalCars == nil {
 			globalCars = make(map[int]*Car)
@@ -404,17 +435,10 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 			fatalLogger.Fatalf("获取CarID失败: %v", err)
 		}
 		config.ID = carID
-		// 获取完整的车辆信息
-		if w.SimulateSQL {
-			row := w.DB.QueryRow("SELECT display_name, manufacturer, car_class FROM car WHERE car_id = ?", 1)
-			if err := row.Scan(&config.DisplayName, &config.Manufacturer, &config.CarClass); err != nil {
-				fatalLogger.Fatalf("模拟SQL模式下获取车辆详细信息失败: %v", err)
-			}
-		} else {
-			row := w.DB.QueryRow("SELECT display_name, manufacturer, car_class FROM car WHERE car_id = ?", carID)
-			if err := row.Scan(&config.DisplayName, &config.Manufacturer, &config.CarClass); err != nil {
-				fatalLogger.Fatalf("警告: 获取车辆 %s 详细信息失败: %v", driver.Car, err)
-			}
+		// 获取完整的车辆信息（查不到只告警，不终止启动）
+		row := w.DB.QueryRow("SELECT display_name, manufacturer, car_class FROM car WHERE car_id = ?", carID)
+		if err := row.Scan(&config.DisplayName, &config.Manufacturer, &config.CarClass); err != nil {
+			logger.Printf("警告: 获取车辆 %s 详细信息失败: %v", driver.Car, err)
 		}
 		globalCars[carID] = config
 		if err != nil {
@@ -528,7 +552,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 						}
 					}
 					if !found {
-						_, err := w.DB.Exec("UPDATE team_member SET active = 0 WHERE team_id = ? AND user_id = ?", teamID, uid)
+						_, err := w.executeSQL("UPDATE team_member SET active = 0 WHERE team_id = ? AND user_id = ?", teamID, uid)
 						if err != nil {
 							fatalLogger.Fatalf("更新成员状态失败: %v", err)
 						}
@@ -571,9 +595,9 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 
 // CreateEvent 创建事件
 func (w *DBWriter) CreateEvent(event *Event) (int, error) {
-	query := `INSERT INTO event (name, server_name, track_config_id, practice_duration, quali_duration, race_duration, race_duration_type, race_extra_laps, reverse_grid_positions, team_event, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO event (name, server_name, track_config_id, practice_duration, quali_duration, race_duration, race_duration_type, race_wait_time, race_extra_laps, reverse_grid_positions, team_event, active, livery_preview, use_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	result, err := w.executeSQL(query, event.Name, event.ServerName, event.TrackConfigID, event.PracticeDuration, event.QualiDuration, event.RaceDuration, event.RaceDurationType, event.RaceExtraLaps, event.ReverseGridPositions, event.TeamEvent, event.Active)
+	result, err := w.executeSQL(query, event.Name, event.ServerName, event.TrackConfigID, event.PracticeDuration, event.QualiDuration, event.RaceDuration, event.RaceDurationType, event.RaceWaitTime, event.RaceExtraLaps, event.ReverseGridPositions, event.TeamEvent, event.Active, event.LiveryPreview, event.UseNumber)
 	if err != nil {
 		return 0, err
 	}
@@ -591,9 +615,9 @@ func (w *DBWriter) CreateEvent(event *Event) (int, error) {
 
 // CreateSession 创建会话
 func (w *DBWriter) CreateSession(session *Session) (int64, error) {
-	query := `INSERT INTO session (event_id, type, name, track_time, start_time, duration_min, weather, air_temp, road_temp, start_grip, current_grip, http_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO session (event_id, type, name, track_time, start_time, duration_min, elapsed_ms, laps, weather, air_temp, road_temp, start_grip, current_grip, is_finished, last_activity, http_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	result, err := w.executeSQL(query, session.EventID, session.Type, session.Name, session.TrackTime, session.StartTime, session.DurationMin, session.Weather, session.AirTemp, session.RoadTemp, session.StartGrip, session.CurrentGrip, session.HTTPPort)
+	result, err := w.executeSQL(query, session.EventID, session.Type, session.Name, session.TrackTime, session.StartTime, session.DurationMin, session.ElapsedMs, session.Laps, session.Weather, session.AirTemp, session.RoadTemp, session.StartGrip, session.CurrentGrip, session.IsFinished, session.LastActivity, session.HTTPPort)
 	if err != nil {
 		return 0, err
 	}
@@ -611,9 +635,9 @@ func (w *DBWriter) CreateSession(session *Session) (int64, error) {
 
 // CreateSessionStint 创建SessionStint
 func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
-	query := `INSERT INTO session_stint (session_id, team_member_id, user_id, car_id, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO session_stint (session_id, team_member_id, user_id, car_id, game_car_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
 
-	result, err := w.executeSQL(query, stint.SessionID, stint.TeamMemberID, stint.UserID, stint.CarID, stint.StartedAt, stint.FinishedAt)
+	result, err := w.executeSQL(query, stint.SessionID, stint.TeamMemberID, stint.UserID, stint.CarID, stint.GameCarID, stint.StartedAt, stint.FinishedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -732,13 +756,67 @@ func (w *DBWriter) GetEventByID(eventID int) (*Event, error) {
 	return event, nil
 }
 
+// readTrackMetadata 从游戏目录的 ui_track.json 读取赛道显示名/国家/城市/长度。
+// 依次尝试 layout 专属与基础目录，读不到就返回空值。
+func readTrackMetadata(trackName, configName string) (display, country, city string, length int) {
+	if cfg == nil || cfg.Game.Path == "" {
+		return "", "", "", 0
+	}
+	base := filepath.Join(cfg.Game.Path, "content", "tracks", trackName)
+	candidates := []string{
+		filepath.Join(base, "ui", configName, "ui_track.json"),
+		filepath.Join(base, "ui", "ui_track.json"),
+		filepath.Join(base, configName, "ui", "ui_track.json"),
+	}
+	for _, p := range candidates {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var raw struct {
+			Name    string          `json:"name"`
+			City    string          `json:"city"`
+			Country string          `json:"country"`
+			Length  json.RawMessage `json:"length"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue
+		}
+		return raw.Name, raw.Country, raw.City, parseTrackLength(raw.Length)
+	}
+	return "", "", "", 0
+}
+
+// parseTrackLength 兼容 ui_track.json 中 length 为字符串或数字的情况
+func parseTrackLength(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if f, err2 := strconv.ParseFloat(strings.TrimSpace(s), 64); err2 == nil {
+			return int(f)
+		}
+		return 0
+	}
+	var n float64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return int(n)
+	}
+	return 0
+}
+
 // GetTrackConfigByID 根据ID获取赛道配置
 func (w *DBWriter) GetTrackConfigByID(trackConfigID int) (*TrackConfig, error) {
 	trackConfig := &TrackConfig{}
+	var length sql.NullInt64
 	query := "SELECT track_config_id, track_name, config_name, display_name, country, city, length FROM track_config WHERE track_config_id = ?"
-	err := w.DB.QueryRow(query, trackConfigID).Scan(&trackConfig.ID, &trackConfig.TrackName, &trackConfig.ConfigName, &trackConfig.DisplayName, &trackConfig.Country, &trackConfig.City, &trackConfig.Length)
+	err := w.DB.QueryRow(query, trackConfigID).Scan(&trackConfig.ID, &trackConfig.TrackName, &trackConfig.ConfigName, &trackConfig.DisplayName, &trackConfig.Country, &trackConfig.City, &length)
 	if err != nil {
 		return nil, fmt.Errorf("获取赛道配置失败: %v", err)
+	}
+	if length.Valid {
+		trackConfig.Length = int(length.Int64)
 	}
 
 	return trackConfig, nil
@@ -829,7 +907,7 @@ func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
 
 // FindSessionStintsBySessionID 查找指定会话的所有Stint
 func (w *DBWriter) FindSessionStintsBySessionID(sessionID int64) ([]*SessionStint, error) {
-	query := `SELECT id, user_id, team_member_id, session_id, car_id, game_car_id, laps, valid_laps, best_lap_id, is_finished, started_at, finished_at 
+	query := `SELECT session_stint_id, user_id, team_member_id, session_id, car_id, game_car_id, laps, valid_laps, best_lap_id, is_finished, started_at, finished_at 
 			 FROM session_stint 
 			 WHERE session_id = ?`
 	rows, err := w.DB.Query(query, sessionID)
@@ -872,7 +950,7 @@ func (w *DBWriter) UpdateSession(session *Session) error {
 
 // FindStintLapsByStintID 查找指定Stint的所有圈速
 func (w *DBWriter) FindStintLapsByStintID(stintID int) ([]*StintLap, error) {
-	query := `SELECT id, stint_id, sector1, sector2, sector3, grip, tyre, time, cuts, crashes, car_crashes, max_speed, avg_speed, finished_at 
+	query := `SELECT stint_lap_id, stint_id, sector_1, sector_2, sector_3, grip, tyre, time, cuts, crashes, car_crashes, max_speed, avg_speed, finished_at 
 			 FROM stint_lap 
 			 WHERE stint_id = ?`
 	rows, err := w.DB.Query(query, stintID)
@@ -929,9 +1007,13 @@ func (w *DBWriter) FindOrCreateTrackConfigID(trackConfig *TrackConfig) (int, err
 		return 0, fmt.Errorf("查询赛道配置失败: %v", err)
 	}
 
-	// 配置不存在，创建新配置
-	insertQuery := "INSERT INTO track_config (track_name, config_name, display_name) VALUES (?, ?, ?)"
-	result, err := w.executeSQL(insertQuery, trackConfig.TrackName, trackConfig.ConfigName, fmt.Sprintf("%s %s", trackConfig.TrackName, trackConfig.ConfigName))
+	// 配置不存在，创建新配置（尽量从游戏目录的 ui_track.json 补齐显示名/国家/城市/长度）
+	display, country, city, length := readTrackMetadata(trackConfig.TrackName, trackConfig.ConfigName)
+	if display == "" {
+		display = fmt.Sprintf("%s %s", trackConfig.TrackName, trackConfig.ConfigName)
+	}
+	insertQuery := "INSERT INTO track_config (track_name, config_name, display_name, country, city, length) VALUES (?, ?, ?, ?, ?, ?)"
+	result, err := w.executeSQL(insertQuery, trackConfig.TrackName, trackConfig.ConfigName, display, country, city, length)
 	if err != nil {
 		return 0, fmt.Errorf("创建赛道配置失败: %v", err)
 	}
@@ -960,9 +1042,21 @@ func (w *DBWriter) FindOrCreateCarID(config *Car) (int, error) {
 		return 0, fmt.Errorf("查询车辆失败: %v", err)
 	}
 
-	// 车辆不存在，创建新车辆
-	insertQuery := "INSERT INTO car (name) VALUES (?)"
-	result, err := w.executeSQL(insertQuery, config.Name)
+	// 车辆不存在，创建新车辆（display_name/manufacturer 为 NOT NULL 约束，必须提供值）
+	displayName := config.DisplayName
+	if displayName == "" {
+		displayName = config.Name
+	}
+	manufacturer := config.Manufacturer
+	if manufacturer == "" {
+		manufacturer = "N/A"
+	}
+	carClass := config.CarClass
+	if carClass == "" {
+		carClass = "N/A"
+	}
+	insertQuery := "INSERT INTO car (name, display_name, manufacturer, car_class) VALUES (?, ?, ?, ?)"
+	result, err := w.executeSQL(insertQuery, config.Name, displayName, manufacturer, carClass)
 	if err != nil {
 		return 0, fmt.Errorf("创建车辆失败: %v", err)
 	}
@@ -991,9 +1085,9 @@ func (w *DBWriter) FindOrCreateTeam(team *Team) (int, error) {
 		return 0, fmt.Errorf("查询团队失败: %v", err)
 	}
 
-	// 团队不存在，创建新团队
-	insertQuery := "INSERT INTO team (event_id, name) VALUES (?, ?)"
-	result, err := w.executeSQL(insertQuery, team.EventID, team.Name)
+	// 团队不存在，创建新团队（car_id 与 created_at 为 NOT NULL 约束）
+	insertQuery := "INSERT INTO team (event_id, name, team_no, car_id, livery_name, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+	result, err := w.executeSQL(insertQuery, team.EventID, team.Name, team.TeamNo, team.CarID, team.LiveryName, team.Active, team.CreatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("创建团队失败: %v", err)
 	}
@@ -1022,9 +1116,9 @@ func (w *DBWriter) FindOrCreateTeamMember(teamMember *TeamMember) (int, error) {
 		return 0, fmt.Errorf("查询团队成员失败: %v", err)
 	}
 
-	// 团队成员不存在，创建新团队成员
-	insertQuery := "INSERT INTO team_member (team_id, user_id) VALUES (?, ?)"
-	result, err := w.executeSQL(insertQuery, teamMember.TeamID, teamMember.UserID)
+	// 团队成员不存在，创建新团队成员（created_at 为 NOT NULL 约束）
+	insertQuery := "INSERT INTO team_member (team_id, user_id, role, active, created_at) VALUES (?, ?, ?, ?, ?)"
+	result, err := w.executeSQL(insertQuery, teamMember.TeamID, teamMember.UserID, teamMember.Role, teamMember.Active, teamMember.CreatedAt)
 	if err != nil {
 		return 0, fmt.Errorf("创建团队成员失败: %v", err)
 	}

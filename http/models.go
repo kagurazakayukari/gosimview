@@ -232,6 +232,8 @@ type Entry struct {
 	PosZ           float32
 	TelemetryMask  uint16
 	RPM            uint16
+	Gear           uint8
+	Speed          uint16
 	TyreLength     uint8
 	Tyre           string
 	BestLapS1      uint32

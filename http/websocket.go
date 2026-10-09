@@ -92,7 +92,8 @@ func writeEntriesToBuffer(entries []Entry, buf *bytes.Buffer) error {
 		if err := writeBinary(buf, binary.LittleEndian, e.PosZ, "PosZ"); err != nil {
 			return err
 		}
-		if err := writeBinary(buf, binary.LittleEndian, e.TelemetryMask, "TelemetryMask"); err != nil {
+		mask2 := uint16(e.Gear) | (uint16(e.Speed) << 6)
+		if err := writeBinary(buf, binary.LittleEndian, mask2, "GearSpeed"); err != nil {
 			return err
 		}
 		if err := writeBinary(buf, binary.LittleEndian, e.RPM, "RPM"); err != nil {
@@ -203,6 +204,8 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	eventId := cookie.Value
 
+	var writeMu sync.Mutex
+
 	atomic.AddInt32(&wsConnectionCount, 1)
 	defer func() {
 		atomic.AddInt32(&wsConnectionCount, -1)
@@ -235,11 +238,11 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 获取最新会话ID
+	// 获取最新会话ID和会话详情（加锁读取）
+	liveEventsMutex.Lock()
 	latestSessionID := liveEventsData.Session.SessionID
-
-	// 获取会话详情
 	session := liveEventsData.Session
+	liveEventsMutex.Unlock()
 
 	// 查询session feed数据并记录最后一个feed_id
 	var lastFeedID int64
@@ -264,8 +267,14 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// 数据更新和心跳检测循环
 	pingTicker := time.NewTicker(15 * time.Second) // 缩短ping间隔至15秒
-	// Ensure non-negative interval with default fallback
+
+	// 广播间隔兜底，避免 NewTicker(0) 触发 panic
+	liveEventsMutex.Lock()
 	interval := liveEventsData.BroadcastInterval
+	liveEventsMutex.Unlock()
+	if interval <= 0 {
+		interval = 2000
+	}
 
 	updateTicker := time.NewTicker(time.Duration(interval) * time.Millisecond)
 	defer func() {
@@ -325,15 +334,20 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
+				// 加锁快照，避免与读取协程并发读写 liveEventsData
+				liveEventsMutex.Lock()
+				dataSnapshot := liveEventsData
+				liveEventsMutex.Unlock()
+
 				// 解析排行榜数据
-				entries := liveEventsData.Entries
+				entries := dataSnapshot.Entries
 
 				// 从池获取缓冲区
 				buf := bufferPool.Get().(*bytes.Buffer)
 				defer bufferPool.Put(buf)
 
 				// 构建WebSocket消息
-				if err := buildWebSocketMessage(liveEventsData, buf); err != nil {
+				if err := buildWebSocketMessage(dataSnapshot, buf); err != nil {
 					logger.Printf("构建消息失败: %v", err)
 					return
 				}
@@ -367,9 +381,12 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 				// 写入结束标识
 				binary.Write(buf, binary.LittleEndian, uint8(0))
 
-				// 发送消息
-				if err := conn.WriteMessage(websocket.BinaryMessage, buf.Bytes()); err != nil {
-					logger.Printf("发送更新数据失败: %v", err)
+				// 发送消息（同一连接串行写入，避免并发写 panic）
+				writeMu.Lock()
+				werr := conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+				writeMu.Unlock()
+				if werr != nil {
+					logger.Printf("发送更新数据失败: %v", werr)
 				}
 			}()
 		}

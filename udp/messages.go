@@ -160,7 +160,7 @@ func (asu *AssettoServerUDP) serve() {
 
 				if err != nil {
 					logrus.WithError(err).Error("could not handle UDP message")
-					return
+					continue
 				}
 
 				asu.callback(msg)

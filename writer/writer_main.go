@@ -9,6 +9,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"gosimview/config"
+	"gosimview/kn5conv"
 	"gosimview/udp"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -40,12 +42,12 @@ var (
 	latestFile          os.DirEntry
 	receivedSessionInfo bool
 	receivedVersionInfo bool
-	// 新增的全局变量
-	globalUsers        map[int]*User
-	globalTeams        map[int]*Team
-	globalTeamMembers  map[int]*TeamMember
-	globalCars         map[int]*Car
-	globalTrackConfigs map[int]*TrackConfig
+	// 新增的全局变量（预初始化，避免向 nil map 写入导致 panic）
+	globalUsers        = make(map[int]*User)
+	globalTeams        = make(map[int]*Team)
+	globalTeamMembers  = make(map[int]*TeamMember)
+	globalCars         = make(map[int]*Car)
+	globalTrackConfigs = make(map[int]*TrackConfig)
 	// 互斥锁
 	globalMutex      sync.Mutex
 	connectionsMutex sync.Mutex
@@ -59,8 +61,8 @@ var (
 	// 用于跟踪单圈数据的全局变量
 	carLapData        = make(map[int][]udp.CarUpdate)
 	telemetryData     = make(map[int][]byte)
-	globalConnections map[int]*ConnectionInfo
-	globalEntryList   map[int]EntryListDriver
+	globalConnections = make(map[int]*ConnectionInfo)
+	globalEntryList   = make(map[int]EntryListDriver)
 	lapDataMutex      sync.Mutex
 	// 日志文件处理变量
 	lastFileSize    int64
@@ -71,6 +73,8 @@ var (
 	staticSessionIDCounter int64
 	// 维修区边界
 	pitBoundary [][3]float32
+	// 已加载边界的赛道标识（track|config），避免重复生成
+	pitBoundaryLoadedFor string
 	// 新增：用于实时发送遥测数据的全局变量
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	wsMutex          sync.Mutex
@@ -255,20 +259,27 @@ type Session struct {
 
 // ServerConfig 服务器配置结构体
 type ServerConfig struct {
-	Name                string
-	Slots               int
-	Port                int
-	HTTP                string
-	HTTPPort            int
-	AdminPassword       string
-	Password            string
-	MaxCarSlots         int
-	IdleTimeout         int
-	VoteTimeout         int
-	QualifyStandingType int
-	PitWindowStart      int
-	PitWindowEnd        int
-	ShortFormationLap   int
+	Name                 string
+	Slots                int
+	Port                 int
+	HTTP                 string
+	HTTPPort             int
+	AdminPassword        string
+	Password             string
+	MaxCarSlots          int
+	IdleTimeout          int
+	VoteTimeout          int
+	QualifyStandingType  int
+	PitWindowStart       int
+	PitWindowEnd         int
+	ShortFormationLap    int
+	PracticeDuration     int
+	QualiDuration        int
+	RaceDuration         int
+	RaceDurationType     int
+	RaceWaitTime         int
+	RaceExtraLaps        int
+	ReverseGridPositions int
 }
 
 // Car 车辆结构体
@@ -352,6 +363,8 @@ type Entry struct {
 	PosZ          float32
 	TelemetryMask uint16
 	RPM           uint16
+	Gear          uint8
+	Speed         uint16
 	TyreLength    uint8
 	Tyre          string
 	BestLapS1     uint32
@@ -368,14 +381,20 @@ type Entry struct {
 	PosChange     int8
 }
 
-// ACSession ACSession结构体
+// ACSession ACSession结构体（json tag 必须与 HTTP 端 WebSocketMessage.Session 对齐）
 type ACSession struct {
-	SessionID   int64
-	Type        int
-	DurationMin int
-	StartGrip   float64
-	CurrentGrip float64
-	ElapsedMs   int64
+	SessionID   int64   `json:"session_id"`
+	EventID     int     `json:"event_id"`
+	Type        int     `json:"type"`
+	Name        string  `json:"name"`
+	TrackTime   string  `json:"track_time"`
+	Laps        int     `json:"laps"`
+	Weather     string  `json:"weather"`
+	DurationMin int     `json:"duration_min"`
+	ElapsedMs   int64   `json:"elapsed_ms"`
+	StartGrip   float64 `json:"start_grip"`
+	CurrentGrip float64 `json:"current_grip"`
+	HttpPort    int     `json:"http_port"`
 }
 
 // TrackConfig 赛道配置结构体
@@ -396,7 +415,11 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	lapDataMutex.Lock()
 	defer lapDataMutex.Unlock()
 
-	// 仅处理当前完成圈数事件的车辆
+	// 仅处理当前完成圈数事件的车辆（Cars 按 CarID 索引，需防御越界）
+	if int(lapMsg.CarID) >= len(lapMsg.Cars) || lapMsg.Cars[lapMsg.CarID] == nil {
+		logger.Printf("完成圈数事件的 CarID %d 超出车辆数组范围(len=%d)，已跳过", lapMsg.CarID, len(lapMsg.Cars))
+		return
+	}
 	car := lapMsg.Cars[lapMsg.CarID]
 	lapData := CarLapData{
 		SessionID:  globalSession.ID,
@@ -458,6 +481,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		// 查询或创建用户
 		var userID int
 		foundUser := false
+		globalMutex.Lock()
 		for _, u := range globalUsers {
 			if u.Steam64ID == steam64ID {
 				userID = u.UserID
@@ -465,6 +489,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 				break
 			}
 		}
+		globalMutex.Unlock()
 		if !foundUser {
 			user := &User{Steam64ID: steam64ID}
 			userID, _, err = globalDBWriter.FindOrCreateUser(user)
@@ -492,6 +517,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		if globalEvent.TeamEvent == 1 {
 			teamFound = false
 			// 查询团队成员缓存
+			globalMutex.Lock()
 			for _, tm := range globalTeamMembers {
 				if tm.UserID == userID {
 					for _, t := range globalTeams {
@@ -506,6 +532,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 					}
 				}
 			}
+			globalMutex.Unlock()
 		} // 查找未完成的stint
 		if dataCollectionEnabled {
 			var existingStintID int
@@ -513,8 +540,8 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 			var existingValidLaps int
 			var existingBestLapID int
 			queryErr := globalDBWriter.DB.QueryRow(
-				"SELECT id, laps, valid_laps, best_lap_id FROM session_stint WHERE user_id = ? AND session_id = ? AND car_id = ? AND is_finished = 0",
-				userID, globalSession.ID, lapData.CarID,
+				"SELECT session_stint_id, laps, valid_laps, best_lap_id FROM session_stint WHERE user_id = ? AND session_id = ? AND car_id = ? AND is_finished = 0",
+				userID, globalSession.ID, lapData.GameCarID,
 			).Scan(&existingStintID, &existingLaps, &existingValidLaps, &existingBestLapID)
 
 			// 创建或更新stint记录
@@ -540,7 +567,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 					CarCrashes: int(lapData.CarCrashes),
 					// 从carLapData计算最大速度
 					MaxSpeed:   int(calculateMaxSpeed(carLapData[lapData.CarID])),
-					AvgSpeed:   int(float64(globalTrackConfigs[globalEvent.TrackConfigID].Length) * 3.6 / float64(lapData.LapTime)),
+					AvgSpeed:   int(float64(getTrackLength()) * 3.6 / float64(lapData.LapTime)),
 					FinishedAt: lapData.Timestamp,
 				}
 				lapID, err := globalDBWriter.InsertStintLap(stintLap)
@@ -548,17 +575,13 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 					logger.Printf("插入圈速记录失败: %v", err)
 				}
 
-				result, err := globalDBWriter.DB.Exec("INSERT INTO session_stint (session_id, user_id, team_member_id, car_id, game_car_id, started_at) VALUES (?, ?, ?, ?, ?, ?)",
-					globalSession.ID, userID, 0, lapData.CarID, 0, time.Now())
+				result, err := globalDBWriter.executeSQL("INSERT INTO session_stint (session_id, user_id, team_member_id, car_id, game_car_id, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+					globalSession.ID, userID, 0, lapData.GameCarID, lapData.CarID, time.Now())
 				if err != nil {
 					logger.Printf("创建SessionStint失败: %v", err)
 					return
 				}
-				_, err = result.LastInsertId()
-				if err != nil {
-					logger.Printf("获取SessionStint ID失败: %v", err)
-					return
-				}
+				_, _ = result.LastInsertId()
 
 				// 检查当前圈速是否有效并更新valid_laps
 				if lapData.Completed > 0 && lapData.Cuts == 0 && lapData.Crashes == 0 {
@@ -567,7 +590,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 					// 将lapData.LapTime从毫秒转换为秒以匹配数据库单位
 					// 检查是否为单阶段最快圈速 (case 4)
 					if isCurrentLapValid && (bestLapID == int(lapID)) {
-						stintBestDetail := fmt.Sprintf(`{"driver":"%s","lap_time":%d,"sector1":%d,"sector2":%d,"sector3":%d}`, connInfo.DriverName, lapData.LapTime, lapData.Sector1, lapData.Sector2, lapData.Sector3)
+						stintBestDetail := fmt.Sprintf(`{"user_id":%d,"car_id":%d,"lap_time":%d}`, userID, lapData.CarID, lapData.LapTime)
 						globalDBWriter.InsertSessionFeed(&SessionFeed{
 							SessionID: globalSession.ID,
 							Type:      4,
@@ -590,15 +613,15 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 						var classBestLapTime int
 						err := globalDBWriter.DB.QueryRow(
 							`SELECT MIN(sl.time) FROM stint_lap sl
-								JOIN session_stint ss ON sl.stint_id = ss.id
-								JOIN cars c ON ss.game_car_id = c.id
+								JOIN session_stint ss ON sl.stint_id = ss.session_stint_id
+								JOIN car c ON ss.car_id = c.car_id
 								WHERE ss.session_id = ? AND c.car_class = ?`,
 							globalSession.ID, carClass,
 						).Scan(&classBestLapTime)
 
 						// 如果查询失败(无记录)或当前圈速更快，则更新组别最快圈速
 						if err != nil || (isCurrentLapValid && lapData.LapTime < classBestLapTime) {
-							classBestDetail := fmt.Sprintf(`{"driver":"%s","class":"%s","lap_time":%d}`, connInfo.DriverName, carClass, lapData.LapTime)
+							classBestDetail := fmt.Sprintf(`{"user_id":%d,"car_id":%d,"lap_time":%d}`, userID, lapData.CarID, lapData.LapTime)
 							globalDBWriter.InsertSessionFeed(&SessionFeed{
 								SessionID: globalSession.ID,
 								Type:      5,
@@ -613,8 +636,8 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 						bestLapID = int(lapID)
 					}
 				}
-				_, err = globalDBWriter.DB.Exec(
-					"UPDATE session_stint SET laps = ?, valid_laps = ?, best_lap_id = ?, finished_at = ? WHERE id = ?",
+				_, err = globalDBWriter.executeSQL(
+					"UPDATE session_stint SET laps = ?, valid_laps = ?, best_lap_id = ?, finished_at = ? WHERE session_stint_id = ?",
 					laps, validLaps, bestLapID, time.Now(), existingStintID,
 				)
 				if err != nil {
@@ -641,13 +664,13 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 				var args []interface{}
 				if globalEvent.TeamEvent == 1 {
 					sqlStr = "INSERT INTO session_stint (user_id, team_member_id, session_id, car_id, game_car_id, laps, valid_laps, is_finished, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-					args = []interface{}{stint.UserID, stint.TeamMemberID, stint.SessionID, stint.CarID, stint.GameCarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
+					args = []interface{}{stint.UserID, stint.TeamMemberID, stint.SessionID, stint.GameCarID, stint.CarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
 				} else {
 					sqlStr = "INSERT INTO session_stint (user_id, session_id, car_id, game_car_id, laps, valid_laps, is_finished, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-					args = []interface{}{stint.UserID, stint.SessionID, stint.CarID, stint.GameCarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
+					args = []interface{}{stint.UserID, stint.SessionID, stint.GameCarID, stint.CarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
 				}
-				result, err := globalDBWriter.DB.Exec(sqlStr, args...)
-				if err == nil {
+				result, err := globalDBWriter.executeSQL(sqlStr, args...)
+				if err == nil && result != nil {
 					stintID, _ = result.LastInsertId()
 				}
 			}
@@ -665,7 +688,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 					Crashes:    int(lapData.Crashes),
 					CarCrashes: int(lapData.CarCrashes),
 					MaxSpeed:   int(calculateMaxSpeed(carLapData[lapData.CarID])),
-					AvgSpeed:   int(float64(globalTrackConfigs[globalEvent.TrackConfigID].Length) * 3.6 / float64(lapData.LapTime)),
+					AvgSpeed:   int(float64(getTrackLength()) * 3.6 / float64(lapData.LapTime)),
 					FinishedAt: lapData.Timestamp,
 				}
 				lapID, err := globalDBWriter.InsertStintLap(stintLap)
@@ -704,10 +727,11 @@ func handleCarInfoMessage(carInfoMsg udp.CarInfo, lastDataTime *time.Time) {
 
 func handleClientLoadedMessage(clientMsg udp.ClientLoaded, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	connInfo := globalConnections[int(clientMsg.Event())]
-	if connInfo != nil {
+	connectionsMutex.Lock()
+	if connInfo := globalConnections[int(clientMsg.Event())]; connInfo != nil {
 		connInfo.ConnectionStatus = 0 // 设为已连接状态
 	}
+	connectionsMutex.Unlock()
 }
 
 type PitVisit struct {
@@ -734,7 +758,7 @@ type ConnectionInfo struct {
 
 func getLapTimeByID(lapID int) float64 {
 	var lapTime float64
-	err := globalDBWriter.DB.QueryRow("SELECT time FROM stint_lap WHERE id = ?", lapID).Scan(&lapTime)
+	err := globalDBWriter.DB.QueryRow("SELECT time FROM stint_lap WHERE stint_lap_id = ?", lapID).Scan(&lapTime)
 	if err != nil {
 		return math.MaxFloat64 // 返回最大浮点数确保当前圈速成为最佳圈
 	}
@@ -783,16 +807,10 @@ func handleNewConnectionMessage(connMsg udp.SessionCarInfo, lastDataTime *time.T
 	// 插入用户连接事件SessionFeed (case2)
 	userID := getUserIDByCarID(carID)
 	teamID := getTeamIDByCarID(carID)
-	detail := map[string]interface{}{
-		"user_id": userID,
-		"team_id": teamID,
-		"car_id":  carID,
-	}
-	detailJSON, _ := json.Marshal(detail)
 	globalDBWriter.InsertSessionFeed(&SessionFeed{
 		SessionID: globalSession.ID,
 		Type:      2,
-		Detail:    string(detailJSON),
+		Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, userID, carID),
 		Time:      time.Now(),
 	})
 
@@ -822,20 +840,12 @@ func handleChatMessage(chatMsg udp.Chat, lastDataTime *time.Time) {
 
 	// 获取发送者信息
 	userID := getUserIDByCarID(int(chatMsg.CarID))
-	username := getUserNameByID(int(userID))
 
-	// 构造聊天消息详情
-	detail := map[string]interface{}{
-		"user":    username,
-		"message": chatMsg.Message,
-	}
-	detailJSON, _ := json.Marshal(detail)
-
-	// 插入聊天消息事件到SessionFeed
+	// 插入聊天消息事件到SessionFeed（原版格式: {"user_id","msg"}）
 	globalDBWriter.InsertSessionFeed(&SessionFeed{
 		SessionID: globalSession.ID,
 		Type:      7,
-		Detail:    string(detailJSON),
+		Detail:    fmt.Sprintf(`{"user_id":%d,"msg":%q}`, userID, chatMsg.Message),
 		Time:      time.Now(),
 	})
 }
@@ -848,7 +858,7 @@ func supplementStintLapData(stintID int, sessionData *SessionData) error {
 		// 检查lap是否已存在于数据库并获取当前数据
 		var existingLap StintLap
 		err := globalDBWriter.DB.QueryRow(`
-			SELECT id, sector1, sector2, sector3, tyre, cuts 
+			SELECT stint_lap_id, sector_1, sector_2, sector_3, tyre, cuts 
 			FROM stint_lap 
 			WHERE stint_id = ? AND time = ?`, stintID, lap.LapTime).Scan(
 			&existingLap.ID, &existingLap.Sector1, &existingLap.Sector2, &existingLap.Sector3, &existingLap.Tyre, &existingLap.Cuts)
@@ -883,7 +893,7 @@ func supplementStintLapData(stintID int, sessionData *SessionData) error {
 			if needUpdate {
 				// 执行更新
 				_, err := globalDBWriter.DB.Exec(`
-					UPDATE stint_lap SET sector1=?, sector2=?, sector3=?, tyre=?, cuts=? WHERE id=?`,
+					UPDATE stint_lap SET sector_1=?, sector_2=?, sector_3=?, tyre=?, cuts=? WHERE stint_lap_id=?`,
 					existingLap.Sector1, existingLap.Sector2, existingLap.Sector3,
 					existingLap.Tyre, existingLap.Cuts, existingLap.ID)
 				if err != nil {
@@ -976,7 +986,7 @@ func handleEndSessionMessage(endMsg udp.EndSession, lastDataTime *time.Time) {
 					Crashes:    0,
 					CarCrashes: 0,
 					MaxSpeed:   0,
-					AvgSpeed:   globalTrackConfigs[globalEvent.TrackConfigID].Length / lap.LapTime,
+					AvgSpeed:   getTrackLength() / lap.LapTime,
 					FinishedAt: existingSession.StartTime.Add(time.Duration(lap.Timestamp) * time.Millisecond),
 				})
 			}
@@ -1093,6 +1103,7 @@ func completeMissingLaps(carID int, lastStintID int, jsonLaps []Lap) error {
 
 func handleNewSessionMessage(sessionMsg udp.SessionInfo, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
+	loadPitBoundary(sessionMsg.Track, sessionMsg.TrackConfig)
 	lapDataMutex.Lock()
 	carLapDataMap = make(map[int][]CarLapData)
 	stintLapData = make(map[int]map[int][]StintLap) // 清空stint_lap数据
@@ -1239,17 +1250,10 @@ func handleConnectionClosedMessage(connMsg udp.SessionCarInfo, lastDataTime *tim
 	// 插入用户断开连接事件SessionFeed (case3)
 	carID := int(connMsg.CarID)
 	userID := getUserIDByCarID(carID)
-	teamID := getTeamIDByCarID(carID)
-	detail := map[string]interface{}{
-		"user_id": userID,
-		"team_id": teamID,
-		"car_id":  carID,
-	}
-	detailJSON, _ := json.Marshal(detail)
 	globalDBWriter.InsertSessionFeed(&SessionFeed{
 		SessionID: globalSession.ID,
 		Type:      3,
-		Detail:    string(detailJSON),
+		Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, userID, carID),
 		Time:      time.Now(),
 	})
 
@@ -1270,9 +1274,9 @@ func handleCollisionWithCarMessage(collisionMsg udp.CollisionWithCar, lastDataTi
 	sf := &SessionFeed{
 		SessionID: globalSession.ID,
 		Type:      0,
-		Detail: fmt.Sprintf(`{"user_id_1": %d, "team_id_1": %d, "car_id_1": %d, "user_id_2": %d, "team_id_2": %d, "car_id_2": %d, "nsp": %.2f}`,
-			getUserIDByCarID(carID1), getTeamIDByCarID(carID1), carID1,
-			getUserIDByCarID(carID2), getTeamIDByCarID(carID2), carID2,
+		Detail: fmt.Sprintf(`{"user_id_1":%d,"user_id_2":%d,"car_id_1":%d,"car_id_2":%d,"speed":%d,"nsp":%g}`,
+			getUserIDByCarID(carID1), getUserIDByCarID(carID2), carID1, carID2,
+			int(collisionMsg.ImpactSpeed),
 			latestCarUpdates[udp.CarID(carID1)].NormalisedSplinePos),
 		Time: time.Now(),
 	}
@@ -1288,8 +1292,8 @@ func handleCollisionWithEnvMessage(collisionMsg udp.CollisionWithEnvironment, la
 	sf := &SessionFeed{
 		SessionID: globalSession.ID,
 		Type:      1,
-		Detail: fmt.Sprintf(`{"user_id": %d, "team_id": %d, "speed": %.2f, "nsp": %.2f}`,
-			getUserIDByCarID(carID), getTeamIDByCarID(carID), collisionMsg.ImpactSpeed,
+		Detail: fmt.Sprintf(`{"user_id":%d,"speed":%d,"car_id":%d,"nsp":%g}`,
+			getUserIDByCarID(carID), int(collisionMsg.ImpactSpeed), carID,
 			latestCarUpdates[udp.CarID(carID)].NormalisedSplinePos),
 		Time: time.Now(),
 	}
@@ -1303,7 +1307,14 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
 	carID := int(updateMsg.CarID)
 	currentSplinePos := updateMsg.NormalisedSplinePos
-	// 检查是否完成一圈 (从接近1变为接近0)
+
+	// 实时更新最新车辆数据（wsMutex 保护，供主循环构建排行榜使用）
+	wsMutex.Lock()
+	latestCarUpdates[updateMsg.CarID] = updateMsg
+	wsMutex.Unlock()
+
+	// 圈跟踪数据用 lapDataMutex 保护
+	lapDataMutex.Lock()
 	lastUpdates, exists := carLapData[carID]
 
 	var lastPos float32
@@ -1316,7 +1327,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	if lapCompleted {
 		// 生成遥测数据
 		if len(lastUpdates) > 0 {
-			telemetry, err := generateLapTelemetry(carID, int32(globalTrackConfigs[globalEvent.TrackConfigID].Length), lastUpdates)
+			telemetry, err := generateLapTelemetry(carID, int32(getTrackLength()), lastUpdates)
 			if err != nil {
 				logger.Printf("生成遥测数据失败: %v", err)
 			} else {
@@ -1327,6 +1338,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	}
 	// 添加新数据点到圈跟踪
 	carLapData[carID] = append(carLapData[carID], updateMsg)
+	lapDataMutex.Unlock()
 
 	// 判断是否在维修区
 	if len(pitBoundary) > 0 {
@@ -1364,7 +1376,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 					sf := &SessionFeed{
 						SessionID: globalSession.ID,
 						Type:      sfType,
-						Detail:    fmt.Sprintf(`{"user_id": %d, "team_id": %d}`, getUserIDByCarID(connInfo.CarID), getTeamIDByCarID(connInfo.CarID)),
+						Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, getUserIDByCarID(connInfo.CarID), connInfo.CarID),
 						Time:      time.Now(),
 					}
 					if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
@@ -1395,7 +1407,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 							sf := &SessionFeed{
 								SessionID: globalSession.ID,
 								Type:      12,
-								Detail:    fmt.Sprintf(`{"user_id": %d, "team_id": %d, "pit_time": %d}`, getUserIDByCarID(connInfo.CarID), getTeamIDByCarID(connInfo.CarID), pitDuration.Milliseconds()),
+								Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d,"pit_time":%d}`, getUserIDByCarID(connInfo.CarID), connInfo.CarID, pitDuration.Milliseconds()),
 								Time:      time.Now(),
 							}
 							if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
@@ -1417,12 +1429,40 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 			}
 		}
 	}
+}
 
-	// 实时发送遥测数据
-	wsMutex.Lock()
-	// 更新全局遥测数据变量，覆盖对应CarID的最新数据
-	latestCarUpdates[updateMsg.CarID] = updateMsg
-	wsMutex.Unlock()
+// getTrackLength 安全获取当前事件赛道长度，缺失时返回 0（避免 nil 解引用）
+func getTrackLength() int {
+	id := globalEvent.TrackConfigID
+	if tc, ok := globalTrackConfigs[id]; ok && tc != nil {
+		return tc.Length
+	}
+	tc, err := globalDBWriter.GetTrackConfigByID(id)
+	if err != nil || tc == nil {
+		return 0
+	}
+	globalTrackConfigs[id] = tc
+	return tc.Length
+}
+
+// loadPitBoundary 调用 kn5conv 生成/读取当前赛道的维修区边界（同一赛道只处理一次）。
+// 生成的 SVG 同时写入 cache.path/live-track-maps，供 HTTP 端赛道地图使用。
+func loadPitBoundary(trackName, configName string) {
+	if trackName == "" || cfg.App.Server.CachePath == "" {
+		return
+	}
+	key := trackName + "|" + configName
+	if pitBoundaryLoadedFor == key {
+		return
+	}
+	boundary, err := kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
+	if err != nil {
+		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
+		return
+	}
+	pitBoundary = boundary
+	pitBoundaryLoadedFor = key
+	logger.Printf("维修区边界已加载: %s, 顶点数: %d", key, len(boundary))
 }
 
 var currentLogFile string = ""
@@ -1435,6 +1475,7 @@ var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (\w+) \[[^\]]*\
 
 func handleSessionInfoMessage(sessionMsg udp.SessionInfo, lastDataTime *time.Time) {
 	var err error
+	loadPitBoundary(sessionMsg.Track, sessionMsg.TrackConfig)
 	latestFile, err = findLatestSessionLogFile(logDir)
 	if err != nil {
 		logger.Printf("查找最新会话日志文件失败: %v", err)
@@ -1501,12 +1542,13 @@ func handleSessionInfoMessage(sessionMsg udp.SessionInfo, lastDataTime *time.Tim
 						userID, _, err := globalDBWriter.FindOrCreateUser(user)
 						if err != nil {
 							logger.Printf("获取用户信息失败: %v", err)
-							globalMutex.Unlock()
-							return
+							continue
 						}
-						globalMutex.Lock()
+						connectionsMutex.Lock()
 						globalConnections[carID] = &connInfo
+						connectionsMutex.Unlock()
 
+						globalMutex.Lock()
 						globalUsers[userID] = user
 						globalMutex.Unlock()
 						//logger.Printf("已添加全局连接信息: %+v", connInfo)
@@ -1816,6 +1858,7 @@ func collectCarUpdates() {
 			if tyreMatch := tyreRegex.FindStringSubmatch(line); len(tyreMatch) == 3 {
 				username := tyreMatch[1]
 				tyreType := tyreMatch[2]
+				oldTyre := userTyres[username]
 				userTyres[username] = tyreType
 				userStintIDs[username]++
 
@@ -1831,32 +1874,14 @@ func collectCarUpdates() {
 				connectionsMutex.Unlock()
 
 				if carID != -1 {
-					// 获取用户ID和团队ID
+					// 获取用户ID
 					userID := getUserIDByCarID(carID)
-					teamID := getTeamIDByCarID(carID)
-					teamName := getTeamNameByID(int(teamID))
-					userName := getUserNameByID(int(userID))
 
-					// 构造轮胎更换事件详情
-					detail := fmt.Sprintf(`{
-						"car_id": %d,
-						"driver": "%s",
-						"team": "%s",
-						"tire_compound": "%s",
-						"change_time": "%s"
-					}`,
-						carID,
-						userName,
-						teamName,
-						tyreType,
-						time.Now().Format(time.RFC3339),
-					)
-
-					// 插入轮胎更换事件
+					// 插入轮胎更换事件（原版格式: {"user_id","car_id","old_t","new_t"}）
 					globalDBWriter.InsertSessionFeed(&SessionFeed{
 						SessionID: globalSession.ID,
 						Type:      16,
-						Detail:    detail,
+						Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d,"old_t":%q,"new_t":%q}`, userID, carID, oldTyre, tyreType),
 						Time:      time.Now(),
 					})
 				}
@@ -2107,7 +2132,15 @@ func main() {
 	initLogger()
 	logger.Println("Writer应用程序启动")
 
-	data, err := os.ReadFile("config/config.toml")
+	// 命令行参数：默认真正写库（模仿原版 SimView）；加 -simulate 则只模拟、不写库
+	simulateMode := flag.Bool("simulate", false, "为 true 时仅模拟、不向数据库写入；默认 false 会真正写库")
+	flag.Parse()
+
+	configPath := firstExistingPath("config/config.toml", "simview/config/config.toml", "config.toml")
+	if configPath == "" {
+		fatalLogger.Fatalf("未找到 config.toml（已尝试 config/config.toml、simview/config/config.toml）")
+	}
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		fatalLogger.Fatalf("读取配置文件失败: %v", err)
 	}
@@ -2119,6 +2152,9 @@ func main() {
 	}
 	cfg = &config
 	//logger.Printf("配置加载成功: %+v", cfg)
+	// 初始化全局对象，避免首个消息到达前对 nil 解引用
+	globalEvent = &Event{}
+	globalSession = &Session{}
 	logDir = filepath.Join(cfg.Game.Path, "logs", "session")
 	port := config.Database.Port
 	if port == 0 {
@@ -2132,16 +2168,29 @@ func main() {
 		port,
 		cfg.Database.Schema)
 
-	dbWriter, err := NewDBWriter(dsn)
+	dbWriter, err := NewDBWriter(dsn, *simulateMode)
 	if err != nil {
 		fatalLogger.Fatalf("Failed to create DBWriter: %v", err)
 	}
 	globalDBWriter = dbWriter // 设置全局DBWriter实例
 	defer dbWriter.Close()
+	if *simulateMode {
+		logger.Println("SQL模拟模式已开启：本次运行不会向数据库写入任何数据")
+	}
 
 	// 加载并验证server_cfg.ini配置
 	if err := dbWriter.LoadServerConfig(cfg.Game.Path); err != nil {
 		fatalLogger.Fatalf("server_cfg.ini验证失败: %v", err)
+	}
+	// 用 server_cfg.ini 的 session 时长初始化 event 默认值（模仿原版写入 event 表）
+	if sc := dbWriter.ServerCfg; sc != nil {
+		globalEvent.PracticeDuration = sc.PracticeDuration
+		globalEvent.QualiDuration = sc.QualiDuration
+		globalEvent.RaceDuration = sc.RaceDuration
+		globalEvent.RaceDurationType = sc.RaceDurationType
+		globalEvent.RaceWaitTime = sc.RaceWaitTime
+		globalEvent.RaceExtraLaps = sc.RaceExtraLaps
+		globalEvent.ReverseGridPos = sc.ReverseGridPositions
 	}
 	// 加载并验证entry_list配置
 	if err := dbWriter.LoadEntryList(cfg.Game.Path); err != nil {
@@ -2239,7 +2288,11 @@ outerLoop:
 			buildAndSendWebSocketMessage()
 
 			// 定期检查连接状态
-			time.Sleep(time.Duration(cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS) * time.Millisecond)
+			interval := cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS
+			if interval <= 0 {
+				interval = 2000
+			}
+			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}
 	}
 }

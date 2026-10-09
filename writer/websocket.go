@@ -9,7 +9,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"time"
@@ -33,8 +35,14 @@ func initWebSocket() error {
 	wssURL := url.URL{Scheme: "ws", Host: fmt.Sprintf("localhost:%d", cfg.App.Server.Port), Path: "/live"}
 	url := wssURL.String()
 
+	// HTTP 端要求连接携带 eventId cookie，否则会被直接断开
+	header := http.Header{}
+	if globalEvent != nil && globalEvent.ID > 0 {
+		header.Set("Cookie", fmt.Sprintf("eventId=%d", globalEvent.ID))
+	}
+
 	// 建立WebSocket连接
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(url, header)
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %v", err)
 	}
@@ -120,6 +128,14 @@ func buildAndSendWebSocketMessage() {
 			session.CurrentGrip = globalSession.CurrentGrip
 		}
 	}
+
+	// 补充与 HTTP 端对齐的会话字段
+	session.EventID = globalEvent.ID
+	session.Name = globalSession.Name
+	session.TrackTime = globalSession.TrackTime
+	session.Laps = globalSession.Laps
+	session.Weather = globalSession.Weather
+	session.HttpPort = globalSession.HTTPPort
 
 	// 计算已用时间
 	elapsedMs, err := calculateElapsedMs(session.SessionID)
@@ -224,20 +240,40 @@ func parseLeaderboardEntries(sessionID int, carUpdates map[udp.CarID]udp.CarUpda
 
 		// 获取赛道状态（0=正常赛道, 1=偏离赛道, 2=维修区入口, 3=维修区, 4=维修区出口）
 		var trackStatus uint8
+		connectionsMutex.Lock()
 		if conn, ok := globalConnections[ServerCarID]; ok {
 			trackStatus = conn.TrackStatus // 赛道状态掩码（0=正常赛道, 1=偏离赛道, 2=维修区入口, 3=维修区, 4=维修区出口）
 		} else {
 			trackStatus = 0 // 默认正常赛道状态
 		}
-		// 组合状态：高4位存储连接状态，低4位存储赛道状态
-		combinedStatus := (status << 4) | trackStatus
+		connectionsMutex.Unlock()
+		// 组合状态（位布局须与前端 LeaderBoardDeserialiser 一致）：
+		// isFinished=bit0, trackStatus=bits1-4, connectionStatus=bits5-7
+		combinedStatus := (trackStatus << 1) | (status << 5)
+
+		// 速度（km/h），供 mask2 的 gear/speed 使用
+		vel := math.Sqrt(float64(update.Velocity.X*update.Velocity.X + update.Velocity.Y*update.Velocity.Y + update.Velocity.Z*update.Velocity.Z))
+		speedKmh := uint16(vel * 3.6)
+
+		// 解析该槽位对应的数据库车辆 id（前端用 car_id 关联 /api/ac/cars 拿名字/组别）
+		dbCarID := 0
+		connectionsMutex.Lock()
+		if conn, ok := globalConnections[ServerCarID]; ok {
+			for _, car := range globalCars {
+				if car.Name == conn.CarModel {
+					dbCarID = car.ID
+					break
+				}
+			}
+		}
+		connectionsMutex.Unlock()
 
 		// 构建Entry对象
 		entry := Entry{
 			TeamID:        0, // 团队赛事中会覆盖此值
 			UserID:        0, // 根据赛事类型在后续逻辑中设置
-			CarID:         uint16(ServerCarID),
-			GameCarID:     0, // 默认值，实际应从数据库获取
+			CarID:         uint16(dbCarID),
+			GameCarID:     ServerCarID,
 			Laps:          uint16(laps),
 			ValidLaps:     uint16(validLaps),
 			CurrentLapS1:  uint32(currentS1),
@@ -256,6 +292,8 @@ func parseLeaderboardEntries(sessionID int, carUpdates map[udp.CarID]udp.CarUpda
 			PosZ:          float32(update.Pos.Z),
 			TelemetryMask: 0,
 			RPM:           uint16(update.EngineRPM),
+			Gear:          update.Gear,
+			Speed:         speedKmh,
 			BestLapS1:     0,
 			BestLapS2:     0,
 			BestLapS3:     0,
@@ -299,16 +337,16 @@ func parseLeaderboardEntries(sessionID int, carUpdates map[udp.CarID]udp.CarUpda
 			lapDataMutex.Unlock()
 		}
 
-		// 设置赛段掩码
+		// 设置赛段掩码（位布局与前端一致）：currentLap=bits0-1, s3=bits2-3, s2=bits4-5, s1=bits6-7
 		sectorMask := uint8(0)
 		if currentS1 > 0 {
-			sectorMask |= 0x01 // 赛段1已完成
+			sectorMask |= 1 << 6
 		}
 		if currentS2 > 0 {
-			sectorMask |= 0x02 // 赛段2已完成
+			sectorMask |= 1 << 4
 		}
 		if currentS3 > 0 {
-			sectorMask |= 0x04 // 赛段3已完成
+			sectorMask |= 1 << 2
 		}
 		entry.SectorMask = sectorMask
 

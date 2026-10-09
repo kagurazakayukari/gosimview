@@ -281,8 +281,13 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	config.ACServer.UDP.Port = getIntValue(config.ACServer.RawConfig, "udp.port")
 	config.ACServer.UDP.LocalPort = getIntValue(config.ACServer.RawConfig, "udp.local.port")
 	config.ACServer.UDP.UseACSMUDP = getBoolValue(config.ACServer.RawConfig, "udp.use.acsm.udp")
-	config.ACServer.Event.Team.LiveryPreviewEnable = getBoolValue(config.ACServer.RawConfig, "event.team.livery.preview.enable")
 	config.ACServer.UDP.Realtime.Update.Interval.MS = getIntValue(config.ACServer.RawConfig, "udp.realtime.update.interval.ms")
+	// 事件与团队相关配置（此前遗漏，导致 event.name / team 开关无效）
+	config.ACServer.Event.Name = getStringValue(config.ACServer.RawConfig, "event.name")
+	config.ACServer.Event.LapTelemetryEnable = getBoolValue(config.ACServer.RawConfig, "event.lap.telemetry.enable")
+	config.ACServer.Event.Team.Enable = getBoolValue(config.ACServer.RawConfig, "event.team.enable")
+	config.ACServer.Event.Team.UseNumber = getBoolValue(config.ACServer.RawConfig, "event.team.use.number")
+	config.ACServer.Event.Team.LiveryPreviewEnable = getBoolValue(config.ACServer.RawConfig, "event.team.livery.preview.enable")
 
 	// 映射Writer配置
 	config.Writer.HTTP.Port = getIntValue(config.Writer.RawConfig, "http.port")

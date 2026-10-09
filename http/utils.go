@@ -114,10 +114,23 @@ func methodMiddleware(next http.HandlerFunc, allowedMethods ...string) http.Hand
 	}
 }
 
+// firstExistingPath 返回第一个存在的路径，都没有时返回空字符串
+func firstExistingPath(paths ...string) string {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 // serveFileWithGzip 统一处理静态文件，支持自动处理.gz压缩文件
 func serveFileWithGzip(w http.ResponseWriter, _ *http.Request, fileName string) {
 	// 构建文件路径
-	basePath := filepath.Join("html", fileName)
+	basePath := filepath.Join(docRoot, fileName)
 	gzPath := basePath + ".gz"
 	var filePath string
 	var isGzip bool

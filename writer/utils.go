@@ -24,6 +24,19 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// firstExistingPath 返回第一个存在的路径，都没有时返回空字符串
+func firstExistingPath(paths ...string) string {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 // calculateElapsedMs 计算会话已用时间（毫秒）
 func calculateElapsedMs(sessionID int64) (int64, error) {
 	// 查询会话开始时间

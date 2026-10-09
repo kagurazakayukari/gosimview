@@ -314,6 +314,10 @@ func handleACUsers(w http.ResponseWriter, r *http.Request) {
 // 处理单个用户详情请求
 func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 5 || pathParts[4] == "" {
+		sendErrorResponse(w, http.StatusBadRequest, "缺少用户ID参数", "user")
+		return
+	}
 	driverId := pathParts[4]
 	hasSummary := false
 	if len(pathParts) > 5 && strings.ToLower(pathParts[5]) == "summary" {
@@ -571,6 +575,11 @@ func handleACTrack(w http.ResponseWriter, r *http.Request) {
 		resourceType = pathParts[4]
 	}
 
+	// 将 track_config_id 注入 query，供 handleTrackSVG/handleTrackImage 读取
+	q := r.URL.Query()
+	q.Set("track_config_id", trackID)
+	r.URL.RawQuery = q.Encode()
+
 	// 根据资源类型分发到不同的处理函数
 	switch resourceType {
 	case "map":
@@ -736,6 +745,12 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 	var allLaps []ACBestLap
 	var page, entries int = 1, 10
 	var err error
+
+	// 防御：路径过短时直接返回，避免 pathParts[3] 越界 panic
+	if len(pathParts) < 4 {
+		sendErrorResponse(w, http.StatusBadRequest, "无效的URL路径格式", "bestlap")
+		return
+	}
 
 	// 判断是按事件还是按赛道查询
 	switch pathParts[3] {
@@ -1145,78 +1160,8 @@ func handleACSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 根据资源类型处理不同请求
-	switch resourceType {
-	case "":
-		// 单个会话详情
-		session := ACSession{}
-		err := db.QueryRow("SELECT session_id, event_id, type, track_time, name, CAST(UNIX_TIMESTAMP(start_time) * 1000000 AS SIGNED) AS start_time, duration_min, elapsed_ms, laps, weather, air_temp, road_temp, start_grip, current_grip, is_finished, CAST(UNIX_TIMESTAMP(finish_time) * 1000000 AS SIGNED) AS finish_time, CAST(UNIX_TIMESTAMP(last_activity) * 1000000 AS SIGNED) AS last_activity FROM session WHERE session_id = ?", sessionIDInt).Scan(
-			&session.SessionID, &session.EventID, &session.Type, &session.TrackTime, &session.Name, &session.StartTime, &session.DurationMin, &session.ElapsedMs, &session.Laps, &session.Weather, &session.AirTemp, &session.RoadTemp, &session.StartGrip, &session.CurrentGrip, &session.IsFinished, &session.FinishTime, &session.LastActivity)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				sendErrorResponse(w, http.StatusNotFound, "会话不存在", "sessionDetails")
-				return
-			}
-			logger.Printf("查询会话失败: %v", err)
-			sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("查询会话失败: %v", err), "sessionDetails")
-			return
-		}
-		sendSuccessResponse(w, "会话详情获取成功", "session", session)
-
-	case "live":
-		// 单个会话实时数据
-		liveData := ACLiveData{}
-		err := db.QueryRow("SELECT session_id, timestamp, status FROM live_data WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1", sessionID).Scan(
-			&liveData.SessionID, &liveData.Timestamp, &liveData.Status)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				sendErrorResponse(w, http.StatusNotFound, "实时数据不存在", "sessionLive")
-				return
-			}
-			logger.Printf("查询实时数据失败: %v", err)
-			sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("查询实时数据失败: %v", err), "sessionLive")
-			return
-		}
-		sendSuccessResponse(w, "实时数据获取成功", "liveData", liveData)
-
-	case "live/positions":
-		// 单个会话实时位置
-		rows, err := db.Query("SELECT driver_id, driver_name, position, x, y, z FROM session_feed WHERE session_id = ? ORDER BY position", sessionID)
-		if err != nil {
-			logger.Printf("查询位置数据失败: %v", err)
-			sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("查询位置数据失败: %v", err), "sessionPositions")
-			return
-		}
-		defer rows.Close()
-
-		var positions []ACLivePosition
-		for rows.Next() {
-			pos := ACLivePosition{}
-			if err := rows.Scan(&pos.DriverID, &pos.DriverName, &pos.Position, &pos.X, &pos.Y, &pos.Z); err != nil {
-				logger.Printf("解析位置数据失败: %v", err)
-				sendErrorResponse(w, http.StatusInternalServerError, "解析位置数据失败", "sessionPositions")
-				return
-			}
-			positions = append(positions, pos)
-		}
-		sendSuccessResponse(w, "位置数据获取成功", "positions", positions)
-
-	case "result":
-		// 单个会话结果
-		result := ACResult{}
-		err := db.QueryRow("SELECT session_id, winner_driver, winner_team, laps_completed, fastest_lap FROM results WHERE session_id = ?", sessionID).Scan(
-			&result.SessionID, &result.WinnerDriver, &result.WinnerTeam, &result.LapsCompleted, &result.FastestLap)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				sendErrorResponse(w, http.StatusNotFound, "结果数据不存在", "sessionResult")
-				return
-			}
-			logger.Printf("查询结果数据失败: %v", err)
-			sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("查询结果数据失败: %v", err), "sessionResult")
-			return
-		}
-		sendSuccessResponse(w, "结果数据获取成功", "result", result)
-	}
+	// 根据资源类型分发到对应处理器（实现在 session_result.go）
+	dispatchSessionResource(w, r, sessionIDInt, resourceType)
 }
 
 // 处理AC事件详情请求
@@ -1381,9 +1326,9 @@ func handleTrackSVG(w http.ResponseWriter, r *http.Request) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		logger.Printf("打开地图文件失败: %v", err)
-		w.WriteHeader(http.StatusNotFound)
-		// 返回默认SVG以避免前端错误
+		// 返回默认SVG以避免前端错误（必须先设置头部再写状态码）
 		w.Header().Set("Content-Type", "image/svg+xml")
+		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><text x="100" y="50" text-anchor="middle">地图未找到</text></svg>`))
 		return
 	}

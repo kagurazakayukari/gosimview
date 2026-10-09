@@ -37,12 +37,19 @@ var cfg *config.Config // 全局配置实例
 // 静态文件服务器实例
 var fs http.Handler
 
+// 静态文件根目录（启动时解析）
+var docRoot = "html"
+
 func main() {
 	// 初始化日志系统
 	initLogger()
 	logger.Println("应用程序启动")
 
-	data, err := os.ReadFile("config/config.toml")
+	configPath := firstExistingPath("config/config.toml", "simview/config/config.toml", "config.toml")
+	if configPath == "" {
+		fatalLogger.Fatalf("未找到 config.toml（已尝试 config/config.toml、simview/config/config.toml）")
+	}
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		fatalLogger.Fatalf("读取配置文件失败: %v", err)
 	}
@@ -53,6 +60,12 @@ func main() {
 		fatalLogger.Fatalf("解析配置失败: %v", err)
 	}
 	cfg = &config
+	// 解析静态文件目录：优先 config 的 server.doc.root，其次 simview/html，最后 html
+	docRoot = firstExistingPath(cfg.App.Server.DocRoot, "simview/html", "html")
+	if docRoot == "" {
+		docRoot = cfg.App.Server.DocRoot
+	}
+	logger.Printf("静态文件目录: %s", docRoot)
 	// 连接数据库
 	if err := connectDB(cfg); err != nil {
 		fatalLogger.Fatalf("数据库连接失败: %v", err)
@@ -147,11 +160,10 @@ func connectDB(config *config.Config) error {
 
 // executeSQLSchema 执行SQL schema文件
 func executeSQLSchema(db *sql.DB, logger *log.Logger) {
-	// 只在data目录下查找SQL文件
-	dataSQLFiles, err := filepath.Glob("data/*.sql")
-	if err != nil {
-		logger.Printf("查找data目录下的SQL文件失败: %v", err)
-		return
+	// 只在data目录下查找SQL文件（支持从仓库根或 simview/ 下启动）
+	dataSQLFiles, _ := filepath.Glob("data/*.sql")
+	if len(dataSQLFiles) == 0 {
+		dataSQLFiles, _ = filepath.Glob("simview/data/*.sql")
 	}
 
 	var sqlFile string
