@@ -272,12 +272,6 @@ func readString(r io.Reader, sizeMultiplier int) string {
 	return string(b)
 }
 
-// SendGetCarInfo 请求指定槽位的既有车辆身份，报文为 event byte + slot byte。
-func (asu *AssettoServerUDP) SendGetCarInfo(slot CarID) error {
-	_, err := asu.listener.Write([]byte{byte(EventGetCarInfo), byte(slot)})
-	return err
-}
-
 func (asu *AssettoServerUDP) SendMessage(message Message) error {
 	switch a := message.(type) {
 	case EnableRealtimePosInterval:

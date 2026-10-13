@@ -1826,23 +1826,12 @@ outerLoop:
 	sessionInfoReceived:
 		logger.Println("已获取SessionInfo，开始主循环")
 
-		// 启动时主动请求既有在线车辆，不要求车手重新连接。
+		// 使用 UDP 包原有的实时更新请求，不额外构造车辆查询报文。
 		if cfg.ACServer.UDP.Realtime.Update.Interval.MS > 0 {
 			udp.RealtimePosIntervalMs = cfg.ACServer.UDP.Realtime.Update.Interval.MS
 		}
 		if err := acClient.SendMessage(udp.NewEnableRealtimePosInterval(udp.RealtimePosIntervalMs)); err != nil {
 			logger.Printf("开启车辆更新失败: %v", err)
-		}
-		stateMutex.RLock()
-		slots := make([]int, 0, len(globalEntryList))
-		for slot := range globalEntryList {
-			slots = append(slots, slot)
-		}
-		stateMutex.RUnlock()
-		for _, slot := range slots {
-			if err := acClient.SendGetCarInfo(udp.CarID(slot)); err != nil {
-				logger.Printf("请求车辆信息失败: %v", err)
-			}
 		}
 		// 初始化WebSocket连接
 		wsPort := cfg.App.Server.Port
