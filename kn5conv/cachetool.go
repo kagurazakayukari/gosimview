@@ -274,6 +274,13 @@ func parsePitLaneAI(filePath string) ([][3]float32, error) {
 		return nil, fmt.Errorf("读取头部失败: %w", err)
 	}
 	length := int(header[1])
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if length <= 0 || int64(length)*20 > info.Size()-16 {
+		return nil, fmt.Errorf("pit_lane.ai 点数与文件长度不一致")
+	}
 
 	// 读取rawIdeal数据
 	rawIdeal := make([][5]float32, length)
@@ -311,7 +318,7 @@ func generatePitBoundary(model *KN5Model, aiPoints [][3]float32, cacheDir, kn5Fi
 			// 提取顶点数据（x,y,z）
 			for i := 0; i < len(node.Position); i += 3 {
 				if i+2 >= len(node.Position) {
-					// break // 移除break，确保处理所有文件
+					break
 				}
 				x, y, z := node.Position[i], node.Position[i+1], node.Position[i+2]
 				pitVertices = append(pitVertices, [3]float32{x, y, z})
@@ -345,7 +352,7 @@ func generatePitBoundary(model *KN5Model, aiPoints [][3]float32, cacheDir, kn5Fi
 	defer writerPN.Flush()
 
 	// 5. 写入所有pit节点的xz坐标
-	for _, v := range pitVertices {
+	for _, v := range boundary {
 		if _, err := fmt.Fprintf(writerPN, "%.3f %.3f\n", v[0], v[2]); err != nil {
 			return nil, false, fmt.Errorf("写入pit节点失败: %w", err)
 		}
@@ -414,8 +421,6 @@ func generatePitBoundary(model *KN5Model, aiPoints [][3]float32, cacheDir, kn5Fi
 			}
 			logrus.Infof("成功生成4个扩展点并创建PB文件: %s", pbFileName)
 		}
-	} else {
-		return nil, false, fmt.Errorf("未找到足够的交点，无法生成维修区边界")
 	}
 	return boundary, true, nil
 }
@@ -477,6 +482,13 @@ func parseFastLaneAI(filePath string) ([]TrackDetail, error) {
 		return nil, fmt.Errorf("读取头部失败: %w", err)
 	}
 	pointCount := int(header[1])
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if pointCount <= 0 || int64(pointCount)*20 > info.Size()-16 {
+		return nil, fmt.Errorf("fast_lane.ai 点数与文件长度不一致")
+	}
 
 	rawIdeal := make([][5]interface{}, pointCount)
 	for i := 0; i < pointCount; i++ {
@@ -509,6 +521,9 @@ func parseFastLaneAI(filePath string) ([]TrackDetail, error) {
 
 	// 读取额外细节数据
 	extraCount := int(header[3])
+	if extraCount < 0 || extraCount > pointCount {
+		return nil, fmt.Errorf("fast_lane.ai 细节点数不合法: %d", extraCount)
+	}
 	details := make([]TrackDetail, extraCount)
 	for i := 0; i < extraCount; i++ {
 		var rawDetail [18]float32
@@ -518,10 +533,8 @@ func parseFastLaneAI(filePath string) ([]TrackDetail, error) {
 			}
 		}
 
-		prevRawIdeal := rawIdeal[i-1]
-		if i == 0 {
-			prevRawIdeal = rawIdeal[len(rawIdeal)-1]
-		}
+		prevIndex := (i + len(rawIdeal) - 1) % len(rawIdeal)
+		prevRawIdeal := rawIdeal[prevIndex]
 
 		// 计算方向
 		prevPos := [3]float32{prevRawIdeal[0].(float32), prevRawIdeal[1].(float32), prevRawIdeal[2].(float32)}
@@ -1147,123 +1160,80 @@ func distance2D(a, b [3]float32) float32 {
 // --------------------------- 批量处理函数 ---------------------------
 // BatchProcess 批量处理指定目录下的models_gp.ini中的KN5文件
 func BatchProcess(gameDir, cacheDir, trackName, configName string) ([][3]float32, error) {
-
-	// 1. 拼接models_gp.ini路径
-	iniPath := filepath.Join(gameDir, "content", "tracks", trackName, "models_"+configName+".ini")
-	surfacePath := filepath.Join(gameDir, "content", "tracks", trackName, configName, "data", "surfaces.ini")
-	sectionPath := filepath.Join(gameDir, "content", "tracks", trackName, configName, "data", "sections.ini")
-	// 2. 解析INI文件，提取KN5文件列表
-	logrus.Infof("开始解析配置文件: %s", iniPath)
-	kn5FileNames, err := parseModelsIni(iniPath)
-	if err != nil {
-		return nil, fmt.Errorf("解析models ini失败: %w", err)
-	}
-
-	logrus.Infof("开始解析配置文件: %s", surfacePath)
-	surfaceName, err := parseSurfaceIni(surfacePath)
-	if err != nil {
-		return nil, fmt.Errorf("解析surfaces ini失败: %w", err)
-	}
-
-	logrus.Infof("开始解析配置文件: %s", sectionPath)
-	sections, err := parseSectionIni(sectionPath)
-	if err != nil {
-		return nil, fmt.Errorf("解析sections ini失败: %w", err)
-	}
-
-	// 解析fast_lane.ai获取赛道详细信息
-	fastLanePath := filepath.Join(gameDir, "content", "tracks", trackName, configName, "ai", "fast_lane.ai")
-	trackDetails, err := parseFastLaneAI(fastLanePath)
-	if err != nil {
-		return nil, fmt.Errorf("解析fast_lane.ai失败: %w", err)
-	}
-
-	// 解析pit_lane.ai获取AI路径点
-	pitLanePath := filepath.Join(gameDir, "content", "tracks", trackName, configName, "ai", "pit_lane.ai")
-	aiPoints, err := parsePitLaneAI(pitLanePath)
-	if err != nil {
-		return nil, fmt.Errorf("解析pit_lane.ai失败: %w", err)
-	}
-
+	trackDir := filepath.Join(gameDir, "content", "tracks", trackName)
+	layoutDir := filepath.Join(trackDir, configName)
+	key := trackName + "_" + configName
+	pnPath := filepath.Join(cacheDir, "tracks", "pit_node_"+key+".pn")
 	var boundary [][3]float32
-	// 检查PB和PN文件是否存在
-	tbFileName := trackName + "_" + configName
-	pbFileName := "pit_boundary_" + tbFileName + ".pb"
-	pbFilePath := filepath.Join(cacheDir, "tracks", pbFileName)
-	pnFileName := "pit_node_" + tbFileName + ".pn"
-	pnFilePath := filepath.Join(cacheDir, "tracks", pnFileName)
-
-	pbExists := false
-	pnExists := false
-
-	_, err = os.Stat(pbFilePath)
-	if err == nil {
-		pbExists = true
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("检查PB文件时发生错误: %v", err)
-	}
-
-	_, err = os.Stat(pnFilePath)
-	if err == nil {
-		pnExists = true
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("检查PN文件时发生错误: %v", err)
-	}
-
-	// 根据存在情况决定是否处理
-	if pnExists {
-		logrus.Infof("PN文件已存在，读取边界数据: %s", tbFileName)
-		// 读取PN文件获取边界数据
-		boundary, err = readPitBoundary(pnFilePath)
+	if _, err := os.Stat(pnPath); err == nil {
+		points, err := readPitBoundary(pnPath)
 		if err != nil {
-			return nil, fmt.Errorf("读取PN文件失败: %w", err)
+			return nil, err
+		}
+		boundary = computeConvexHull(points)
+		if len(boundary) < 3 {
+			return nil, fmt.Errorf("维修区缓存不足三个边界点")
+		}
+		// 已缓存的边界不再依赖 KN5 原始素材。
+		if _, err := os.Stat(filepath.Join(cacheDir, "live-track-maps", "map_"+key+".svg")); err == nil {
+			return boundary, nil
 		}
 	}
-
-	generatePNOnly := pbExists && !pnExists
-
-	// 3. 遍历每个KN5文件处理
-	successCount := 0
-	failCount := 0
-	for _, kn5FileName := range kn5FileNames {
-		// 拼接KN5文件完整路径
-		kn5FilePath := filepath.Join(gameDir, "content", "tracks", trackName, kn5FileName)
-		logrus.Infof("开始处理KN5文件: %s", kn5FilePath)
-
-		// 验证KN5文件存在
-		if _, err := os.Stat(kn5FilePath); os.IsNotExist(err) {
-			logrus.Errorf("KN5文件不存在，跳过: %s", kn5FilePath)
-			failCount++
-			continue
+	if len(boundary) == 0 {
+		modelsName := "models.ini"
+		if configName != "" {
+			modelsName = "models_" + configName + ".ini"
 		}
-
-		// 读取KN5文件
-		model, err := readKN5(kn5FilePath)
+		models, err := parseModelsIni(filepath.Join(trackDir, modelsName))
 		if err != nil {
-			logrus.Errorf("读取KN5文件失败，跳过: %s, 错误: %v", kn5FilePath, err)
-			failCount++
-			continue
+			return nil, err
 		}
-
-		// 生成Pit边界
-		var success bool = false
-		boundary, success, err = generatePitBoundary(model, aiPoints, cacheDir, kn5FileName, surfaceName, tbFileName, generatePNOnly)
-
+		surface, err := parseSurfaceIni(filepath.Join(layoutDir, "data", "surfaces.ini"))
 		if err != nil {
-			logrus.Errorf("生成Pit边界失败，跳过: %s, 错误: %v", kn5FilePath, err)
-			continue
+			return nil, err
 		}
-		if !success {
-			continue
+		pitAI, err := parsePitLaneAI(filepath.Join(layoutDir, "ai", "pit_lane.ai"))
+		if err != nil {
+			return nil, err
 		}
-		successCount++
-		logrus.Infof("KN5文件%s处理完成", kn5FileName)
-
-		// 生成SVG文件
-		if err := generateSVGFile(cacheDir, trackName, configName, trackDetails, aiPoints, sections); err != nil {
-			logrus.Errorf("生成SVG文件失败: %v", err)
+		for _, name := range models {
+			model, err := readKN5(filepath.Join(trackDir, name))
+			if err != nil {
+				logrus.Warnf("读取KN5失败: %v", err)
+				continue
+			}
+			points, ok, err := generatePitBoundary(model, pitAI, cacheDir, name, surface, key, false)
+			if err != nil {
+				logrus.Warnf("生成边界失败: %v", err)
+				continue
+			}
+			if ok {
+				boundary = points
+				break
+			}
 		}
-		break
+		if len(boundary) < 3 {
+			return nil, fmt.Errorf("未找到有效维修区边界: %s", key)
+		}
+	}
+	// 地图是独立产物，失败不能丢掉已取得的维修区边界。
+	details, err := parseFastLaneAI(filepath.Join(layoutDir, "ai", "fast_lane.ai"))
+	if err != nil {
+		logrus.Warnf("读取赛道地图数据失败: %v", err)
+		return boundary, nil
+	}
+	pitAI, err := parsePitLaneAI(filepath.Join(layoutDir, "ai", "pit_lane.ai"))
+	if err != nil {
+		logrus.Warnf("读取维修区地图数据失败: %v", err)
+		return boundary, nil
+	}
+	sections, err := parseSectionIni(filepath.Join(layoutDir, "data", "sections.ini"))
+	if err != nil {
+		logrus.Warnf("没有赛道分区标签: %v", err)
+		sections = nil
+	}
+	if err := generateSVGFile(cacheDir, trackName, configName, details, pitAI, sections); err != nil {
+		logrus.Warnf("生成地图失败: %v", err)
 	}
 	return boundary, nil
 }

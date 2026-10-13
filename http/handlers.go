@@ -23,11 +23,21 @@ import (
 	"time"
 )
 
-// sanitize 清理字符串，移除文件名中不允许的字符
-func sanitize(s string) string {
-	// 替换文件名中不允许的字符为下划线
-	reg := regexp.MustCompile(`[<>:"/\\|?*]`)
-	return reg.ReplaceAllString(s, "_")
+// parseIDList 解析逗号分隔的 ID 列表；空字符串返回空列表
+func parseIDList(s string) ([]int, error) {
+	ids := []int{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("无效的ID: %s", part)
+		}
+		ids = append(ids, n)
+	}
+	return ids, nil
 }
 
 // 处理AC事件列表请求
@@ -48,20 +58,27 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// 从WebSocket获取实时会话数据
-		liveEventsMutex.Lock()
-		defer liveEventsMutex.Unlock()
-
-		var sessions []ACSession
-		// 过滤匹配当前eventIDs的会话
-		if liveEventsData.Session.EventID > 0 {
-			for _, idStr := range eventIDs {
-				id, _ := strconv.Atoi(idStr)
-				if liveEventsData.Session.EventID == id {
-					sessions = append(sessions, liveEventsData.Session)
-					break
-				}
+		sessions := []ACSession{}
+		seen := map[int]bool{}
+		for _, idStr := range eventIDs {
+			id, _ := strconv.Atoi(idStr)
+			if id <= 0 || seen[id] {
+				continue
 			}
+			seen[id] = true
+			session, ok, err := latestSessionForEvent(id)
+			if err != nil {
+				logger.Printf("查询最新会话失败(event=%d): %v", id, err)
+				continue
+			}
+			if !ok {
+				continue
+			}
+			// 有实时推送时优先使用（可能比库里的更新）
+			if live := hubLiveSession(id); live != nil && live.SessionID >= session.SessionID {
+				session = *live
+			}
+			sessions = append(sessions, session)
 		}
 		sendSuccessResponse(w, "最新事件会话获取成功", "sessions", sessions)
 		return
@@ -69,7 +86,7 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 
 	// 原handleACEvents函数逻辑
 
-	rows, err := db.Query(`SELECT event_id, name, server_name, track_config_id, practice_duration, quali_duration, race_duration, race_duration_type, race_extra_laps, reverse_grid_positions FROM event ORDER BY event_id DESC`)
+	rows, err := db.Query(`SELECT ` + eventSelectColumns + ` FROM event ORDER BY event_id DESC`)
 	if err != nil {
 		logger.Printf("AC事件查询SQL错误: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "数据库查询失败", "events")
@@ -77,10 +94,10 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	events := []ACEvent{}
+	events := []ACEventResponse{}
 	for rows.Next() {
-		e := ACEvent{}
-		if err := rows.Scan(&e.EventID, &e.Name, &e.ServerName, &e.TrackConfigID, &e.PracticeDuration, &e.QualiDuration, &e.RaceDuration, &e.RaceDurationType, &e.RaceExtraLaps, &e.ReverseGridPositions); err != nil {
+		e, err := scanEventRow(rows)
+		if err != nil {
 			logger.Printf("数据库行扫描失败: %v", err)
 			sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "events")
 			return
@@ -97,18 +114,65 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 	sendSuccessResponse(w, "AC事件数据获取成功", "events", events)
 }
 
+// eventSelectColumns 事件统一查询列（对应 ACEventResponse 的字段顺序）
+const eventSelectColumns = "event_id, name, server_name, track_config_id, team_event, active, livery_preview, use_number, practice_duration, quali_duration, race_duration, race_duration_type, race_wait_time, race_extra_laps, reverse_grid_positions"
+
+// scanEventRow 扫描一行事件数据
+func scanEventRow(sc rowScanner) (ACEventResponse, error) {
+	var e ACEventResponse
+	err := sc.Scan(&e.EventID, &e.Name, &e.ServerName, &e.TrackConfigID, &e.TeamEvent, &e.Active,
+		&e.LiveryPreview, &e.UseNumber, &e.PracticeDuration, &e.QualiDuration, &e.RaceDuration,
+		&e.RaceDurationType, &e.RaceWaitTime, &e.RaceExtraLaps, &e.ReverseGridPositions)
+	return e, err
+}
+
+// queryEvents 按 ID 列表查询事件
+func queryEvents(ids []int) []ACEventResponse {
+	events := []ACEventResponse{}
+	if len(ids) == 0 {
+		return events
+	}
+	rows, err := db.Query(`SELECT `+eventSelectColumns+` FROM event WHERE event_id IN (`+placeholders(len(ids))+`) ORDER BY event_id DESC`, intsToArgs(ids)...)
+	if err != nil {
+		logger.Printf("查询事件失败: %v", err)
+		return events
+	}
+	defer rows.Close()
+	for rows.Next() {
+		e, err := scanEventRow(rows)
+		if err != nil {
+			continue
+		}
+		events = append(events, e)
+	}
+	return events
+}
+
+// collectLiveEvents 返回当前进行中的赛事；若没有实时推送则回退到 active=1 的事件
+func collectLiveEvents() []ACEventResponse {
+	if ids := hubLiveEventIDs(); len(ids) > 0 {
+		return queryEvents(ids)
+	}
+	events := []ACEventResponse{}
+	rows, err := db.Query(`SELECT ` + eventSelectColumns + ` FROM event WHERE active = 1 ORDER BY event_id DESC`)
+	if err != nil {
+		logger.Printf("查询活跃事件失败: %v", err)
+		return events
+	}
+	defer rows.Close()
+	for rows.Next() {
+		e, err := scanEventRow(rows)
+		if err != nil {
+			continue
+		}
+		events = append(events, e)
+	}
+	return events
+}
+
 // 处理AC活跃事件请求
 func handleACEventsLive(w http.ResponseWriter, r *http.Request) {
-	// 从WebSocket获取活跃事件数据
-	events, err := getLiveEventsFromWebSocket()
-	if err != nil {
-		logger.Printf("获取活跃事件失败: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "获取事件数据失败", "events")
-		return
-	}
-
-	// 直接返回WebSocket接收的事件数据
-	sendSuccessResponse(w, "AC活跃事件数据获取成功", "events", events)
+	sendSuccessResponse(w, "AC活跃事件数据获取成功", "events", collectLiveEvents())
 }
 
 // 处理AC团队列表请求
@@ -277,10 +341,10 @@ func handleACUsers(w http.ResponseWriter, r *http.Request) {
 			args[i] = id
 		}
 
-		query = fmt.Sprintf("SELECT user_id, name FROM user WHERE user_id IN (%s) ORDER BY user_id ASC", strings.Join(placeholders, ","))
+		query = fmt.Sprintf("SELECT user_id, name, COALESCE(country, '') FROM user WHERE user_id IN (%s) ORDER BY user_id ASC", strings.Join(placeholders, ","))
 	} else {
 		// 如果没有提供ID参数，返回所有用户
-		query = "SELECT user_id, name FROM user ORDER BY user_id ASC"
+		query = "SELECT user_id, name, COALESCE(country, '') FROM user ORDER BY user_id ASC"
 	}
 
 	rows, err := db.Query(query, args...)
@@ -294,7 +358,7 @@ func handleACUsers(w http.ResponseWriter, r *http.Request) {
 	var users []ACUser
 	for rows.Next() {
 		u := ACUser{}
-		if err := rows.Scan(&u.UserID, &u.Name); err != nil {
+		if err := rows.Scan(&u.UserID, &u.Name, &u.Country); err != nil {
 			logger.Printf("数据库行扫描失败: %v", err)
 			sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "users")
 			return
@@ -399,9 +463,9 @@ func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 		event.DistanceDrivenKm = distance
 		event.TotalLaps = laps
 		event.TotalValidLaps = validLaps
-		eventTimeSec := eventTime / 1000
-		event.EventTime = TimeWithTimezone(eventTimeSec)
-		event.TimeAgoSec = now - int64(eventTimeSec)
+		eventTimeSec := eventTime / 1000000
+		event.EventTime = TimeWithTimezone(eventTime)
+		event.TimeAgoSec = now - eventTimeSec
 		if event.TimeAgoSec < 0 {
 			event.TimeAgoSec = 0 // 防止未来时间导致的负数值
 		}
@@ -414,7 +478,7 @@ func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 			// 保留最新的事件时间
 			if event.EventTime > existingEvent.EventTime {
 				existingEvent.EventTime = event.EventTime
-				existingEvent.TimeAgoSec = now - int64(event.EventTime)
+				existingEvent.TimeAgoSec = now - int64(event.EventTime)/1000000
 			}
 		} else {
 			eventMap[event.EventID] = &event
@@ -531,33 +595,34 @@ func handleACTeamMembers(w http.ResponseWriter, r *http.Request) {
 	teamID := strings.TrimPrefix(r.URL.Path, "/api/ac/team/")
 	teamID = strings.TrimSuffix(teamID, "/members")
 
-	rows, err := db.Query("SELECT user_id FROM team_member WHERE team_id = ?", teamID)
+	// 原版前端通过 data.members 渲染成员并显示 name/country
+	rows, err := db.Query("SELECT u.user_id, COALESCE(u.name, ''), COALESCE(u.country, '') FROM team_member tm JOIN user u ON tm.user_id = u.user_id WHERE tm.team_id = ?", teamID)
 	if err != nil {
 		logger.Printf("数据库查询失败: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "数据库查询失败", "teamMembers")
+		sendErrorResponse(w, http.StatusInternalServerError, "数据库查询失败", "members")
 		return
 	}
 	defer rows.Close()
 
-	var members []ACTeamMember
-
+	members := []map[string]interface{}{}
 	for rows.Next() {
-		m := ACTeamMember{}
-		if err := rows.Scan(&m.UserID); err != nil {
+		var userID int
+		var name, country string
+		if err := rows.Scan(&userID, &name, &country); err != nil {
 			logger.Printf("数据解析失败: %v", err)
-			sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "teamMembers")
+			sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "members")
 			return
 		}
-		members = append(members, m)
+		members = append(members, map[string]interface{}{"user_id": userID, "name": name, "country": country})
 	}
 
 	if err := rows.Err(); err != nil {
 		logger.Printf("行迭代错误: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "行迭代错误", "teamMembers")
+		sendErrorResponse(w, http.StatusInternalServerError, "行迭代错误", "members")
 		return
 	}
 
-	sendSuccessResponse(w, "团队成员数据获取成功", "teamMembers", members)
+	sendSuccessResponse(w, "团队成员数据获取成功", "members", members)
 }
 
 // 处理AC赛道请求
@@ -640,12 +705,23 @@ func handleACTracks(w http.ResponseWriter, r *http.Request) {
 func handleACLapSummary(w http.ResponseWriter, r *http.Request) {
 	lapID := strings.TrimPrefix(r.URL.Path, "/api/ac/lap/summary/")
 
-	type Response struct {
-		Status  string  `json:"status"`
-		Summary Summary `json:"summary"`
-	}
-
-	response := Response{}
+	summary := Summary{}
+	var (
+		lapStintLapID                      int64
+		lapStintID                         int64
+		lapSector1, lapSector2, lapSector3 sql.NullInt64
+		lapGrip                            sql.NullFloat64
+		lapTyre                            sql.NullString
+		lapTime                            sql.NullInt64
+		lapCuts, lapCrashes, lapCarCrashes sql.NullInt64
+		lapMaxSpeed, lapAvgSpeed           sql.NullInt64
+		lapFinishedAt                      sql.NullInt64
+		trackLength                        sql.NullInt64
+		trackName                          sql.NullString
+		eventName                          sql.NullString
+		sessionTypeNum                     int
+		airTemp, roadTemp                  sql.NullFloat64
+	)
 
 	err := db.QueryRow(`
 		SELECT 
@@ -662,15 +738,15 @@ func handleACLapSummary(w http.ResponseWriter, r *http.Request) {
 		JOIN car c ON ss.car_id = c.car_id
 		JOIN track_config t ON e.track_config_id = t.track_config_id
 		WHERE l.stint_lap_id = ?`, lapID).Scan(
-		&response.Summary.Lap.StintLapID, &response.Summary.Lap.StintID,
-		&response.Summary.Lap.Sector1, &response.Summary.Lap.Sector2, &response.Summary.Lap.Sector3,
-		&response.Summary.Lap.Grip, &response.Summary.Lap.Tyre, &response.Summary.Lap.Time,
-		&response.Summary.Lap.Cuts, &response.Summary.Lap.Crashes, &response.Summary.Lap.CarCrashes,
-		&response.Summary.Lap.MaxSpeed, &response.Summary.Lap.AvgSpeed, &response.Summary.Lap.FinishedAt,
-		&response.Summary.UserID, &response.Summary.CarID, &response.Summary.EventID,
-		&response.Summary.EventName, &response.Summary.TrackName, &response.Summary.TrackLength,
-		&response.Summary.TrackConfigID, &response.Summary.SessionType, &response.Summary.AirTemp,
-		&response.Summary.RoadTemp, &response.Summary.Weather)
+		&lapStintLapID, &lapStintID,
+		&lapSector1, &lapSector2, &lapSector3,
+		&lapGrip, &lapTyre, &lapTime,
+		&lapCuts, &lapCrashes, &lapCarCrashes,
+		&lapMaxSpeed, &lapAvgSpeed, &lapFinishedAt,
+		&summary.UserID, &summary.CarID, &summary.EventID,
+		&eventName, &trackName, &trackLength,
+		&summary.TrackConfigID, &sessionTypeNum, &airTemp,
+		&roadTemp, &summary.Weather)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			logger.Printf("圈速摘要未找到")
@@ -681,7 +757,32 @@ func handleACLapSummary(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	sendSuccessResponse(w, "圈速摘要获取成功", "summary", response.Summary)
+
+	summary.Lap.StintLapID = lapStintLapID
+	summary.Lap.StintID = lapStintID
+	summary.Lap.Sector1 = lapSector1.Int64
+	summary.Lap.Sector2 = lapSector2.Int64
+	summary.Lap.Sector3 = lapSector3.Int64
+	summary.Lap.Grip = lapGrip.Float64
+	if !lapGrip.Valid {
+		summary.Lap.Grip = -1
+	}
+	summary.Lap.Tyre = lapTyre.String
+	summary.Lap.Time = lapTime.Int64
+	summary.Lap.Cuts = lapCuts.Int64
+	summary.Lap.Crashes = lapCrashes.Int64
+	summary.Lap.CarCrashes = lapCarCrashes.Int64
+	summary.Lap.MaxSpeed = lapMaxSpeed.Int64
+	summary.Lap.AvgSpeed = lapAvgSpeed.Int64
+	summary.Lap.FinishedAt = TimeWithTimezone(lapFinishedAt.Int64)
+	summary.TrackName = trackName.String
+	summary.TrackLength = trackLength.Int64
+	summary.EventName = eventName.String
+	summary.SessionType = sessionTypeName(sessionTypeNum)
+	summary.AirTemp = airTemp.Float64
+	summary.RoadTemp = roadTemp.Float64
+
+	sendSuccessResponse(w, "圈速摘要获取成功", "summary", summary)
 }
 
 // 处理AC单圈遥测数据请求
@@ -803,53 +904,41 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 处理车辆ID（可选）
-		var carFilter string
-		var args []interface{}
-		carIDs := strings.Split(carIDsStr, ",")
-		if len(carIDs) > 0 && carIDs[0] != "" {
-			placeholders := make([]string, len(carIDs))
-			for i := range carIDs {
-				placeholders[i] = "?"
-			}
-			carFilter = fmt.Sprintf("AND ss.car_id IN (%s)", strings.Join(placeholders, ","))
+		// 解析车辆ID列表（原版前端以逗号分隔；可选）
+		carIDs, err := parseIDList(carIDsStr)
+		if err != nil {
+			logger.Printf("无效的车辆ID: %v", err)
+			sendErrorResponse(w, http.StatusBadRequest, "无效的车辆ID格式", "bestlap")
+			return
+		}
+		carFilter := ""
+		args := make([]interface{}, 0, len(carIDs)+1)
+		if len(carIDs) > 0 {
+			carFilter = "AND ss.car_id IN (" + placeholders(len(carIDs)) + ")"
+			args = append(args, intsToArgs(carIDs)...)
 		}
 
-		// 验证并处理车辆ID
-		if carIDsStr != "" {
-			carIDs = strings.Split(carIDsStr, ",")
-			for _, id := range carIDs {
-				if _, err := strconv.Atoi(id); err != nil {
-					logger.Printf("无效的车辆ID: %s", id)
-					sendErrorResponse(w, http.StatusBadRequest, "无效的车辆ID格式", "bestlap")
-					return
-				}
-			}
-		}
-		placeholders := make([]string, len(carIDs))
-		args = make([]interface{}, 0, len(carIDs)+1)
-		for i, id := range carIDs {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
-
-		// 查询最佳圈速数据
+		// 查询最佳圈速数据（可空列 COALESCE）
 		query := fmt.Sprintf(`
             WITH all_laps AS (
-                SELECT l.stint_lap_id AS lap_id, ss.user_id, ss.car_id, l.time, l.sector_1, l.sector_2, l.sector_3, l.grip, l.tyre, l.max_speed, CAST(UNIX_TIMESTAMP(l.finished_at) * 1000000 AS SIGNED) AS finished_at, e.event_id
+                SELECT l.stint_lap_id AS lap_id, ss.user_id, ss.car_id, COALESCE(l.time, 0) AS time,
+                       COALESCE(l.sector_1, 0) AS sector_1, COALESCE(l.sector_2, 0) AS sector_2, COALESCE(l.sector_3, 0) AS sector_3,
+                       COALESCE(l.grip, -1) AS grip, COALESCE(l.tyre, '') AS tyre, COALESCE(l.max_speed, 0) AS max_speed,
+                       COALESCE(l.avg_speed, 0) AS avg_speed,
+                       CAST(UNIX_TIMESTAMP(l.finished_at) * 1000000 AS SIGNED) AS finished_at, e.event_id
                 FROM stint_lap l
                 JOIN session_stint ss ON l.stint_id = ss.session_stint_id
                 JOIN user u ON ss.user_id = u.user_id
                 JOIN car c ON ss.car_id = c.car_id
                 JOIN session s ON ss.session_id = s.session_id
                 JOIN event e ON s.event_id = e.event_id
-                WHERE e.event_id = ? AND l.cuts = 0 AND l.crashes = 0 %s
+                WHERE e.event_id = ? AND l.cuts = 0 AND l.crashes = 0 AND l.time > 0 %s
             ),
             ranked_laps AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id, car_id ORDER BY time ASC) as rn
                 FROM all_laps
             )
-            SELECT lap_id, user_id, car_id, time, sector_1, sector_2, sector_3, grip, tyre, max_speed, finished_at, event_id
+            SELECT lap_id, user_id, car_id, time, sector_1, sector_2, sector_3, grip, tyre, avg_speed, max_speed, finished_at, event_id
             FROM ranked_laps
             WHERE rn = 1
             ORDER BY time ASC
@@ -869,11 +958,13 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 		allLaps = []ACBestLap{}
 		for rows.Next() {
 			lap := ACBestLap{}
-			if err := rows.Scan(&lap.LapID, &lap.User_id, &lap.Car_id, &lap.Time, &lap.Sector1, &lap.Sector2, &lap.Sector3, &lap.Grip, &lap.Tyre, &lap.MaxSpeed, &lap.FinishedAt, &lap.EventID); err != nil {
+			var finishedAt sql.NullInt64
+			if err := rows.Scan(&lap.LapID, &lap.User_id, &lap.Car_id, &lap.Time, &lap.Sector1, &lap.Sector2, &lap.Sector3, &lap.Grip, &lap.Tyre, &lap.AvgSpeed, &lap.MaxSpeed, &finishedAt, &lap.EventID); err != nil {
 				logger.Printf("数据解析失败: %v", err)
 				sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "bestlap")
 				return
 			}
+			lap.FinishedAt = TimeWithTimezone(finishedAt.Int64)
 			allLaps = append(allLaps, lap)
 		}
 
@@ -892,9 +983,9 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 提取参数
+		// 提取参数（路径: track/{trackID}/cars/{carIDs}/page/{p}/entries/{n}）
 		trackIDStr := pathParts[4]
-		carIDStr := pathParts[6]
+		carIDsStr := pathParts[6]
 		pageStr := pathParts[8]
 		entriesStr := pathParts[10]
 
@@ -906,8 +997,9 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		carID, err := strconv.Atoi(carIDStr)
-		if err != nil || carID <= 0 {
+		// 原版前端按车辆列表筛选，这里同样支持逗号分隔
+		carIDs, err := parseIDList(carIDsStr)
+		if err != nil || len(carIDs) == 0 {
 			logger.Printf("无效的car_id参数: %v", err)
 			sendErrorResponse(w, http.StatusBadRequest, "无效的car_id参数", "bestlap")
 			return
@@ -928,19 +1020,20 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 查询所有数据（不使用LIMIT/OFFSET，后续在应用层分页）
-		query := `
+		query := fmt.Sprintf(`
             WITH ranked_laps AS (
-                SELECT 
-                    l.stint_lap_id AS lap_id, 
-                    ss.user_id, 
-                    ss.car_id, 
-                    l.time, 
-                    l.sector_1, 
-                    l.sector_2, 
-                    l.sector_3, 
-                    l.grip, 
-                    l.tyre, 
-                    l.max_speed, 
+                SELECT
+                    l.stint_lap_id AS lap_id,
+                    ss.user_id,
+                    ss.car_id,
+                    COALESCE(l.time, 0) AS time,
+                    COALESCE(l.sector_1, 0) AS sector_1,
+                    COALESCE(l.sector_2, 0) AS sector_2,
+                    COALESCE(l.sector_3, 0) AS sector_3,
+                    COALESCE(l.grip, -1) AS grip,
+                    COALESCE(l.tyre, '') AS tyre,
+                    COALESCE(l.max_speed, 0) AS max_speed,
+                    COALESCE(l.avg_speed, 0) AS avg_speed,
                     CAST(UNIX_TIMESTAMP(l.finished_at) * 1000000 AS SIGNED) AS finished_at,
                     ROW_NUMBER() OVER (PARTITION BY ss.user_id, ss.car_id ORDER BY l.time ASC) AS rn
                 FROM stint_lap l
@@ -949,15 +1042,16 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
                 JOIN event e ON s.event_id = e.event_id
                 JOIN user u ON ss.user_id = u.user_id
                 JOIN car c ON ss.car_id = c.car_id
-                WHERE e.track_config_id = ? AND ss.car_id = ? AND l.cuts = 0 AND l.crashes = 0 
+                WHERE e.track_config_id = ? AND ss.car_id IN (%s) AND l.cuts = 0 AND l.crashes = 0 AND l.time > 0
             )
-            SELECT lap_id, user_id, car_id, time, sector_1, sector_2, sector_3, grip, tyre, max_speed, finished_at 
-            FROM ranked_laps 
+            SELECT lap_id, user_id, car_id, time, sector_1, sector_2, sector_3, grip, tyre, avg_speed, max_speed, finished_at
+            FROM ranked_laps
             WHERE rn = 1
             ORDER BY time ASC
-        `
+        `, placeholders(len(carIDs)))
 
-		rows, err := db.Query(query, trackID, carID)
+		args := append([]interface{}{trackID}, intsToArgs(carIDs)...)
+		rows, err := db.Query(query, args...)
 		if err != nil {
 			logger.Printf("查询最佳圈速数据失败: %v", err)
 			sendErrorResponse(w, http.StatusInternalServerError, "查询数据失败", "bestlap")
@@ -969,11 +1063,13 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 		allLaps = []ACBestLap{}
 		for rows.Next() {
 			lap := ACBestLap{}
-			if err := rows.Scan(&lap.LapID, &lap.User_id, &lap.Car_id, &lap.Time, &lap.Sector1, &lap.Sector2, &lap.Sector3, &lap.Grip, &lap.Tyre, &lap.MaxSpeed, &lap.FinishedAt); err != nil {
+			var finishedAt sql.NullInt64
+			if err := rows.Scan(&lap.LapID, &lap.User_id, &lap.Car_id, &lap.Time, &lap.Sector1, &lap.Sector2, &lap.Sector3, &lap.Grip, &lap.Tyre, &lap.AvgSpeed, &lap.MaxSpeed, &finishedAt); err != nil {
 				logger.Printf("数据解析失败: %v", err)
 				sendErrorResponse(w, http.StatusInternalServerError, "数据解析失败", "bestlap")
 				return
 			}
+			lap.FinishedAt = TimeWithTimezone(finishedAt.Int64)
 			allLaps = append(allLaps, lap)
 		}
 
@@ -1179,86 +1275,98 @@ func handleACEventDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 处理特定资源请求（sessions, cars）
+	// 资源子路径（如 session/latest、sessions、cars）
+	resource := ""
 	if len(pathParts) >= 6 {
-		resource := pathParts[5]
-		switch resource {
-		case "sessions":
-			// 查询事件会话数据
-			rows, err := db.Query(`SELECT s.session_id, s.event_id, s.type, s.track_time, s.name, CAST(UNIX_TIMESTAMP(s.start_time) * 1000000 AS SIGNED) AS start_time, s.duration_min, s.elapsed_ms, s.laps, s.weather, s.air_temp, s.road_temp, s.start_grip, s.current_grip, s.is_finished, CAST(UNIX_TIMESTAMP(s.finish_time) * 1000000 AS SIGNED) AS finish_time, CAST(UNIX_TIMESTAMP(s.last_activity) * 1000000 AS SIGNED) AS last_activity, ? AS http_port FROM session s WHERE s.event_id = ? ORDER BY s.start_time ASC`, cfg.App.Server.Port, eventID)
-			if err != nil {
-				logger.Printf("会话查询失败: %v", err)
-				sendErrorResponse(w, http.StatusInternalServerError, "会话数据查询失败", "sessions")
-				return
-			}
-			defer rows.Close()
+		resource = pathParts[5]
+	}
+	if len(pathParts) >= 7 {
+		resource = pathParts[5] + "/" + pathParts[6]
+	}
 
-			sessions := []ACSession{}
-			for rows.Next() {
-				s := ACSession{}
-				if err := rows.Scan(&s.SessionID, &s.EventID, &s.Type, &s.TrackTime, &s.Name, &s.StartTime, &s.DurationMin, &s.ElapsedMs, &s.Laps, &s.Weather, &s.AirTemp, &s.RoadTemp, &s.StartGrip, &s.CurrentGrip, &s.IsFinished, &s.FinishTime, &s.LastActivity, &s.HttpPort); err != nil {
-					logger.Printf("会话行扫描失败: %v", err)
-					sendErrorResponse(w, http.StatusInternalServerError, "会话数据解析失败", "sessions")
-					return
-				}
-				sessions = append(sessions, s)
-			}
-
-			if err = rows.Err(); err != nil {
-				logger.Printf("会话行迭代错误: %v", err)
-				sendErrorResponse(w, http.StatusInternalServerError, "会话数据处理失败", "sessions")
-				return
-			}
-
-			sendSuccessResponse(w, "事件会话数据获取成功", "sessions", sessions)
-			return
-		case "cars":
-			// 查询事件车辆数据
-			carRows, err := db.Query("SELECT DISTINCT c.car_id, c.name, c.display_name, c.manufacturer, c.car_class FROM session_stint ss JOIN session s ON ss.session_id = s.session_id JOIN car c ON ss.car_id = c.car_id WHERE s.event_id = ?", eventID)
-			if err != nil {
-				logger.Printf("车辆查询失败: %v", err)
-				sendErrorResponse(w, http.StatusInternalServerError, "车辆数据查询失败", "vehicles")
-				return
-			}
-			defer carRows.Close()
-
-			var cars []ACCar
-			for carRows.Next() {
-				c := ACCar{}
-				if err := carRows.Scan(&c.CarID, &c.Name, &c.DisplayName, &c.Manufacturer, &c.CarClass); err != nil {
-					logger.Printf("车辆行扫描失败: %v", err)
-					sendErrorResponse(w, http.StatusInternalServerError, "车辆数据解析失败", "vehicles")
-					return
-				}
-				cars = append(cars, c)
-			}
-
-			if err = carRows.Err(); err != nil {
-				logger.Printf("车辆行迭代错误: %v", err)
-				sendErrorResponse(w, http.StatusInternalServerError, "车辆数据处理失败", "vehicles")
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "cars": cars})
+	switch resource {
+	case "session/latest":
+		// 原版前端（live.js）使用单数形式并读取 data.session
+		session, ok, err := latestSessionForEvent(eventID)
+		if err != nil {
+			logger.Printf("查询最新会话失败: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "会话查询失败", "session")
 			return
 		}
+		if !ok {
+			sendErrorResponse(w, http.StatusNotFound, "未找到会话数据", "session")
+			return
+		}
+		if live := hubLiveSession(eventID); live != nil && live.SessionID >= session.SessionID {
+			session = *live
+		}
+		sendSuccessResponse(w, "事件会话数据获取成功", "session", session)
+		return
+	case "sessions":
+		// 查询事件会话数据（可空列均 COALESCE，type 由 ACSession.MarshalJSON 输出字符串）
+		rows, err := db.Query(`SELECT `+sessionSelectColumns+` FROM session s WHERE s.event_id = ? ORDER BY s.session_id DESC`, eventID)
+		if err != nil {
+			logger.Printf("会话查询失败: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "会话数据查询失败", "sessions")
+			return
+		}
+		defer rows.Close()
+
+		sessions := []ACSession{}
+		for rows.Next() {
+			s, err := scanSessionRow(rows)
+			if err != nil {
+				logger.Printf("会话行扫描失败: %v", err)
+				continue
+			}
+			sessions = append(sessions, s)
+		}
+		sendSuccessResponse(w, "事件会话数据获取成功", "sessions", sessions)
+		return
+	case "cars":
+		// 查询事件车辆数据
+		carRows, err := db.Query("SELECT DISTINCT c.car_id, c.name, c.display_name, c.manufacturer, c.car_class FROM session_stint ss JOIN session s ON ss.session_id = s.session_id JOIN car c ON ss.car_id = c.car_id WHERE s.event_id = ?", eventID)
+		if err != nil {
+			logger.Printf("车辆查询失败: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "车辆数据查询失败", "vehicles")
+			return
+		}
+		defer carRows.Close()
+
+		var cars []ACCar
+		for carRows.Next() {
+			c := ACCar{}
+			if err := carRows.Scan(&c.CarID, &c.Name, &c.DisplayName, &c.Manufacturer, &c.CarClass); err != nil {
+				logger.Printf("车辆行扫描失败: %v", err)
+				sendErrorResponse(w, http.StatusInternalServerError, "车辆数据解析失败", "vehicles")
+				return
+			}
+			cars = append(cars, c)
+		}
+
+		if err = carRows.Err(); err != nil {
+			logger.Printf("车辆行迭代错误: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "车辆数据处理失败", "vehicles")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "cars": cars})
+		return
 	}
 
 	// 查询事件基本信息（包含完整元数据）
-	event := ACEventResponse{}
-	row := db.QueryRow(`SELECT event_id, name, server_name, track_config_id, team_event, active, livery_preview, use_number, practice_duration, quali_duration, race_duration, race_duration_type, race_wait_time, race_extra_laps, reverse_grid_positions FROM event WHERE event_id = ?`, eventID)
-	err = row.Scan(&event.EventID, &event.Name, &event.ServerName, &event.TrackConfigID, &event.TeamEvent, &event.Active, &event.LiveryPreview, &event.UseNumber, &event.PracticeDuration, &event.QualiDuration, &event.RaceDuration, &event.RaceDurationType, &event.RaceWaitTime, &event.RaceExtraLaps, &event.ReverseGridPositions)
+	row := db.QueryRow(`SELECT `+eventSelectColumns+` FROM event WHERE event_id = ?`, eventID)
+	event, err := scanEventRow(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			logger.Printf("事件不存在: %v", err)
 			sendErrorResponse(w, http.StatusNotFound, "事件不存在", "events")
-			return
 		} else {
 			logger.Printf("扫描事件详情失败: %v", err)
 			sendErrorResponse(w, http.StatusInternalServerError, "扫描事件详情失败", "events")
-			return
 		}
+		return
 	}
 
 	sendSuccessResponse(w, "事件详情获取成功", "event", event)
@@ -1304,9 +1412,9 @@ func handleTrackSVG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查询赛道名称
+	// 查询赛道名称（可空列 COALESCE）
 	var trackName, configName string
-	query := `SELECT track_name, config_name FROM track_config
+	query := `SELECT COALESCE(track_name, ''), COALESCE(config_name, '') FROM track_config
 		WHERE track_config_id = ?`
 	err := db.QueryRow(query, trackConfigID).Scan(&trackName, &configName)
 	if err != nil {
@@ -1315,11 +1423,9 @@ func handleTrackSVG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 清理文件名并构建路径
-	// 将赛道名称转换为小写并替换空格为下划线
-	sanitizedTrack := strings.ToLower(strings.ReplaceAll(trackName, " ", "_"))
-	sanitizedConfig := strings.ToLower(strings.ReplaceAll(configName, " ", "_"))
-	fileName := fmt.Sprintf("map_%s_%s.svg", sanitizedTrack, sanitizedConfig)
+	// 文件名须与 Writer 端 generateSVGFile 一致（使用原始 track/config 名），
+	// 同时做路径安全清理，避免越出缓存目录
+	fileName := fmt.Sprintf("map_%s_%s.svg", safeFileName(trackName), safeFileName(configName))
 	filePath := filepath.Join(cfg.App.Server.CachePath, "live-track-maps", fileName)
 
 	// 读取并返回SVG文件
@@ -1349,9 +1455,9 @@ func handleTrackImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查询数据库获取赛道名称和配置名称
+	// 查询数据库获取赛道名称和配置名称（可空列 COALESCE）
 	var trackName, configName string
-	err := db.QueryRow("SELECT track_name, config_name FROM track_config WHERE track_config_id = ?", trackConfigID).Scan(&trackName, &configName)
+	err := db.QueryRow("SELECT COALESCE(track_name, ''), COALESCE(config_name, '') FROM track_config WHERE track_config_id = ?", trackConfigID).Scan(&trackName, &configName)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			http.NotFound(w, r)
@@ -1362,10 +1468,8 @@ func handleTrackImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 清理名称以创建有效的文件名
-	sanitizedTrack := sanitize(trackName)
-	sanitizedConfig := sanitize(configName)
-	filename := fmt.Sprintf("preview_%s_%s.png", sanitizedTrack, sanitizedConfig)
+	// 清理名称以创建安全的文件名
+	filename := fmt.Sprintf("preview_%s_%s.png", safeFileName(trackName), safeFileName(configName))
 
 	// 构建完整文件路径
 	filePath := filepath.Join(cfg.App.Server.CachePath, "tracks", filename)
@@ -1414,9 +1518,17 @@ func handleTrackImage(w http.ResponseWriter, r *http.Request) {
 			file, _ = os.Open(filePath)
 		}
 	}
+	if file == nil {
+		http.NotFound(w, r)
+		return
+	}
 	defer file.Close()
 
-	fi, _ := file.Stat()
+	fi, err := file.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
 	io.Copy(w, file)
@@ -1446,8 +1558,7 @@ func handleCarResource(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 清理文件名并构建路径
-	sanitizedName := strings.ToLower(strings.ReplaceAll(carName, " ", "_"))
-	fileName := fmt.Sprintf("badge_%s.png", sanitizedName)
+	fileName := fmt.Sprintf("badge_%s.png", safeFileName(carName))
 	filePath := filepath.Join(cfg.App.Server.CachePath, "cars", fileName)
 
 	// 读取并返回文件
@@ -1489,9 +1600,17 @@ func handleCarResource(w http.ResponseWriter, r *http.Request) {
 			file, _ = os.Open(filePath)
 		}
 	}
+	if file == nil {
+		http.NotFound(w, r)
+		return
+	}
 	defer file.Close()
 
-	fi, _ := file.Stat()
+	fi, err := file.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	// 设置正确的Content-Type
 	if strings.HasSuffix(filePath, ".dds") {
 		w.Header().Set("Content-Type", "image/vnd.ms-dds")

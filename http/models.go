@@ -8,6 +8,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 )
 
 // 最佳圈速数据结构
@@ -21,8 +22,9 @@ type ACBestLap struct {
 	Sector1          int              `json:"sector_1"`
 	Sector2          int              `json:"sector_2"`
 	Sector3          int              `json:"sector_3"`
-	Grip             int              `json:"grip"`
+	Grip             float64          `json:"grip"`
 	Tyre             string           `json:"tyre"`
+	AvgSpeed         int              `json:"avg_speed"`
 	MaxSpeed         int              `json:"max_speed"`
 	CarBest          int              `json:"car_best,omitempty"`
 	ClassBest        int              `json:"class_best,omitempty"`
@@ -113,14 +115,43 @@ type ACSession struct {
 	ElapsedMs    int64            `json:"elapsed_ms"`
 	Laps         int              `json:"laps"`
 	Weather      string           `json:"weather"`
-	AirTemp      int              `json:"air_temp"`
-	RoadTemp     int              `json:"road_temp"`
+	AirTemp      float64          `json:"air_temp"`
+	RoadTemp     float64          `json:"road_temp"`
 	StartGrip    float64          `json:"start_grip"`
 	CurrentGrip  float64          `json:"current_grip"`
 	IsFinished   int              `json:"is_finished"`
 	FinishTime   TimeWithTimezone `json:"finish_time"`
 	LastActivity TimeWithTimezone `json:"last_activity"`
 	HttpPort     int              `json:"http_port"`
+}
+
+// sessionTypeName 将数据库中存储的数值会话类型转换为原版前端使用的字符串。
+// 数值仍以 numeric 存库（0=Practice, 1=Qualifying, 2=Race），仅在响应时转换。
+func sessionTypeName(t int) string {
+	switch t {
+	case 0:
+		return "Practice"
+	case 1:
+		return "Qualifying"
+	case 2:
+		return "Race"
+	default:
+		return "Unknown"
+	}
+}
+
+// MarshalJSON 让会话在响应中以字符串形式输出 type（原版前端按 Practice/Qualifying/Race 比较）。
+// 注意：反序列化（接收 Writer 推送的 JSON）仍按数值解析，不受影响。
+type acSessionJSON ACSession
+
+func (s ACSession) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		Type string `json:"type"`
+		acSessionJSON
+	}{
+		Type:          sessionTypeName(s.Type),
+		acSessionJSON: acSessionJSON(s),
+	})
 }
 
 type ACLiveData struct {
@@ -256,7 +287,7 @@ type LapInfo struct {
 	Sector1    int64            `json:"sector_1"`
 	Sector2    int64            `json:"sector_2"`
 	Sector3    int64            `json:"sector_3"`
-	Grip       int64            `json:"grip"`
+	Grip       float64          `json:"grip"`
 	Tyre       string           `json:"tyre"`
 	Time       int64            `json:"time"`
 	Cuts       int64            `json:"cuts"`
@@ -276,8 +307,8 @@ type Summary struct {
 	UserID        int64   `json:"user_id"`
 	CarID         int64   `json:"car_id"`
 	SessionType   string  `json:"session_type"`
-	AirTemp       string  `json:"air_temp"`
-	RoadTemp      string  `json:"road_temp"`
+	AirTemp       float64 `json:"air_temp"`
+	RoadTemp      float64 `json:"road_temp"`
 	Weather       string  `json:"weather"`
 	Lap           LapInfo `json:"lap"`
 }

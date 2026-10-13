@@ -21,6 +21,10 @@ import (
 type TimeWithTimezone int64
 
 func (t TimeWithTimezone) MarshalJSON() ([]byte, error) {
+	// 0 表示“无时间”，必须原样输出 0，不能加时区偏移（否则会变成假日期）
+	if int64(t) == 0 {
+		return []byte("0"), nil
+	}
 	// 获取本地时区偏移（秒）
 	_, offset := time.Now().Zone()
 	// 转换为微秒并添加到时间戳
@@ -127,23 +131,45 @@ func firstExistingPath(paths ...string) string {
 	return ""
 }
 
-// serveFileWithGzip 统一处理静态文件，支持自动处理.gz压缩文件
-func serveFileWithGzip(w http.ResponseWriter, _ *http.Request, fileName string) {
+// safeFileName 清理由数据派生的文件名：去掉目录分隔符与控制字符，避免越出缓存目录。
+// 保留大小写与空格等，以便与 Writer 生成的缓存文件名（原始 track/config 名）保持一致。
+func safeFileName(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		}
+		if r < 32 {
+			return '_'
+		}
+		return r
+	}, name)
+}
+
+// serveFileWithGzip 统一处理静态文件，支持自动处理.gz压缩文件（遵循 Accept-Encoding 协商）
+func serveFileWithGzip(w http.ResponseWriter, r *http.Request, fileName string) {
 	// 构建文件路径
 	basePath := filepath.Join(docRoot, fileName)
 	gzPath := basePath + ".gz"
 	var filePath string
 	var isGzip bool
 
-	// 优先检查gzip版本
-	if _, err := os.Stat(gzPath); err == nil {
-		filePath = gzPath
-		isGzip = true
-	} else if _, err := os.Stat(basePath); err == nil {
-		filePath = basePath
-		isGzip = false
-	} else {
-		// 文件不存在
+	_, gzErr := os.Stat(gzPath)
+	_, plainErr := os.Stat(basePath)
+	acceptsGzip := false
+	if r != nil {
+		acceptsGzip = strings.Contains(strings.ToLower(r.Header.Get("Accept-Encoding")), "gzip")
+	}
+
+	switch {
+	case gzErr == nil && acceptsGzip:
+		filePath, isGzip = gzPath, true
+	case plainErr == nil:
+		filePath, isGzip = basePath, false
+	case gzErr == nil:
+		// 客户端未声明支持 gzip，但仓库只提供 .gz 版本：仍按 gzip 返回，避免 404
+		filePath, isGzip = gzPath, true
+	default:
 		sendErrorResponse(w, http.StatusNotFound, "File not found", "staticFile")
 		return
 	}
@@ -179,6 +205,8 @@ func serveFileWithGzip(w http.ResponseWriter, _ *http.Request, fileName string) 
 	case ".svg":
 		w.Header().Set("Content-Type", "image/svg+xml")
 	}
+
+	w.Header().Add("Vary", "Accept-Encoding")
 
 	// 处理gzip压缩
 	if isGzip {

@@ -14,9 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
-	"strings"
 	"time"
 
 	"gosimview/config"
@@ -75,27 +72,47 @@ func main() {
 	// 设置HTTP路由
 	setupRoutes()
 
-	// 启动HTTP服务器
-	// 从配置读取HTTP端口
+	// 启动HTTP服务器：监听地址遵循 app.server.host（为空则监听所有网卡）
 	port := cfg.App.Server.Port
-	logger.Printf("HTTP服务器启动在: %d", port)
+	host := cfg.App.Server.Host
+	logger.Printf("HTTP服务器监听地址: %s", listenAddr(host, port))
 
-	// 从配置读取WebSocket端口
-	wsPort := cfg.ACServer.UDP.LocalPort
+	// HTTPS 配置尚未接入：明确报告，避免误以为已启用 TLS
+	if cfg.App.SSL.CertFile != "" || cfg.App.SSL.PrivateKeyFile != "" {
+		logger.Printf("警告: 已配置 ssl.cert.file/private.key.file，但当前未启用 HTTPS（仍以明文 HTTP 监听）")
+	}
 
-	wsMux := http.NewServeMux()
-	wsMux.HandleFunc("/live", handleACEventWebSocket)
-	go func() {
-		logger.Printf("WebSocket服务器启动在: %d", wsPort)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", wsPort), wsMux); err != nil {
-			logger.Printf("WebSocket服务器启动失败: %v", err)
-		}
-	}()
+	// 直播 WebSocket 端口：writer.http.port，为 0 时退回 ac.server.udp.local.port
+	lbPort := cfg.Writer.HTTP.Port
+	if lbPort == 0 {
+		lbPort = cfg.ACServer.UDP.LocalPort
+	}
+
+	// 主 HTTP 端口已通过 setupRoutes 提供 /live；两者相同则不重复绑定
+	if lbPort > 0 && lbPort != port {
+		wsMux := http.NewServeMux()
+		wsMux.HandleFunc("/live", handleACEventWebSocket)
+		addr := listenAddr(host, lbPort)
+		go func() {
+			logger.Printf("WebSocket服务器监听地址: %s", addr)
+			if err := http.ListenAndServe(addr, wsMux); err != nil {
+				logger.Printf("WebSocket服务器启动失败: %v", err)
+			}
+		}()
+	}
 
 	// 启动主HTTP服务器
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
+	if err := http.ListenAndServe(listenAddr(host, port), nil); err != nil {
 		fatalLogger.Fatalf("服务器启动失败: %v", err)
 	}
+}
+
+// listenAddr 依据配置的 host 组装监听地址；host 为空时监听所有网卡
+func listenAddr(host string, port int) string {
+	if host == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 // 初始化日志系统
@@ -152,168 +169,7 @@ func connectDB(config *config.Config) error {
 
 	logger.Println("数据库连接成功")
 
-	// 执行SQL schema文件（如果存在）
-	executeSQLSchema(db, logger)
-
+	// 注意：HTTP 进程不再执行 schema（原版 schema 含 DROP TABLE，会在启动时破坏数据）。
+	// 建表/迁移由 Writer 侧的显式 ApplySchema 负责。
 	return nil
-}
-
-// executeSQLSchema 执行SQL schema文件
-func executeSQLSchema(db *sql.DB, logger *log.Logger) {
-	// 只在data目录下查找SQL文件（支持从仓库根或 simview/ 下启动）
-	dataSQLFiles, _ := filepath.Glob("data/*.sql")
-	if len(dataSQLFiles) == 0 {
-		dataSQLFiles, _ = filepath.Glob("simview/data/*.sql")
-	}
-
-	var sqlFile string
-	// 优先使用simview-1.2.sql
-	for _, file := range dataSQLFiles {
-		if strings.Contains(file, "simview-1.2.sql") {
-			sqlFile = file
-			break
-		}
-	}
-
-	// 如果没有找到simview-1.2.sql，使用第一个找到的SQL文件
-	if sqlFile == "" && len(dataSQLFiles) > 0 {
-		sqlFile = dataSQLFiles[0]
-	}
-
-	if sqlFile == "" {
-		logger.Println("未找到data目录下的SQL schema文件")
-		logger.Println("请将原版SimView的SQL文件放置在data目录下")
-		return
-	}
-
-	// 读取SQL文件内容
-	sqlContent, err := os.ReadFile(sqlFile)
-	if err != nil {
-		logger.Printf("读取SQL文件失败: %v", err)
-		return
-	}
-
-	// 从SQL文件中提取版本号
-	fileVersion := extractSQLVersion(sqlContent)
-
-	// 从schema_info表获取数据库版本
-	dbVersion := getDatabaseVersion(db)
-
-	// 比较版本并决定是否执行
-	if dbVersion == "" || isNewerVersion(fileVersion, dbVersion) {
-		// 执行SQL语句
-		logger.Printf("执行SQL schema: %s", sqlFile)
-		sqlStatements := strings.Split(string(sqlContent), ";")
-		for i, stmt := range sqlStatements {
-			stmt = strings.TrimSpace(stmt)
-			if stmt == "" || strings.HasPrefix(stmt, "--") {
-				continue
-			}
-
-			stmt += ";"
-			if _, err := db.Exec(stmt); err != nil {
-				logger.Printf("SQL执行失败 (行 %d): %v", i+1, err)
-				continue
-			}
-		}
-		logger.Println("SQL schema执行完成")
-	} else {
-		logger.Printf("数据库版本已更新，跳过SQL schema执行")
-	}
-}
-
-// extractSQLVersion 从SQL文件中提取版本号
-func extractSQLVersion(sqlContent []byte) string {
-	content := string(sqlContent)
-	// 尝试从SQL文件中提取版本号
-	// 支持多种版本格式，包括 INSERT INTO `schema_info` VALUES ("1.2", "ac")
-	versionPatterns := []string{
-		`schema_info.*VALUES.*["']([0-9.]+)["']`,
-		`--\s*Version:\s*([0-9.]+)`,
-		`/\*\s*Version:\s*([0-9.]+)\s*\*/`,
-		`simview-([0-9.]+)\.sql`,
-	}
-
-	for _, pattern := range versionPatterns {
-		match := regexp.MustCompile(pattern).FindStringSubmatch(content)
-		if len(match) > 1 {
-			return match[1]
-		}
-	}
-	return ""
-}
-
-// tableExists 检查表是否存在
-func tableExists(db *sql.DB, tableName string) bool {
-	query := "SHOW TABLES LIKE ?"
-	row := db.QueryRow(query, tableName)
-	var name string
-	err := row.Scan(&name)
-	return err == nil
-}
-
-// getDatabaseVersion 获取数据库版本
-func getDatabaseVersion(db *sql.DB) string {
-	// 检查是否存在schema_info表
-	if !tableExists(db, "schema_info") {
-		return ""
-	}
-
-	// 查询版本号
-	query := "SELECT version FROM schema_info LIMIT 1"
-	row := db.QueryRow(query)
-	var version string
-	err := row.Scan(&version)
-	if err != nil {
-		if err != sql.ErrNoRows {
-			log.Printf("查询数据库版本失败: %v", err)
-		}
-		return ""
-	}
-	return version
-}
-
-// isNewerVersion 比较两个版本号，判断fileVersion是否比dbVersion新
-func isNewerVersion(fileVersion, dbVersion string) bool {
-	// 如果数据库版本为空，认为文件版本更新
-	if dbVersion == "" {
-		return true
-	}
-	// 如果文件版本为空，无法比较，默认不更新
-	if fileVersion == "" {
-		return false
-	}
-
-	// 简单的版本比较（仅支持数字和点）
-	fileParts := strings.Split(fileVersion, ".")
-	dbParts := strings.Split(dbVersion, ".")
-
-	// 取较长的长度
-	maxLength := len(fileParts)
-	if len(dbParts) > maxLength {
-		maxLength = len(dbParts)
-	}
-
-	// 比较每一部分
-	for i := 0; i < maxLength; i++ {
-		filePart := 0
-		dbPart := 0
-
-		if i < len(fileParts) {
-			filePart, _ = strconv.Atoi(fileParts[i])
-		}
-
-		if i < len(dbParts) {
-			dbPart, _ = strconv.Atoi(dbParts[i])
-		}
-
-		if filePart > dbPart {
-			return true
-		} else if filePart < dbPart {
-			return false
-		}
-	}
-
-	// 版本相同
-	return false
 }

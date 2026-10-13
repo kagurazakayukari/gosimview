@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,10 +48,19 @@ var (
 	globalCars         = make(map[int]*Car)
 	globalTrackConfigs = make(map[int]*TrackConfig)
 	// 互斥锁
-	globalMutex      sync.Mutex
-	connectionsMutex sync.Mutex
-	entryListMutex   sync.Mutex
-	sessionMutex     sync.Mutex
+	// UDP 状态由单个写锁保护，广播只读快照。
+	stateMutex                sync.RWMutex
+	activeStints              = make(map[int]*SessionStint)
+	entryListLoaded           bool
+	lastLogPoll               time.Time
+	bestLapTimes              = make(map[int]int)
+	classBestTimes            = make(map[string]int)
+	sessionStints             = make([]*SessionStint, 0)
+	completedTelemetrySamples = make(map[int][]udp.CarUpdate)
+	globalMutex               sync.Mutex
+	connectionsMutex          sync.Mutex
+	entryListMutex            sync.Mutex
+	sessionMutex              sync.Mutex
 	// 数据收集控制
 	dataCollectionEnabled bool = false
 	// 全局变量用于暂存车辆信息，带互斥锁保证并发安全
@@ -383,18 +391,24 @@ type Entry struct {
 
 // ACSession ACSession结构体（json tag 必须与 HTTP 端 WebSocketMessage.Session 对齐）
 type ACSession struct {
-	SessionID   int64   `json:"session_id"`
-	EventID     int     `json:"event_id"`
-	Type        int     `json:"type"`
-	Name        string  `json:"name"`
-	TrackTime   string  `json:"track_time"`
-	Laps        int     `json:"laps"`
-	Weather     string  `json:"weather"`
-	DurationMin int     `json:"duration_min"`
-	ElapsedMs   int64   `json:"elapsed_ms"`
-	StartGrip   float64 `json:"start_grip"`
-	CurrentGrip float64 `json:"current_grip"`
-	HttpPort    int     `json:"http_port"`
+	SessionID    int64   `json:"session_id"`
+	EventID      int     `json:"event_id"`
+	Type         int     `json:"type"`
+	Name         string  `json:"name"`
+	TrackTime    string  `json:"track_time"`
+	Laps         int     `json:"laps"`
+	Weather      string  `json:"weather"`
+	DurationMin  int     `json:"duration_min"`
+	ElapsedMs    int64   `json:"elapsed_ms"`
+	StartGrip    float64 `json:"start_grip"`
+	CurrentGrip  float64 `json:"current_grip"`
+	HttpPort     int     `json:"http_port"`
+	StartTime    int64   `json:"start_time"`
+	FinishTime   int64   `json:"finish_time"`
+	LastActivity int64   `json:"last_activity"`
+	AirTemp      float64 `json:"air_temp"`
+	RoadTemp     float64 `json:"road_temp"`
+	IsFinished   int     `json:"is_finished"`
 }
 
 // TrackConfig 赛道配置结构体
@@ -410,328 +424,166 @@ type TrackConfig struct {
 
 func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	collectCarUpdates()
-	// 处理单圈完成事件，暂存所有车辆信息
-	lapDataMutex.Lock()
-	defer lapDataMutex.Unlock()
-
-	// 仅处理当前完成圈数事件的车辆（Cars 按 CarID 索引，需防御越界）
-	if int(lapMsg.CarID) >= len(lapMsg.Cars) || lapMsg.Cars[lapMsg.CarID] == nil {
-		logger.Printf("完成圈数事件的 CarID %d 超出车辆数组范围(len=%d)，已跳过", lapMsg.CarID, len(lapMsg.Cars))
+	if globalSession == nil || globalSession.ID == 0 {
 		return
 	}
-	car := lapMsg.Cars[lapMsg.CarID]
-	lapData := CarLapData{
-		SessionID:  globalSession.ID,
-		CarID:      int(car.CarID),
-		GameCarID:  0,
-		LapTime:    int(lapMsg.LapTime),
-		Sector1:    0,
-		Sector2:    0,
-		Sector3:    0,
-		Tyre:       "",
-		Cuts:       uint8(lapMsg.Cuts),
-		Crashes:    0,
-		CarCrashes: 0,
-		Laps:       car.Laps,
-		Completed:  uint16(car.Completed),
-		Timestamp:  time.Now(),
-	}
-
-	// 从stintLapData获取最新圈数据
-	if dataCollectionEnabled {
-		sessionMap, sessionOk := stintLapData[int(lapData.SessionID)]
-		if sessionOk {
-			laps, ok := sessionMap[lapData.CarID]
-			if ok && len(laps) > 0 {
-				lastLap := laps[len(laps)-1]
-				lapData.LapTime = lastLap.Time
-				if lastLap.Sector1 >= 0 {
-					lapData.Sector1 = lastLap.Sector1
-				}
-				if lastLap.Sector2 >= 0 {
-					lapData.Sector2 = lastLap.Sector2
-				}
-				if lastLap.Sector3 >= 0 {
-					lapData.Sector3 = lastLap.Sector3
-				}
-				if lastLap.Tyre != "" {
-					lapData.Tyre = lastLap.Tyre
-				}
-				lapData.Cuts = uint8(lastLap.Cuts)
-				lapData.Crashes = uint8(lastLap.Crashes + lastLap.CarCrashes)
-			}
+	collectCarUpdates()
+	var completedCar *udp.LapCompletedCar
+	for _, car := range lapMsg.Cars {
+		if car != nil && car.CarID == lapMsg.CarID {
+			completedCar = car
+			break
 		}
 	}
-
-	// 获取用户连接信息并处理业务逻辑
-	connectionsMutex.Lock()
-	connInfo, exists := globalConnections[lapData.CarID]
-	connectionsMutex.Unlock()
-
-	if exists && connInfo.DriverGUID != "" {
-		// 解析GUID并查询用户
-		steam64ID, err := strconv.ParseInt(connInfo.DriverGUID, 10, 64)
+	if completedCar == nil {
+		logger.Printf("完成圈消息缺少车辆 %d", lapMsg.CarID)
+		return
+	}
+	slot := int(lapMsg.CarID)
+	conn := globalConnections[slot]
+	if conn != nil && conn.UserID == 0 {
+		initializeConnectionIdentity(conn)
+	}
+	if conn == nil || conn.UserID == 0 || conn.CarDBID == 0 {
+		logger.Printf("车辆 %d 身份尚未初始化，跳过写圈", slot)
+		return
+	}
+	lap := CarLapData{SessionID: globalSession.ID, CarID: slot, GameCarID: conn.CarDBID,
+		LapTime: int(lapMsg.LapTime), Cuts: lapMsg.Cuts, Laps: completedCar.Laps,
+		Completed: uint16(completedCar.Completed), Timestamp: time.Now()}
+	// 日志只补充完整圈的分段，保留 UDP 圈时这一权威值。
+	for i := len(stintLapData[int(globalSession.ID)][slot]) - 1; i >= 0; i-- {
+		v := stintLapData[int(globalSession.ID)][slot][i]
+		if v.Time == lap.LapTime {
+			lap.Sector1, lap.Sector2, lap.Sector3, lap.Tyre = v.Sector1, v.Sector2, v.Sector3, v.Tyre
+			lap.Crashes, lap.CarCrashes = uint8(v.Crashes), uint8(v.CarCrashes)
+			break
+		}
+	}
+	if lap.Tyre == "" {
+		lap.Tyre = userTyres[conn.DriverName]
+	}
+	previous := carLapDataMap[slot]
+	if len(previous) > 0 && previous[len(previous)-1].Laps >= lap.Laps {
+		return
+	}
+	stint := activeStints[slot]
+	if stint == nil || stint.UserID != conn.UserID || stint.IsFinished != 0 {
+		stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: lap.Timestamp}
+		if globalEvent.TeamEvent == 1 {
+			for _, member := range globalTeamMembers {
+				if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
+					stint.TeamMemberID = member.ID
+					break
+				}
+			}
+		}
+		id, err := globalDBWriter.CreateSessionStint(stint)
 		if err != nil {
-			logger.Printf("解析DriverGUID失败: %v", err)
-			// 跳过本次循环剩余逻辑
+			logger.Printf("创建 stint 失败: %v", err)
 			return
 		}
-
-		// 查询或创建用户
-		var userID int
-		foundUser := false
-		globalMutex.Lock()
-		for _, u := range globalUsers {
-			if u.Steam64ID == steam64ID {
-				userID = u.UserID
-				foundUser = true
-				break
-			}
+		stint.ID = int(id)
+		activeStints[slot] = stint
+		sessionStints = append(sessionStints, stint)
+	}
+	valid := lap.Cuts == 0 && lap.Crashes == 0 && lap.CarCrashes == 0 && lap.LapTime > 0
+	record := &StintLap{StintID: stint.ID, Sector1: lap.Sector1, Sector2: lap.Sector2, Sector3: lap.Sector3,
+		Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lap.LapTime, Cuts: int(lap.Cuts), Crashes: int(lap.Crashes),
+		CarCrashes: int(lap.CarCrashes), MaxSpeed: int(calculateMaxSpeed(completedTelemetrySamples[slot])), FinishedAt: lap.Timestamp}
+	if lap.LapTime > 0 {
+		record.AvgSpeed = int(float64(getTrackLength()) * 3600 / float64(lap.LapTime))
+	}
+	lapID, err := globalDBWriter.InsertStintLap(record)
+	if err != nil {
+		logger.Printf("写入单圈失败: %v", err)
+		return
+	}
+	stint.Laps++
+	if valid {
+		stint.ValidLaps++
+		if stint.BestLapID == 0 || lap.LapTime < bestLapTimes[stint.ID] {
+			bestLapTimes[stint.ID] = lap.LapTime
+			stint.BestLapID = lapID
+			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 4,
+				Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
 		}
-		globalMutex.Unlock()
-		if !foundUser {
-			user := &User{Steam64ID: steam64ID}
-			userID, _, err = globalDBWriter.FindOrCreateUser(user)
-			if err != nil {
-				logger.Printf("手动添加用户失败: %v", err)
-				return
-			}
+		carClass := "N/A"
+		if car := globalCars[conn.CarDBID]; car != nil {
+			carClass = car.CarClass
 		}
-
-		// 从globalCars缓存获取GameCarID
-		var gameCarID int
-		for _, car := range globalCars {
-			if car.Name == connInfo.CarModel {
-				gameCarID = car.ID
-				break
-			}
+		if classBestTimes[carClass] == 0 || lap.LapTime < classBestTimes[carClass] {
+			classBestTimes[carClass] = lap.LapTime
+			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 5, Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
 		}
-		lapData.GameCarID = gameCarID
-
-		// 初始化团队成员ID和团队查找状态
-		var teamMemberID int
-		var teamFound bool = false
-
-		// 仅团队事件处理团队成员信息
-		if globalEvent.TeamEvent == 1 {
-			teamFound = false
-			// 查询团队成员缓存
-			globalMutex.Lock()
-			for _, tm := range globalTeamMembers {
-				if tm.UserID == userID {
-					for _, t := range globalTeams {
-						if t.ID == tm.TeamID && t.EventID == globalEvent.ID {
-							teamMemberID = tm.ID
-							teamFound = true
-							break
-						}
-					}
-					if teamFound {
-						break
-					}
-				}
-			}
-			globalMutex.Unlock()
-		} // 查找未完成的stint
-		if dataCollectionEnabled {
-			var existingStintID int
-			var existingLaps int
-			var existingValidLaps int
-			var existingBestLapID int
-			queryErr := globalDBWriter.DB.QueryRow(
-				"SELECT session_stint_id, laps, valid_laps, best_lap_id FROM session_stint WHERE user_id = ? AND session_id = ? AND car_id = ? AND is_finished = 0",
-				userID, globalSession.ID, lapData.GameCarID,
-			).Scan(&existingStintID, &existingLaps, &existingValidLaps, &existingBestLapID)
-
-			// 创建或更新stint记录
-			var stintID int64
-			var isCurrentLapValid bool
-			if queryErr == nil {
-				// 更新现有未完成的stint
-				laps := existingLaps + 1
-				validLaps := existingValidLaps
-				bestLapID := existingBestLapID
-
-				// 先创建stintLap获取lapID
-				stintLap := &StintLap{
-					StintID:    existingStintID,
-					Sector1:    lapData.Sector1,
-					Sector2:    lapData.Sector2,
-					Sector3:    lapData.Sector3,
-					Grip:       globalSession.CurrentGrip,
-					Tyre:       lapData.Tyre,
-					Time:       lapData.LapTime,
-					Cuts:       int(lapData.Cuts),
-					Crashes:    int(lapData.Crashes),
-					CarCrashes: int(lapData.CarCrashes),
-					// 从carLapData计算最大速度
-					MaxSpeed:   int(calculateMaxSpeed(carLapData[lapData.CarID])),
-					AvgSpeed:   int(float64(getTrackLength()) * 3.6 / float64(lapData.LapTime)),
-					FinishedAt: lapData.Timestamp,
-				}
-				lapID, err := globalDBWriter.InsertStintLap(stintLap)
-				if err != nil {
-					logger.Printf("插入圈速记录失败: %v", err)
-				}
-
-				result, err := globalDBWriter.executeSQL("INSERT INTO session_stint (session_id, user_id, team_member_id, car_id, game_car_id, started_at) VALUES (?, ?, ?, ?, ?, ?)",
-					globalSession.ID, userID, 0, lapData.GameCarID, lapData.CarID, time.Now())
-				if err != nil {
-					logger.Printf("创建SessionStint失败: %v", err)
-					return
-				}
-				_, _ = result.LastInsertId()
-
-				// 检查当前圈速是否有效并更新valid_laps
-				if lapData.Completed > 0 && lapData.Cuts == 0 && lapData.Crashes == 0 {
-					validLaps++
-					isCurrentLapValid = true
-					// 将lapData.LapTime从毫秒转换为秒以匹配数据库单位
-					// 检查是否为单阶段最快圈速 (case 4)
-					if isCurrentLapValid && (bestLapID == int(lapID)) {
-						stintBestDetail := fmt.Sprintf(`{"user_id":%d,"car_id":%d,"lap_time":%d}`, userID, lapData.CarID, lapData.LapTime)
-						globalDBWriter.InsertSessionFeed(&SessionFeed{
-							SessionID: globalSession.ID,
-							Type:      4,
-							Detail:    stintBestDetail,
-							Time:      time.Now(),
-						})
-					}
-
-					// 检查是否为全场组别最快圈速 (case 5)
-					// 查找当前车辆类别
-					var carClass string
-					for _, car := range globalCars {
-						if car.ID == gameCarID {
-							carClass = car.CarClass
-							break
-						}
-					}
-					if carClass != "" {
-						// 查询当前组别最快圈速
-						var classBestLapTime int
-						err := globalDBWriter.DB.QueryRow(
-							`SELECT MIN(sl.time) FROM stint_lap sl
-								JOIN session_stint ss ON sl.stint_id = ss.session_stint_id
-								JOIN car c ON ss.car_id = c.car_id
-								WHERE ss.session_id = ? AND c.car_class = ?`,
-							globalSession.ID, carClass,
-						).Scan(&classBestLapTime)
-
-						// 如果查询失败(无记录)或当前圈速更快，则更新组别最快圈速
-						if err != nil || (isCurrentLapValid && lapData.LapTime < classBestLapTime) {
-							classBestDetail := fmt.Sprintf(`{"user_id":%d,"car_id":%d,"lap_time":%d}`, userID, lapData.CarID, lapData.LapTime)
-							globalDBWriter.InsertSessionFeed(&SessionFeed{
-								SessionID: globalSession.ID,
-								Type:      5,
-								Detail:    classBestDetail,
-								Time:      time.Now(),
-							})
-						}
-					}
-
-					// 将lapData.LapTime从毫秒转换为秒以匹配数据库单位
-					if bestLapID == 0 || float64(lapData.LapTime)/1000 < getLapTimeByID(bestLapID) {
-						bestLapID = int(lapID)
-					}
-				}
-				_, err = globalDBWriter.executeSQL(
-					"UPDATE session_stint SET laps = ?, valid_laps = ?, best_lap_id = ?, finished_at = ? WHERE session_stint_id = ?",
-					laps, validLaps, bestLapID, time.Now(), existingStintID,
-				)
-				if err != nil {
-					logger.Printf("更新stint记录失败: %v", err)
-					return
-				}
-				stintID = int64(existingStintID)
-			} else {
-				// 创建新的stint记录
-				stint := &SessionStint{
-					UserID:       userID,
-					TeamMemberID: teamMemberID,
-					SessionID:    int(globalSession.ID),
-					CarID:        lapData.CarID,
-					GameCarID:    lapData.GameCarID,
-					Laps:         1,
-					ValidLaps:    boolToInt(lapData.Cuts == 0 && lapData.Crashes == 0 && lapData.CarCrashes == 0),
-					IsFinished:   0,
-					StartedAt:    time.Now(),
-					FinishedAt:   time.Now(),
-				}
-				isCurrentLapValid = false
-				var sqlStr string
-				var args []interface{}
-				if globalEvent.TeamEvent == 1 {
-					sqlStr = "INSERT INTO session_stint (user_id, team_member_id, session_id, car_id, game_car_id, laps, valid_laps, is_finished, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-					args = []interface{}{stint.UserID, stint.TeamMemberID, stint.SessionID, stint.GameCarID, stint.CarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
-				} else {
-					sqlStr = "INSERT INTO session_stint (user_id, session_id, car_id, game_car_id, laps, valid_laps, is_finished, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-					args = []interface{}{stint.UserID, stint.SessionID, stint.GameCarID, stint.CarID, stint.Laps, stint.ValidLaps, stint.IsFinished, stint.StartedAt, stint.FinishedAt}
-				}
-				result, err := globalDBWriter.executeSQL(sqlStr, args...)
-				if err == nil && result != nil {
-					stintID, _ = result.LastInsertId()
-				}
-			}
+		if cfg.ACServer.Event.LapTelemetryEnable && len(telemetryData[slot]) == 0 && len(carLapData[slot]) > 0 {
+			data, err := generateLapTelemetry(slot, int32(getTrackLength()), carLapData[slot])
 			if err == nil {
-
-				stintLap := &StintLap{
-					StintID:    int(stintID),
-					Sector1:    lapData.Sector1,
-					Sector2:    lapData.Sector2,
-					Sector3:    lapData.Sector3,
-					Grip:       globalSession.CurrentGrip,
-					Tyre:       lapData.Tyre,
-					Time:       lapData.LapTime,
-					Cuts:       int(lapData.Cuts),
-					Crashes:    int(lapData.Crashes),
-					CarCrashes: int(lapData.CarCrashes),
-					MaxSpeed:   int(calculateMaxSpeed(carLapData[lapData.CarID])),
-					AvgSpeed:   int(float64(getTrackLength()) * 3.6 / float64(lapData.LapTime)),
-					FinishedAt: lapData.Timestamp,
-				}
-				lapID, err := globalDBWriter.InsertStintLap(stintLap)
-				if err != nil {
-					logger.Printf("插入圈速记录失败: %v", err)
-					return
-				}
-				logger.Printf("创建stint %d 及圈速记录 for 车辆 %d", stintID, lapData.CarID)
-
-				// 仅有效圈才插入遥测数据
-				if isCurrentLapValid {
-					// 插入遥测数据
-					if telemetry, ok := telemetryData[lapData.CarID]; ok && len(telemetry) > 0 {
-						if err := globalDBWriter.InsertLapTelemetry(int(lapID), telemetry); err != nil {
-							logger.Printf("插入遥测数据失败: %v", err)
-						} else {
-							logger.Printf("遥测数据已插入，lapID: %d, 数据大小: %d 字节", lapID, len(telemetry))
-						}
-					}
-					delete(telemetryData, lapData.CarID) // 清除已完成圈数的遥测数据
-				}
+				telemetryData[slot] = data
 			}
 		}
-		// 数据收集未启用时跳过数据库操作
-	} else {
-		//logger.Printf("数据收集未启用，跳过stint和圈速记录处理")
+		if cfg.ACServer.Event.LapTelemetryEnable && len(telemetryData[slot]) > 0 {
+			if err := globalDBWriter.InsertLapTelemetry(lapID, telemetryData[slot]); err != nil {
+				logger.Printf("写遥测失败: %v", err)
+			}
+		}
 	}
-	// 添加到对应车辆的暂存列表
-	carLapDataMap[lapData.CarID] = append(carLapDataMap[lapData.CarID], lapData)
-	logger.Printf("暂存车辆 %d 圈速数据，累计 %d 条", lapData.CarID, len(carLapDataMap[lapData.CarID]))
+	_, err = globalDBWriter.executeSQL("UPDATE session_stint SET laps=?, valid_laps=?, best_lap_id=?, finished_at=? WHERE session_stint_id=?",
+		stint.Laps, stint.ValidLaps, nullableLapID(stint.BestLapID), lap.Timestamp, stint.ID)
+	if err != nil {
+		logger.Printf("更新 stint 失败: %v", err)
+	}
+	delete(telemetryData, slot)
+	delete(completedTelemetrySamples, slot)
+	carLapDataMap[slot] = append(previous, lap)
+	globalSession.LastActivity = lap.Timestamp
+	globalDBWriter.UpdateSessionGrip(globalSession.ID, globalSession.CurrentGrip)
 }
 
-func handleCarInfoMessage(carInfoMsg udp.CarInfo, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
+func nullableLapID(id int) interface{} {
+	if id == 0 {
+		return nil
+	}
+	return id
 }
 
-func handleClientLoadedMessage(clientMsg udp.ClientLoaded, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-	connectionsMutex.Lock()
-	if connInfo := globalConnections[int(clientMsg.Event())]; connInfo != nil {
-		connInfo.ConnectionStatus = 0 // 设为已连接状态
+// UDP 类型保持原协议，数据库和原版网页使用 0/1/2。
+func databaseSessionType(msg udp.SessionInfo) int {
+	switch strings.ToLower(msg.Name) {
+	case "practice":
+		return 0
+	case "qualify", "qualifying", "qualification":
+		return 1
+	case "race":
+		return 2
 	}
-	connectionsMutex.Unlock()
+	if msg.Type >= udp.SessionTypePractice && msg.Type <= udp.SessionTypeRace {
+		return int(msg.Type) - 1
+	}
+	return 0
+}
+
+func handleCarInfoMessage(msg udp.CarInfo, last *time.Time) {
+	*last = time.Now()
+	if !msg.IsConnected {
+		return
+	}
+	slot := int(msg.CarID)
+	conn := globalConnections[slot]
+	if conn == nil {
+		conn = &ConnectionInfo{CarID: slot, TrackStatus: 3}
+		globalConnections[slot] = conn
+	}
+	conn.DriverName, conn.DriverGUID, conn.CarModel, conn.CarSkin = msg.DriverName, string(msg.DriverGUID), msg.CarModel, msg.CarSkin
+	conn.ConnectionStatus = 0
+	initializeConnectionIdentity(conn)
+}
+
+func handleClientLoadedMessage(msg udp.ClientLoaded, last *time.Time) {
+	*last = time.Now()
+	if conn := globalConnections[int(msg)]; conn != nil {
+		conn.ConnectionStatus = 0
+	}
 }
 
 type PitVisit struct {
@@ -740,6 +592,9 @@ type PitVisit struct {
 }
 
 type ConnectionInfo struct {
+	UserID                     int
+	CarDBID                    int
+	TeamID                     int
 	CarID                      int
 	DriverName                 string
 	DriverGUID                 string
@@ -757,561 +612,404 @@ type ConnectionInfo struct {
 }
 
 func getLapTimeByID(lapID int) float64 {
-	var lapTime float64
+	if globalDBWriter.SimulateSQL {
+		for _, values := range carLapDataMap {
+			for _, v := range values {
+				if v.LapTime > 0 {
+					return float64(v.LapTime)
+				}
+			}
+		}
+		return math.MaxFloat64
+	}
+	var lapTime sql.NullFloat64
 	err := globalDBWriter.DB.QueryRow("SELECT time FROM stint_lap WHERE stint_lap_id = ?", lapID).Scan(&lapTime)
 	if err != nil {
 		return math.MaxFloat64 // 返回最大浮点数确保当前圈速成为最佳圈
 	}
-	return lapTime
+	if !lapTime.Valid {
+		return math.MaxFloat64
+	}
+	return lapTime.Float64
 }
 
-func handleNewConnectionMessage(connMsg udp.SessionCarInfo, lastDataTime *time.Time) {
-	carID := int(connMsg.CarID)
-	// 存储连接信息到全局变量
-	connectionsMutex.Lock()
-	globalConnections[carID] = &ConnectionInfo{
-		CarID:                      carID,
-		DriverName:                 connMsg.DriverName,
-		DriverGUID:                 string(connMsg.DriverGUID),
-		CarModel:                   connMsg.CarModel,
-		CarSkin:                    connMsg.CarSkin,
-		DriverInitials:             connMsg.DriverInitials,
-		CarName:                    connMsg.CarName,
-		ConnectionStatus:           1,
-		TrackStatus:                3,
-		TrackStatusLastChangedTime: time.Now(),
-	}
-	connectionsMutex.Unlock()
-	// 处理用户GUID并查询/创建用户
-	steam64ID, err := strconv.ParseInt(string(connMsg.DriverGUID), 10, 64)
-	if err != nil {
-		logger.Printf("解析DriverGUID失败: %v\n", err)
-	} else {
-		user := &User{
-			Name:      connMsg.DriverName,
-			Steam64ID: steam64ID,
-		}
-
-		userID, newUser, err := globalDBWriter.FindOrCreateUser(user)
-		if err != nil {
-			logger.Printf("查询/创建用户 %s 失败: %v\n", connMsg.DriverName, err)
-		} else {
-			if newUser {
-				logger.Printf("新用户 (CarID: %d): %d, %s\n", int(connMsg.CarID), userID, connMsg.DriverName)
-			} else {
-				logger.Printf("已知用户 (CarID: %d): %d, %s\n", int(connMsg.CarID), userID, connMsg.DriverName)
-			}
-		}
-	}
-
-	// 插入用户连接事件SessionFeed (case2)
-	userID := getUserIDByCarID(carID)
-	teamID := getTeamIDByCarID(carID)
-	globalDBWriter.InsertSessionFeed(&SessionFeed{
-		SessionID: globalSession.ID,
-		Type:      2,
-		Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, userID, carID),
-		Time:      time.Now(),
-	})
-
-	// 处理车队车手变更事件 (case6)
-	if teamID > 0 && connMsg.DriverName != "" {
-		teamName := getTeamNameByID(int(teamID))
-		if teamName != "" {
-			detail := map[string]interface{}{
-				"team":       teamName,
-				"new_driver": connMsg.DriverName,
-			}
-			detailJSON, _ := json.Marshal(detail)
-			globalDBWriter.InsertSessionFeed(&SessionFeed{
-				SessionID: globalSession.ID,
-				Type:      6,
-				Detail:    string(detailJSON),
-				Time:      time.Now(),
-			})
-		}
-	}
-
-	*lastDataTime = time.Now()
-}
-
-func handleChatMessage(chatMsg udp.Chat, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-
-	// 获取发送者信息
-	userID := getUserIDByCarID(int(chatMsg.CarID))
-
-	// 插入聊天消息事件到SessionFeed（原版格式: {"user_id","msg"}）
-	globalDBWriter.InsertSessionFeed(&SessionFeed{
-		SessionID: globalSession.ID,
-		Type:      7,
-		Detail:    fmt.Sprintf(`{"user_id":%d,"msg":%q}`, userID, chatMsg.Message),
-		Time:      time.Now(),
-	})
-}
-
-// 补全lap数据实现
-func supplementStintLapData(stintID int, sessionData *SessionData) error {
-	logger.Printf("补全stint %d的lap数据", stintID)
-	// 从sessionData提取lap数据
-	for _, lap := range sessionData.Laps {
-		// 检查lap是否已存在于数据库并获取当前数据
-		var existingLap StintLap
-		err := globalDBWriter.DB.QueryRow(`
-			SELECT stint_lap_id, sector_1, sector_2, sector_3, tyre, cuts 
-			FROM stint_lap 
-			WHERE stint_id = ? AND time = ?`, stintID, lap.LapTime).Scan(
-			&existingLap.ID, &existingLap.Sector1, &existingLap.Sector2, &existingLap.Sector3, &existingLap.Tyre, &existingLap.Cuts)
-
-		if err != nil && err != sql.ErrNoRows {
-			logger.Printf("检查lap存在性失败: %v", err)
-			return err
-		}
-
-		lapExists := err != sql.ErrNoRows
-		needUpdate := false
-
-		if lapExists {
-			// 检查是否需要更新字段
-			if existingLap.Sector1 == 0 && lap.Sectors[0] > 0 {
-				existingLap.Sector1 = lap.Sectors[0]
-				needUpdate = true
-			}
-			if existingLap.Sector2 == 0 && lap.Sectors[1] > 0 {
-				existingLap.Sector2 = lap.Sectors[1]
-				needUpdate = true
-			}
-			if existingLap.Sector3 == 0 && lap.Sectors[2] > 0 {
-				existingLap.Sector3 = lap.Sectors[2]
-				needUpdate = true
-			}
-			if existingLap.Tyre == "" && lap.Tyre != "" {
-				existingLap.Tyre = lap.Tyre
-				needUpdate = true
-			}
-
-			if needUpdate {
-				// 执行更新
-				_, err := globalDBWriter.DB.Exec(`
-					UPDATE stint_lap SET sector_1=?, sector_2=?, sector_3=?, tyre=?, cuts=? WHERE stint_lap_id=?`,
-					existingLap.Sector1, existingLap.Sector2, existingLap.Sector3,
-					existingLap.Tyre, existingLap.Cuts, existingLap.ID)
-				if err != nil {
-					logger.Printf("更新lap数据失败: %v", err)
-					return err
-				}
-				logger.Printf("已更新stint %d的lap %d数据", stintID, lap.LapTime)
-			}
-		} else {
-			// 插入新lap数据
-			newLap := &StintLap{
-				StintID: stintID,
-				Sector1: lap.Sectors[0],
-				Sector2: lap.Sectors[1],
-				Sector3: lap.Sectors[2],
-				Time:    lap.LapTime,
-				Tyre:    lap.Tyre,
-				Cuts:    0,
-			}
-			_, err := globalDBWriter.InsertStintLap(newLap)
-			if err != nil {
-				logger.Printf("插入lap数据失败: %v", err)
-				return err
-			}
-			logger.Printf("已补充stint %d的lap %d数据", stintID, lap.LapTime)
-		}
-	}
-	return nil
-}
-
-func handleEndSessionMessage(endMsg udp.EndSession, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-
-	// 查找当前事件的最新会话
-	existingSession, err := globalDBWriter.FindLatestSessionByEventID(globalEvent.ID)
-	if err != nil {
-		logger.Printf("查找session失败: %v", err)
+// 身份查询只在车辆接入时执行；广播只使用已解析的数据库 ID。
+func initializeConnectionIdentity(conn *ConnectionInfo) {
+	guid, err := strconv.ParseInt(conn.DriverGUID, 10, 64)
+	if err != nil || guid <= 0 {
+		logger.Printf("车辆 %d 的 GUID 无效", conn.CarID)
 		return
 	}
-	if existingSession == nil {
-		logger.Printf("未找到当前会话信息")
-		return
-	}
-
-	// 读取JSON会话数据(移至循环外，仅读取一次)
-	sessionData, err := readSessionDataFromJSON(filepath.Join(cfg.Game.Path, string(endMsg)))
+	user := &User{Steam64ID: guid, Name: conn.DriverName}
+	uid, _, err := globalDBWriter.FindOrCreateUser(user)
 	if err != nil {
-		logger.Printf("读取会话数据失败: %v", err)
+		logger.Printf("解析车手失败: %v", err)
 		return
 	}
-
-	// 查询当前会话的所有stint
-	stints, err := globalDBWriter.FindSessionStintsBySessionID(int64(existingSession.ID))
-	if err != nil {
-		logger.Printf("查询session_stints失败: %v", err)
-		return
-	}
-	if len(stints) == 0 {
-		logger.Printf("未找到任何stint信息")
-		return
-	}
-
-	// 按ID排序stints确保顺序正确
-	sort.Slice(stints, func(i, j int) bool {
-		return stints[i].ID < stints[j].ID
-	})
-
-	// 按carID分组处理stint
-	carStints := make(map[int][]*SessionStint)
-	for _, stint := range stints {
-		carStints[stint.CarID] = append(carStints[stint.CarID], stint)
-	}
-
-	// 处理每个车辆的stint数据
-	for carID, stints := range carStints {
-		// 过滤当前车辆的lap数据
-		var carStintLaps []StintLap
-		if sessionData != nil {
-			for _, lap := range sessionData.Laps {
-				// 转换Lap为StintLap并使用当前stint的ID
-				carStintLaps = append(carStintLaps, StintLap{
-					StintID:    lap.StintID,
-					Sector1:    lap.Sectors[0],
-					Sector2:    lap.Sectors[1],
-					Sector3:    lap.Sectors[2],
-					Grip:       globalEvent.StartGrip,
-					Tyre:       lap.Tyre,
-					Time:       lap.LapTime,
-					Cuts:       lap.Cuts,
-					Crashes:    0,
-					CarCrashes: 0,
-					MaxSpeed:   0,
-					AvgSpeed:   getTrackLength() / lap.LapTime,
-					FinishedAt: existingSession.StartTime.Add(time.Duration(lap.Timestamp) * time.Millisecond),
-				})
-			}
-		}
-
-		// 创建当前车辆的sessionData副本
-		currentSessionData := *sessionData
-		// Convert StintLap to JSONLap
-		currentSessionData.Laps = make([]JSONLap, len(carStintLaps))
-		for i, sl := range carStintLaps {
-			currentSessionData.Laps[i] = JSONLap{
-				StintID: sl.StintID,
-				Sectors: [3]int{sl.Sector1, sl.Sector2, sl.Sector3},
-				LapTime: sl.Time,
-				Tyre:    sl.Tyre,
-				Cuts:    sl.Cuts,
-			}
-		}
-
-		// 处理该车辆的所有stint
-		for _, stint := range stints {
-			logger.Printf("处理车辆 %d 的stint %d", carID, stint.ID)
-
-			// 补全lap数据
-			if err := supplementStintLapData(stint.ID, &currentSessionData); err != nil {
-				logger.Printf("补全stint %d 的lap数据失败: %v", stint.ID, err)
-			}
-		}
-
-		// 检查并补全缺失的lap
-		// Convert StintLap to Lap
-		var laps []Lap
-		for _, sl := range carStintLaps {
-			laps = append(laps, Lap{
-				StintID:    sl.StintID,
-				Sectors:    [3]int{sl.Sector1, sl.Sector2, sl.Sector3},
-				Time:       sl.Time,
-				Tyre:       sl.Tyre,
-				Cuts:       sl.Cuts,
-				Crashes:    sl.Crashes,
-				CarCrashes: sl.CarCrashes,
-			})
-		}
-		if err := completeMissingLaps(carID, stints[len(stints)-1].ID, laps); err != nil {
-			logger.Printf("补全车辆 %d 的lap数据失败: %v", carID, err)
-		}
-	}
-	logger.Printf("所有车辆的stint处理完成")
-	// 更新会话状态为已结束
-	if existingSession.IsFinished == 0 {
-		existingSession.IsFinished = 1
-		existingSession.LastActivity = time.Now()
-		if err := globalDBWriter.UpdateSession(existingSession); err != nil {
-			logger.Printf("更新session状态失败: %v", err)
-		}
-		logger.Printf("session %d 结束", existingSession.ID)
-	}
-}
-
-// 补全缺失的lap到最后一个stint
-func completeMissingLaps(carID int, lastStintID int, jsonLaps []Lap) error {
-	// 查询数据库中已有的lap数
-	dbLaps, err := globalDBWriter.FindStintLapsByStintID(lastStintID)
-	if err != nil {
-		return fmt.Errorf("查询lap数失败: %v", err)
-	}
-
-	// 比较JSON和数据库中的lap数
-	if len(dbLaps) >= len(jsonLaps) {
-		return nil // 无需补全
-	}
-
-	// 计算需要补全的lap数
-	missing := len(jsonLaps) - len(dbLaps)
-	logger.Printf("车辆 %d 需要补全 %d 个lap到stint %d", carID, missing, lastStintID)
-
-	// 补全缺失的lap
-	added := 0
-	for _, lap := range jsonLaps {
-		if added >= missing {
+	conn.UserID = uid
+	globalUsers[uid] = user
+	for id, car := range globalCars {
+		if car.Name == conn.CarModel {
+			conn.CarDBID = id
 			break
 		}
-
-		// 检查lap是否已存在
-		exists, err := globalDBWriter.FindStintLapByStintIDAndTime(lastStintID, lap.Time)
+	}
+	if conn.CarDBID == 0 {
+		car := &Car{Name: conn.CarModel, DisplayName: conn.CarModel, Manufacturer: "N/A", CarClass: "N/A"}
+		id, err := globalDBWriter.FindOrCreateCarID(car)
 		if err != nil {
-			logger.Printf("检查lap存在性失败: %v", err)
-			continue
+			logger.Printf("解析车辆失败: %v", err)
+			return
 		}
+		car.ID = id
+		globalCars[id] = car
+		conn.CarDBID = id
+	}
+	conn.TeamID = 0
+	conn.TeamID = int(getTeamIDByCarID(conn.CarID))
+}
 
-		if !exists {
-			// 插入新lap
-			_, err := globalDBWriter.InsertStintLap(&StintLap{
-				StintID: lastStintID,
-				Sector1: lap.Sectors[0],
-				Sector2: lap.Sectors[1],
-				Sector3: lap.Sectors[2],
-				Time:    lap.Time,
-				Tyre:    lap.Tyre,
-				Cuts:    lap.Cuts,
-				Crashes: 0,
-			})
-			if err != nil {
-				logger.Printf("插入lap失败: %v", err)
-			} else {
-				added++
-				logger.Printf("已补全lap %d", lap.Time)
-			}
+func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
+	*last = time.Now()
+	slot := int(msg.CarID)
+	previous := globalConnections[slot]
+	finishStint(slot)
+	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
+	globalConnections[slot] = conn
+	initializeConnectionIdentity(conn)
+	if globalSession != nil && globalSession.ID > 0 && conn.UserID > 0 {
+		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 2, Detail: feedDetail(slot, nil), Time: time.Now()})
+		if previous != nil && conn.TeamID > 0 && previous.UserID > 0 && previous.UserID != conn.UserID {
+			data, _ := json.Marshal(map[string]interface{}{"team_id_1": conn.TeamID, "user_id_1": previous.UserID, "user_id_2": conn.UserID})
+			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 6, Detail: string(data), Time: time.Now()})
 		}
 	}
+}
 
+func handleChatMessage(msg udp.Chat, last *time.Time) {
+	*last = time.Now()
+	if !cfg.App.Live.SessionFeedShowChat || globalSession == nil || globalSession.ID == 0 {
+		return
+	}
+	conn := globalConnections[int(msg.CarID)]
+	if conn == nil || conn.UserID == 0 {
+		return
+	}
+	globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 7, Detail: feedDetail(int(msg.CarID), map[string]interface{}{"msg": msg.Message}), Time: time.Now()})
+}
+
+func handleEndSessionMessage(msg udp.EndSession, last *time.Time) {
+	*last = time.Now()
+	if globalSession == nil || globalSession.ID == 0 {
+		return
+	}
+	// 成绩 JSON 按槽位和 GUID 归属补充，绝不把全场圈写入每辆车。
+	data, err := readSessionDataFromJSON(filepath.Join(cfg.Game.Path, string(msg)))
+	if err != nil {
+		logger.Printf("读取成绩文件失败: %v", err)
+	} else {
+		importResultLaps(data)
+	}
+	finishCurrentSession()
+}
+
+func importResultLaps(data *SessionData) {
+	seen := make(map[[3]int]int)
+	for _, lap := range data.Laps {
+		slot := lap.CarId
+		conn := globalConnections[slot]
+		if conn == nil {
+			continue
+		}
+		userID := conn.UserID
+		if lap.DriverGuid != "" {
+			guid, err := strconv.ParseInt(lap.DriverGuid, 10, 64)
+			if err != nil {
+				continue
+			}
+			userID = 0
+			for id, user := range globalUsers {
+				if user.Steam64ID == guid {
+					userID = id
+					break
+				}
+			}
+			if userID == 0 {
+				continue
+			}
+		}
+		lapTime := lap.Time
+		if lapTime <= 0 {
+			lapTime = lap.LapTime
+		}
+		if lapTime <= 0 {
+			continue
+		}
+		stint := activeStints[slot]
+		if stint != nil && stint.UserID != userID {
+			stint = nil
+		}
+		if stint == nil {
+			for i := len(sessionStints) - 1; i >= 0; i-- {
+				v := sessionStints[i]
+				if v.GameCarID == slot && v.UserID == userID {
+					stint = v
+					break
+				}
+			}
+		}
+		if stint == nil {
+			continue
+		}
+		key := [3]int{slot, userID, lapTime}
+		seen[key]++
+		exists := false
+		if !globalDBWriter.SimulateSQL {
+			var count int
+			if err := globalDBWriter.DB.QueryRow("SELECT COUNT(*) FROM stint_lap WHERE stint_id=? AND time=?", stint.ID, lapTime).Scan(&count); err != nil {
+				logger.Printf("查询成绩圈失败: %v", err)
+				continue
+			}
+			exists = count >= seen[key]
+		} else {
+			count := 0
+			for _, v := range carLapDataMap[slot] {
+				if v.LapTime == lapTime {
+					count++
+				}
+			}
+			exists = count >= seen[key]
+		}
+		if exists {
+			continue
+		}
+		record := &StintLap{StintID: stint.ID, Sector1: lap.Sectors[0], Sector2: lap.Sectors[1], Sector3: lap.Sectors[2], Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lapTime, Cuts: lap.Cuts, AvgSpeed: int(float64(getTrackLength()) * 3600 / float64(lapTime)), FinishedAt: globalSession.StartTime.Add(time.Duration(lap.Timestamp) * time.Millisecond)}
+		id, err := globalDBWriter.InsertStintLap(record)
+		if err != nil {
+			logger.Printf("补成绩圈失败: %v", err)
+			continue
+		}
+		stint.Laps++
+		if lap.Cuts == 0 {
+			stint.ValidLaps++
+			if stint.BestLapID == 0 || lapTime < bestLapTimes[stint.ID] {
+				stint.BestLapID = id
+				bestLapTimes[stint.ID] = lapTime
+			}
+		}
+		globalDBWriter.executeSQL("UPDATE session_stint SET laps=?,valid_laps=?,best_lap_id=? WHERE session_stint_id=?", stint.Laps, stint.ValidLaps, nullableLapID(stint.BestLapID), stint.ID)
+	}
+}
+
+// 初始化会话使用同一条路径，启动接入已有比赛与换节都可采集。
+func handleNewSessionMessage(msg udp.SessionInfo, last *time.Time) {
+	*last = time.Now()
+	if err := initializeSession(msg, true); err != nil {
+		logger.Printf("新会话初始化失败: %v", err)
+	}
+}
+
+func initializeSession(msg udp.SessionInfo, newSession bool) error {
+	track := &TrackConfig{TrackName: msg.Track, ConfigName: msg.TrackConfig}
+	trackID, err := globalDBWriter.FindOrCreateTrackConfigID(track)
+	if err != nil {
+		return err
+	}
+	name := cfg.ACServer.Event.Name
+	if name == "" {
+		name = msg.ServerName
+	}
+	event, err := globalDBWriter.FindEventByName(name)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if event == nil || err == sql.ErrNoRows {
+		event = &Event{}
+	}
+	event.Name, event.ServerName, event.TrackConfigID = name, msg.ServerName, trackID
+	event.Active, event.TeamEvent, event.LiveryPreview, event.UseNumber = 1, boolToInt(cfg.ACServer.Event.Team.Enable), boolToInt(cfg.ACServer.Event.Team.LiveryPreviewEnable), boolToInt(cfg.ACServer.Event.Team.UseNumber)
+	event.StartGrip = -1
+	if sc := globalDBWriter.ServerCfg; sc != nil {
+		event.PracticeDuration, event.QualiDuration, event.RaceDuration, event.RaceDurationType = sc.PracticeDuration, sc.QualiDuration, sc.RaceDuration, sc.RaceDurationType
+		event.RaceWaitTime, event.RaceExtraLaps, event.ReverseGridPositions = sc.RaceWaitTime, sc.RaceExtraLaps, sc.ReverseGridPositions
+	}
+	if event.ID == 0 {
+		err = globalDBWriter.InsertEvent(event)
+	} else {
+		err = globalDBWriter.UpdateEvent(event)
+	}
+	if err != nil {
+		return err
+	}
+	changedEvent := globalEvent == nil || globalEvent.ID != event.ID
+	globalEvent = event
+	if !entryListLoaded || changedEvent {
+		if err := globalDBWriter.LoadEntryList(cfg.Game.Path); err != nil {
+			return err
+		}
+		entryListLoaded = true
+	}
+	// SESSION_INFO 表示当前会话；重复响应不能再次创建会话。
+	if !newSession && globalSession != nil && globalSession.ID > 0 && globalSession.EventID == event.ID {
+		return nil
+	}
+	if newSession {
+		finishCurrentSession()
+	}
+	var session *Session
+	if !newSession && !globalDBWriter.SimulateSQL {
+		session, err = globalDBWriter.FindLatestSessionByEventID(event.ID)
+		if err != nil {
+			return err
+		}
+		if session != nil && session.IsFinished != 0 {
+			session = nil
+		}
+	}
+	if session == nil {
+		port := cfg.Writer.HTTP.Port
+		if port == 0 {
+			port = cfg.ACServer.UDP.LocalPort
+		}
+		session = &Session{EventID: event.ID, Type: databaseSessionType(msg), Name: msg.Name, TrackTime: "0", StartTime: time.Now().Add(-time.Duration(msg.ElapsedMilliseconds) * time.Millisecond), DurationMin: int(msg.Time), ElapsedMs: int(msg.ElapsedMilliseconds), Laps: int(msg.Laps), Weather: msg.WeatherGraphics, AirTemp: float64(msg.AmbientTemp), RoadTemp: float64(msg.RoadTemp), StartGrip: -1, CurrentGrip: -1, LastActivity: time.Now(), HTTPPort: port}
+		if _, err = globalDBWriter.InsertSession(session); err != nil {
+			return err
+		}
+	}
+	globalSession = session
+	dataCollectionEnabled = true
+	carLapDataMap = make(map[int][]CarLapData)
+	stintLapData = make(map[int]map[int][]StintLap)
+	carLapData = make(map[int][]udp.CarUpdate)
+	telemetryData = make(map[int][]byte)
+	activeStints = make(map[int]*SessionStint)
+	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
+	bestLapTimes = make(map[int]int)
+	classBestTimes = make(map[string]int)
+	sessionStints = make([]*SessionStint, 0)
+	completedTelemetrySamples = make(map[int][]udp.CarUpdate)
+	lastFileSize, lastLineIdx, partialLine, globalNextSessionLineIdx = 0, 0, "", -1
+	latestFile, _ = findLatestSessionLogFile(logDir)
+	// 历史日志不属于本次采集；从接入时的文件末尾开始。
+	if latestFile != nil {
+		if info, err := latestFile.Info(); err == nil {
+			lastFileSize = info.Size()
+		}
+	}
+	for _, conn := range globalConnections {
+		conn.TrackStatus = 3
+		initializeConnectionIdentity(conn)
+	}
+	loadPitBoundary(msg.Track, msg.TrackConfig)
+	logger.Printf("当前事件 %d，会话 %d: %s", event.ID, session.ID, session.Name)
 	return nil
 }
 
-func handleNewSessionMessage(sessionMsg udp.SessionInfo, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-	loadPitBoundary(sessionMsg.Track, sessionMsg.TrackConfig)
-	lapDataMutex.Lock()
-	carLapDataMap = make(map[int][]CarLapData)
-	stintLapData = make(map[int]map[int][]StintLap) // 清空stint_lap数据
-	lapDataMutex.Unlock()
-	dataCollectionEnabled = true
-	collectCarUpdates()
-	// 重置文件读取位置，忽略之前的日志内容
-	lastFileSize = 0
-	lastLineIdx = 0
-	partialLine = ""
-	// 检查event表中是否存在匹配的server_name记录
-	trackConfig := &TrackConfig{
-		TrackName:  sessionMsg.Track,
-		ConfigName: sessionMsg.TrackConfig,
-	}
-	// 获取track_config_id
-	trackConfigID, err := globalDBWriter.FindOrCreateTrackConfigID(trackConfig)
-	if err != nil {
-		logger.Printf("获取track_config_id失败: %v", err)
+func finishStint(slot int) {
+	stint := activeStints[slot]
+	if stint == nil || stint.IsFinished != 0 {
 		return
 	}
-	// 确定server name，优先使用配置中的event name
-	Name := sessionMsg.ServerName
-	if cfg.ACServer.Event.Name != "" {
-		Name = cfg.ACServer.Event.Name
-		logger.Printf("使用配置的event name: %s", Name)
+	stint.IsFinished = 1
+	stint.FinishedAt = time.Now()
+	if _, err := globalDBWriter.executeSQL("UPDATE session_stint SET is_finished=1,finished_at=? WHERE session_stint_id=?", stint.FinishedAt, stint.ID); err != nil {
+		logger.Printf("结束 stint 失败: %v", err)
 	}
-	foundEvent, err := globalDBWriter.FindEventByName(Name)
-	if err != nil {
-		if err != sql.ErrNoRows {
-			logger.Printf("查询event失败: %v", err)
-			return
-		}
-		// 不存在匹配的记录，创建新的event
-		event := &Event{
-			ServerName:       sessionMsg.ServerName,
-			TrackConfigID:    trackConfigID,
-			Name:             Name,
-			TeamEvent:        boolToInt(cfg.ACServer.Event.Team.Enable),
-			Active:           1, // 默认为激活状态
-			LiveryPreview:    boolToInt(cfg.ACServer.Event.Team.LiveryPreviewEnable),
-			UseNumber:        boolToInt(cfg.ACServer.Event.Team.UseNumber),
-			PracticeDuration: globalEvent.PracticeDuration,
-			QualiDuration:    globalEvent.QualiDuration,
-			RaceDuration:     globalEvent.RaceDuration,
-			RaceDurationType: globalEvent.RaceDurationType,
-			RaceWaitTime:     globalEvent.RaceWaitTime,
-			RaceExtraLaps:    globalEvent.RaceExtraLaps,
-			ReverseGridPos:   globalEvent.ReverseGridPos,
-		}
-		if err := globalDBWriter.InsertEvent(event); err != nil {
-			logger.Printf("插入event记录失败: %v", err)
-			return
-		}
-		globalEvent = event
-		logger.Printf("创建event %d, 名称:%s", globalEvent.ID, globalEvent.Name)
-	} else {
-		// 更新现有event
-		event := &Event{
-			ID:               foundEvent.ID,
-			ServerName:       sessionMsg.ServerName,
-			TrackConfigID:    trackConfigID,
-			Name:             Name,
-			TeamEvent:        boolToInt(cfg.ACServer.Event.Team.Enable),
-			Active:           1,
-			LiveryPreview:    boolToInt(cfg.ACServer.Event.Team.LiveryPreviewEnable),
-			UseNumber:        boolToInt(cfg.ACServer.Event.Team.UseNumber),
-			PracticeDuration: globalEvent.PracticeDuration,
-			QualiDuration:    globalEvent.QualiDuration,
-			RaceDuration:     globalEvent.RaceDuration,
-			RaceDurationType: globalEvent.RaceDurationType,
-			RaceWaitTime:     globalEvent.RaceWaitTime,
-			RaceExtraLaps:    globalEvent.RaceExtraLaps,
-			ReverseGridPos:   globalEvent.ReverseGridPos,
-		}
-		if err := globalDBWriter.UpdateEvent(event); err != nil {
-			logger.Printf("更新event记录失败: %v", err)
-			return
-		}
-		globalEvent = event
-		logger.Printf("当前event %d, 名称:%s", globalEvent.ID, globalEvent.Name)
-	}
-	// 直接更新原有session为已结束
-	existingSession, err := globalDBWriter.FindLatestSessionByEventID(globalEvent.ID)
-	if err != nil {
-		logger.Printf("查找现有session失败: %v", err)
-	}
-	if existingSession != nil && existingSession.IsFinished == 0 {
-		existingSession.IsFinished = 1
-		existingSession.FinishTime = time.Now()
-		existingSession.LastActivity = time.Now()
-		if err := globalDBWriter.UpdateSession(existingSession); err != nil {
-			logger.Printf("更新session状态失败: %v", err)
-		}
-	}
+	delete(activeStints, slot)
+}
 
-	// 创建新会话
-	session := &Session{
-		ID:           0,
-		EventID:      globalEvent.ID,
-		Type:         int(sessionMsg.Type),
-		TrackTime:    "0",
-		Name:         sessionMsg.Name,
-		StartTime:    time.Now().Add(-time.Duration(sessionMsg.ElapsedMilliseconds) * time.Millisecond),
-		ElapsedMs:    int(sessionMsg.ElapsedMilliseconds),
-		DurationMin:  int(sessionMsg.Time),
-		Laps:         0,
-		Weather:      sessionMsg.WeatherGraphics,
-		AirTemp:      float64(sessionMsg.AmbientTemp),
-		RoadTemp:     float64(sessionMsg.RoadTemp),
-		StartGrip:    globalEvent.StartGrip,
-		CurrentGrip:  globalEvent.StartGrip,
-		IsFinished:   0,
-		LastActivity: time.Now(),
-		HTTPPort:     cfg.ACServer.UDP.LocalPort,
-	}
-	sessionID, err := globalDBWriter.InsertSession(session)
-	if err != nil {
-		logger.Printf("插入session记录失败: %v", err)
+func finishCurrentSession() {
+	if globalSession == nil || globalSession.ID == 0 || globalSession.IsFinished != 0 {
 		return
 	}
-	// 处理模拟环境下返回ID为0的情况
-	if sessionID == 0 && globalDBWriter.SimulateSQL {
-		staticSessionIDCounter++
-		sessionID = staticSessionIDCounter
+	for slot := range activeStints {
+		finishStint(slot)
 	}
-	session.ID = sessionID
-	logger.Printf("创建session %d, 名称:%s", session.ID, session.Name)
-	sessionMutex.Lock()
-	globalSession = session
-	sessionMutex.Unlock()
-	// 将所有在线车辆状态设为维修区
-	connectionsMutex.Lock()
-	for _, conn := range globalConnections {
-		if conn.ConnectionStatus == 0 {
-			conn.TrackStatus = 3
+	globalSession.IsFinished = 1
+	globalSession.FinishTime = time.Now()
+	globalSession.LastActivity = time.Now()
+	globalSession.ElapsedMs = int(time.Since(globalSession.StartTime).Milliseconds())
+	if err := globalDBWriter.UpdateSession(globalSession); err != nil {
+		logger.Printf("结束会话失败: %v", err)
+	}
+	dataCollectionEnabled = false
+}
+
+// feed 的 car_id 是数据库车辆 ID，槽位只用于寻找当前身份。
+func feedDetail(slot int, detail map[string]interface{}) string {
+	if detail == nil {
+		detail = make(map[string]interface{})
+	}
+	if conn := globalConnections[slot]; conn != nil {
+		detail["user_id"] = conn.UserID
+		detail["car_id"] = conn.CarDBID
+		if conn.TeamID > 0 {
+			detail["team_id"] = conn.TeamID
 		}
 	}
-	connectionsMutex.Unlock()
+	data, err := json.Marshal(detail)
+	if err != nil {
+		logger.Printf("序列化feed失败: %v", err)
+		return "{}"
+	}
+	return string(data)
 }
 
-func handleConnectionClosedMessage(connMsg udp.SessionCarInfo, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-	// 插入用户断开连接事件SessionFeed (case3)
-	carID := int(connMsg.CarID)
-	userID := getUserIDByCarID(carID)
-	globalDBWriter.InsertSessionFeed(&SessionFeed{
-		SessionID: globalSession.ID,
-		Type:      3,
-		Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, userID, carID),
-		Time:      time.Now(),
-	})
-
-	// 更新连接状态为离线
-	connectionsMutex.Lock()
-	defer connectionsMutex.Unlock()
-	if conn, exists := globalConnections[int(connMsg.CarID)]; exists {
-		conn.ConnectionStatus = 0 // 设为已断开连接状态
+func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
+	*last = time.Now()
+	slot := int(msg.CarID)
+	if globalSession != nil && globalSession.ID > 0 {
+		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
+	}
+	finishStint(slot)
+	if conn := globalConnections[slot]; conn != nil {
+		conn.ConnectionStatus = 2
 	}
 }
 
-// 碰撞事件处理函数 (case 0)
-func handleCollisionWithCarMessage(collisionMsg udp.CollisionWithCar, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-	carID1 := int(collisionMsg.CarID)
-	carID2 := int(collisionMsg.OtherCarID)
-	// 创建两车碰撞事件的session feed
-	sf := &SessionFeed{
-		SessionID: globalSession.ID,
-		Type:      0,
-		Detail: fmt.Sprintf(`{"user_id_1":%d,"user_id_2":%d,"car_id_1":%d,"car_id_2":%d,"speed":%d,"nsp":%g}`,
-			getUserIDByCarID(carID1), getUserIDByCarID(carID2), carID1, carID2,
-			int(collisionMsg.ImpactSpeed),
-			latestCarUpdates[udp.CarID(carID1)].NormalisedSplinePos),
-		Time: time.Now(),
+func handleCollisionWithCarMessage(msg udp.CollisionWithCar, last *time.Time) {
+	*last = time.Now()
+	if globalSession == nil || globalSession.ID == 0 {
+		return
 	}
-	if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
-		logger.Printf("插入碰撞事件session feed失败: %v", err)
+	a, b := globalConnections[int(msg.CarID)], globalConnections[int(msg.OtherCarID)]
+	if a == nil || b == nil {
+		return
 	}
+	detail := map[string]interface{}{"user_id_1": a.UserID, "user_id_2": b.UserID, "car_id_1": a.CarDBID, "car_id_2": b.CarDBID, "speed": int(msg.ImpactSpeed), "nsp": latestCarUpdates[msg.CarID].NormalisedSplinePos}
+	if a.TeamID > 0 {
+		detail["team_id_1"] = a.TeamID
+	}
+	if b.TeamID > 0 {
+		detail["team_id_2"] = b.TeamID
+	}
+	data, _ := json.Marshal(detail)
+	globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 0, Detail: string(data), Time: time.Now()})
 }
 
-func handleCollisionWithEnvMessage(collisionMsg udp.CollisionWithEnvironment, lastDataTime *time.Time) {
-	*lastDataTime = time.Now()
-	carID := int(collisionMsg.CarID)
-	// 创建车辆与环境碰撞事件的session feed
-	sf := &SessionFeed{
-		SessionID: globalSession.ID,
-		Type:      1,
-		Detail: fmt.Sprintf(`{"user_id":%d,"speed":%d,"car_id":%d,"nsp":%g}`,
-			getUserIDByCarID(carID), int(collisionMsg.ImpactSpeed), carID,
-			latestCarUpdates[udp.CarID(carID)].NormalisedSplinePos),
-		Time: time.Now(),
+func handleCollisionWithEnvMessage(msg udp.CollisionWithEnvironment, last *time.Time) {
+	*last = time.Now()
+	if globalSession == nil || globalSession.ID == 0 {
+		return
 	}
-	if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
-		logger.Printf("插入环境碰撞事件session feed失败: %v", err)
-	}
+	globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 1, Detail: feedDetail(int(msg.CarID), map[string]interface{}{"speed": int(msg.ImpactSpeed), "nsp": latestCarUpdates[msg.CarID].NormalisedSplinePos}), Time: time.Now()})
 }
 
 // 车辆更新事件处理函数
 func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
+	if globalSession == nil || globalSession.ID == 0 {
+		return
+	}
+	if time.Since(lastLogPoll) >= time.Second {
+		collectCarUpdates()
+		lastLogPoll = time.Now()
+	}
 	carID := int(updateMsg.CarID)
 	currentSplinePos := updateMsg.NormalisedSplinePos
 
 	// 实时更新最新车辆数据（wsMutex 保护，供主循环构建排行榜使用）
-	wsMutex.Lock()
 	latestCarUpdates[updateMsg.CarID] = updateMsg
-	wsMutex.Unlock()
 
 	// 圈跟踪数据用 lapDataMutex 保护
 	lapDataMutex.Lock()
@@ -1325,6 +1023,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	}
 
 	if lapCompleted {
+		completedTelemetrySamples[carID] = append([]udp.CarUpdate(nil), lastUpdates...)
 		// 生成遥测数据
 		if len(lastUpdates) > 0 {
 			telemetry, err := generateLapTelemetry(carID, int32(getTrackLength()), lastUpdates)
@@ -1337,6 +1036,12 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 		}
 	}
 	// 添加新数据点到圈跟踪
+	if lapCompleted {
+		carLapData[carID] = nil
+	}
+	if len(carLapData[carID]) >= 100000 {
+		carLapData[carID] = nil
+	}
 	carLapData[carID] = append(carLapData[carID], updateMsg)
 	lapDataMutex.Unlock()
 
@@ -1376,7 +1081,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 					sf := &SessionFeed{
 						SessionID: globalSession.ID,
 						Type:      sfType,
-						Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d}`, getUserIDByCarID(connInfo.CarID), connInfo.CarID),
+						Detail:    feedDetail(connInfo.CarID, nil),
 						Time:      time.Now(),
 					}
 					if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
@@ -1407,7 +1112,7 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 							sf := &SessionFeed{
 								SessionID: globalSession.ID,
 								Type:      12,
-								Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d,"pit_time":%d}`, getUserIDByCarID(connInfo.CarID), connInfo.CarID, pitDuration.Milliseconds()),
+								Detail:    feedDetail(connInfo.CarID, map[string]interface{}{"pit_time": pitDuration.Milliseconds()}),
 								Time:      time.Now(),
 							}
 							if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
@@ -1455,7 +1160,8 @@ func loadPitBoundary(trackName, configName string) {
 	if pitBoundaryLoadedFor == key {
 		return
 	}
-	boundary, err := kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
+	pitBoundary = nil
+	boundary, err := kn5conv.BatchProcess(filepath.Dir(cfg.Game.Path), cfg.App.Server.CachePath, trackName, configName)
 	if err != nil {
 		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
 		return
@@ -1469,170 +1175,14 @@ var currentLogFile string = ""
 var globalNextSessionLineIdx int = -1
 var userTyres = make(map[string]string)
 var userStintIDs = make(map[string]int)
-var tyreRegex = regexp.MustCompile(`(\w+) \[[^\]]*\] changed tyres to (\w+)`)
+var tyreRegex = regexp.MustCompile(`^\s*(.*?) \[[^\]]*\] changed tyres to (\S+)`)
 var connectionRegex = regexp.MustCompile(`(?s)NEW PICKUP CONNECTION from\s+(.*?)\s*\nVERSION .*?\n(.*?)\nREQUESTED CAR: (.*?)\n.*?GUID (\d+) .*?DRIVER ACCEPTED FOR CAR (\d+)`)
-var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (\w+) \[[^\]]*\]`)
+var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (.*?) \[[^\]]*\]`)
 
-func handleSessionInfoMessage(sessionMsg udp.SessionInfo, lastDataTime *time.Time) {
-	var err error
-	loadPitBoundary(sessionMsg.Track, sessionMsg.TrackConfig)
-	latestFile, err = findLatestSessionLogFile(logDir)
-	if err != nil {
-		logger.Printf("查找最新会话日志文件失败: %v", err)
-		return
-	}
-	// 搜索日志中所有已在服务器上的车辆相关信息
-	if latestFile != nil {
-		filePath := filepath.Join(logDir, latestFile.Name())
-		content, err := os.ReadFile(filePath)
-		if err != nil {
-			logger.Printf("无法读取日志文件: %v", err)
-			return
-		}
-		// 解析玩家车辆信息
-		playerLineRegex := regexp.MustCompile(`^(\d+)\) (.*?) BEST: (.*?) TOTAL: (.*?) Laps:(\d+) SesID:(\d+) HasFinished:(\w+)$`)
-		lines := strings.Split(string(content), "\n")
-
-		for lineIdx, line := range lines {
-			match := playerLineRegex.FindStringSubmatch(line)
-			if len(match) >= 8 {
-				userName := strings.TrimSpace(match[2])
-				sesID := match[6]
-				if userName == "" {
-					continue
-				}
-
-				// 查找匹配的连接数据
-				matches := connectionRegex.FindAllStringSubmatch(string(content), -1)
-				for _, m := range matches {
-					// m[1]=IP, m[2]=用户名, m[3]=车型, m[4]=GUID, m[5]=CarID
-					if len(m) >= 6 && strings.TrimSpace(m[2]) == userName {
-						// 转换sesID为整数
-						carID, err := strconv.Atoi(m[5])
-						if err != nil {
-							logger.Printf("无效的CarID: %s, 错误: %v", sesID, err)
-							continue
-						}
-						// 更新全局连接和用户信息
-						lineNumber := lineIdx + 1
-
-						connInfo := ConnectionInfo{
-							CarID:              carID,
-							DriverName:         userName,
-							DriverGUID:         m[4],
-							CarModel:           m[3],
-							CarSkin:            globalEntryList[carID].Skin,
-							DriverInitials:     "",
-							CarName:            globalEntryList[carID].Name,
-							ConnectionStatus:   0, // 设为在线状态
-							TrackStatus:        3, // 设为在线状态
-							LastConnectionLine: lineNumber,
-						}
-						user := &User{
-							Name: connInfo.DriverName,
-							Steam64ID: func() int64 {
-								id, err := strconv.ParseInt(m[4], 10, 64)
-								if err != nil {
-									logger.Printf("解析Steam64ID失败: %v", err)
-									return 0
-								}
-								return id
-							}(),
-						}
-						userID, _, err := globalDBWriter.FindOrCreateUser(user)
-						if err != nil {
-							logger.Printf("获取用户信息失败: %v", err)
-							continue
-						}
-						connectionsMutex.Lock()
-						globalConnections[carID] = &connInfo
-						connectionsMutex.Unlock()
-
-						globalMutex.Lock()
-						globalUsers[userID] = user
-						globalMutex.Unlock()
-						//logger.Printf("已添加全局连接信息: %+v", connInfo)
-						break
-					}
-				}
-			}
-		}
-	} else {
-		logger.Println("未找到日志文件")
-	}
-
-	*lastDataTime = time.Now()
-	// 检查event表中是否存在匹配的server_name记录
-	trackConfig := &TrackConfig{
-		TrackName:  sessionMsg.Track,
-		ConfigName: sessionMsg.TrackConfig,
-	}
-	// 获取track_config_id
-	trackConfigID, err := globalDBWriter.FindOrCreateTrackConfigID(trackConfig)
-	if err != nil {
-		logger.Printf("获取track_config_id失败: %v", err)
-		return
-	}
-	// 确定server name，优先使用配置中的event name
-	Name := sessionMsg.ServerName
-	if cfg.ACServer.Event.Name != "" {
-		Name = cfg.ACServer.Event.Name
-		logger.Printf("使用配置的event name: %s", Name)
-	}
-	foundEvent, err := globalDBWriter.FindEventByName(Name)
-	if err != nil {
-		if err != sql.ErrNoRows {
-			logger.Printf("查询event失败: %v", err)
-			return
-		}
-		// 不存在匹配的记录，创建新的event
-		event := &Event{
-			ServerName:       sessionMsg.ServerName,
-			TrackConfigID:    trackConfigID,
-			Name:             Name,
-			TeamEvent:        boolToInt(cfg.ACServer.Event.Team.Enable),
-			Active:           1, // 默认为激活状态
-			LiveryPreview:    boolToInt(cfg.ACServer.Event.Team.LiveryPreviewEnable),
-			UseNumber:        boolToInt(cfg.ACServer.Event.Team.UseNumber),
-			PracticeDuration: globalEvent.PracticeDuration,
-			QualiDuration:    globalEvent.QualiDuration,
-			RaceDuration:     globalEvent.RaceDuration,
-			RaceDurationType: globalEvent.RaceDurationType,
-			RaceWaitTime:     globalEvent.RaceWaitTime,
-			RaceExtraLaps:    globalEvent.RaceExtraLaps,
-			ReverseGridPos:   globalEvent.ReverseGridPos,
-		}
-		if err := globalDBWriter.InsertEvent(event); err != nil {
-			logger.Printf("插入event记录失败: %v", err)
-			return
-		}
-		globalEvent = event
-		logger.Printf("创建event %d, 名称:%s", globalEvent.ID, globalEvent.Name)
-	} else {
-		// 更新现有event
-		event := &Event{
-			ID:               foundEvent.ID,
-			ServerName:       sessionMsg.ServerName,
-			TrackConfigID:    trackConfigID,
-			Name:             Name,
-			TeamEvent:        boolToInt(cfg.ACServer.Event.Team.Enable),
-			Active:           1,
-			LiveryPreview:    boolToInt(cfg.ACServer.Event.Team.LiveryPreviewEnable),
-			UseNumber:        boolToInt(cfg.ACServer.Event.Team.UseNumber),
-			PracticeDuration: globalEvent.PracticeDuration,
-			QualiDuration:    globalEvent.QualiDuration,
-			RaceDuration:     globalEvent.RaceDuration,
-			RaceDurationType: globalEvent.RaceDurationType,
-			RaceWaitTime:     globalEvent.RaceWaitTime,
-			RaceExtraLaps:    globalEvent.RaceExtraLaps,
-			ReverseGridPos:   globalEvent.ReverseGridPos,
-		}
-		if err := globalDBWriter.UpdateEvent(event); err != nil {
-			logger.Printf("更新event记录失败: %v", err)
-			return
-		}
-		globalEvent = event
-		logger.Printf("更新event %d, 名称:%s", globalEvent.ID, globalEvent.Name)
+func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
+	*last = time.Now()
+	if err := initializeSession(msg, false); err != nil {
+		logger.Printf("会话初始化失败: %v", err)
 	}
 }
 
@@ -1668,7 +1218,9 @@ func readSessionDataFromJSON(filePath string) (*SessionData, error) {
 // 创建UDP客户端
 func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.Time, sessionInfoChan chan<- struct{}, versionInfoChan chan<- struct{}) (*udp.AssettoServerUDP, error) {
 	// 使用正确的函数名和参数创建UDP客户端
-	client, err := udp.NewServerClient("", localPort, serverPort, false, "", 0, func(msg udp.Message) {
+	client, err := udp.NewServerClient(host, localPort, serverPort, false, "", 0, func(msg udp.Message) {
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
 		// 处理接收到的消息
 		switch msg.Event() {
 		case udp.EventVersion:
@@ -1728,7 +1280,7 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 				logger.Printf("车辆信息事件: %+v", carInfoMsg)
 				handleCarInfoMessage(carInfoMsg, lastDataTime)
 			}
-		case udp.EventClientEvent:
+		case udp.EventClientEvent, udp.EventCollisionWithCar, udp.EventCollisionWithEnv:
 			if carCollision, ok := msg.(udp.CollisionWithCar); ok {
 				logger.Printf("车辆碰撞事件: %+v", carCollision)
 				handleCollisionWithCarMessage(carCollision, lastDataTime)
@@ -1824,18 +1376,14 @@ func collectCarUpdates() {
 		partialLine = lines[len(lines)-1]
 		lines = lines[:len(lines)-1] // 移除最后一个元素（可能不完整的行）
 
-		// 从上次处理的行开始
-		if len(lines) > lastLineIdx {
-			lines = lines[lastLineIdx:]
-			lastLineIdx += len(lines)
-		} else {
-			lines = []string{}
-		}
+		// 文件已经按字节增量读取，不再次用累计行号切片。
+		chunkStart := lastLineIdx
+		lastLineIdx += len(lines)
 
 		// 查找最后一个"Session"行
 		for i, line := range lines {
 			if strings.Contains(line, "SESSION:") {
-				globalNextSessionLineIdx = lastLineIdx + i
+				globalNextSessionLineIdx = chunkStart + i
 			}
 		}
 
@@ -1854,7 +1402,7 @@ func collectCarUpdates() {
 			}
 		}
 		for i, line := range processLines {
-			currentLineIdx := lastLineIdx + i
+			currentLineIdx := chunkStart + i
 			if tyreMatch := tyreRegex.FindStringSubmatch(line); len(tyreMatch) == 3 {
 				username := tyreMatch[1]
 				tyreType := tyreMatch[2]
@@ -1874,18 +1422,19 @@ func collectCarUpdates() {
 				connectionsMutex.Unlock()
 
 				if carID != -1 {
-					// 获取用户ID
-					userID := getUserIDByCarID(carID)
+					if oldTyre != "" && oldTyre != tyreType {
+						finishStint(carID)
+					}
 
 					// 插入轮胎更换事件（原版格式: {"user_id","car_id","old_t","new_t"}）
 					globalDBWriter.InsertSessionFeed(&SessionFeed{
 						SessionID: globalSession.ID,
 						Type:      16,
-						Detail:    fmt.Sprintf(`{"user_id":%d,"car_id":%d,"old_t":%q,"new_t":%q}`, userID, carID, oldTyre, tyreType),
+						Detail:    feedDetail(carID, map[string]interface{}{"old_t": oldTyre, "new_t": tyreType}),
 						Time:      time.Now(),
 					})
 				}
-			} else if connectMatch := connectionRegex.FindStringSubmatch(line); len(connectMatch) == 2 {
+			} else if connectMatch := connectionRegex.FindStringSubmatch(line); len(connectMatch) == 6 {
 				// m[1]=IP, m[2]=用户名, m[3]=车型, m[4]=GUID, m[5]=CarID
 				username := connectMatch[2]
 				connectionsMutex.Lock()
@@ -1908,16 +1457,9 @@ func collectCarUpdates() {
 			}
 		}
 
-		// 计算当前增量中的NextSession位置
+		// 每个增量都处理分段与单圈，SESSION 标记不必与后续数据同批到达。
 		currentNextSessionIdx := -1
-		if globalNextSessionLineIdx != -1 && globalNextSessionLineIdx >= lastLineIdx {
-			currentNextSessionIdx = globalNextSessionLineIdx - lastLineIdx
-			if currentNextSessionIdx >= len(lines) {
-				currentNextSessionIdx = -1
-			}
-		}
-
-		if currentNextSessionIdx != -1 {
+		if globalSession != nil && globalSession.ID > 0 {
 			// 初始化当前session的stintLapData结构
 			currentSessionID := globalSession.ID
 			if stintLapData[int(currentSessionID)] == nil {
@@ -1928,7 +1470,7 @@ func collectCarUpdates() {
 			envCollisionRegex := regexp.MustCompile(`COLLISION BETWEEN: (\w+) \[\] AND ENVIRONMENT`)
 			carCollisionRegex := regexp.MustCompile(`COLLISION BETWEEN: (\w+) \[\] AND (\w+) \[\]`)
 			cutsRegex := regexp.MustCompile(`LAP WITH CUTS: (\w+), (\d+) cuts`)
-			lapRegex := regexp.MustCompile(`LAP (\w+) (\d+):(\d+):(\d+)`)
+			lapRegex := regexp.MustCompile(`LAP (.*?) (\d+):(\d+):(\d+)`)
 
 			// 处理NextSession之后的所有行
 			for i := currentNextSessionIdx + 1; i < len(lines); i++ {
@@ -1977,7 +1519,7 @@ func collectCarUpdates() {
 					}
 				}
 				// 处理Lap完成事件
-				if lapMatch := lapRegex.FindStringSubmatch(line); len(lapMatch) == 4 {
+				if lapMatch := lapRegex.FindStringSubmatch(line); len(lapMatch) == 5 {
 					// 解析用户名和分:秒:毫秒格式 (例如 LAP PlayerName 7:25:669)
 					username := lapMatch[1]
 					minutes, _ := strconv.Atoi(lapMatch[2])
@@ -2132,8 +1674,8 @@ func main() {
 	initLogger()
 	logger.Println("Writer应用程序启动")
 
-	// 命令行参数：默认真正写库（模仿原版 SimView）；加 -simulate 则只模拟、不写库
-	simulateMode := flag.Bool("simulate", false, "为 true 时仅模拟、不向数据库写入；默认 false 会真正写库")
+	// 默认真实采集；只有显式指定 -simulate=true 才隔离数据库。
+	simulateMode := flag.Bool("simulate", false, "显式指定 -simulate=true 时模拟运行，不连接或写入数据库；默认真实采集")
 	flag.Parse()
 
 	configPath := firstExistingPath("config/config.toml", "simview/config/config.toml", "config.toml")
@@ -2192,10 +1734,7 @@ func main() {
 		globalEvent.RaceExtraLaps = sc.RaceExtraLaps
 		globalEvent.ReverseGridPos = sc.ReverseGridPositions
 	}
-	// 加载并验证entry_list配置
-	if err := dbWriter.LoadEntryList(cfg.Game.Path); err != nil {
-		fatalLogger.Fatalf("entry_list验证失败: %v", err)
-	}
+	// entry_list 在收到会话并建立 event 后加载，团队外键才能正确关联。
 	latestFile, err = findLatestSessionLogFile(logDir)
 	if err != nil {
 		logger.Printf("查找最新服务器日志文件失败: %v", err)
@@ -2233,9 +1772,13 @@ outerLoop:
 		// 根据日志文件存在性决定是否等待version包
 		if latestFile == nil {
 			logger.Println("等待AC服务器发送version包...")
-			<-versionInfoChan
-			logger.Println("成功接收version包")
-			receivedVersionInfo = true
+			select {
+			case <-versionInfoChan:
+				logger.Println("成功接收version包")
+				receivedVersionInfo = true
+			case <-time.After(3 * time.Second):
+				logger.Println("未收到version包，主动请求当前会话")
+			}
 		} else {
 			logger.Println("发现日志文件，跳过version包等待")
 		}
@@ -2246,11 +1789,23 @@ outerLoop:
 
 		for {
 			// 发送GetSessionInfo请求
-			//acClient.SendGetSessionInfo()
+			if err := acClient.SendMessage(udp.GetSessionInfo{}); err != nil {
+				logger.Printf("请求当前会话失败: %v", err)
+			}
 
 			// 等待SessionInfo响应或超时
 			select {
 			case <-sessionInfoChan:
+				stateMutex.RLock()
+				ready := globalSession != nil && globalSession.ID > 0
+				stateMutex.RUnlock()
+				if !ready {
+					retryCount++
+					if retryCount >= 3 {
+						goto sessionInfoTimeout
+					}
+					continue
+				}
 				logger.Println("成功接收SessionInfo")
 				goto sessionInfoReceived
 			case <-time.After(10 * time.Second):
@@ -2271,6 +1826,24 @@ outerLoop:
 	sessionInfoReceived:
 		logger.Println("已获取SessionInfo，开始主循环")
 
+		// 启动时主动请求既有在线车辆，不要求车手重新连接。
+		if cfg.ACServer.UDP.Realtime.Update.Interval.MS > 0 {
+			udp.RealtimePosIntervalMs = cfg.ACServer.UDP.Realtime.Update.Interval.MS
+		}
+		if err := acClient.SendMessage(udp.NewEnableRealtimePosInterval(udp.RealtimePosIntervalMs)); err != nil {
+			logger.Printf("开启车辆更新失败: %v", err)
+		}
+		stateMutex.RLock()
+		slots := make([]int, 0, len(globalEntryList))
+		for slot := range globalEntryList {
+			slots = append(slots, slot)
+		}
+		stateMutex.RUnlock()
+		for _, slot := range slots {
+			if err := acClient.SendGetCarInfo(udp.CarID(slot)); err != nil {
+				logger.Printf("请求车辆信息失败: %v", err)
+			}
+		}
 		// 初始化WebSocket连接
 		wsPort := cfg.App.Server.Port
 		if err := waitForWebSocketServer(wsPort); err != nil {

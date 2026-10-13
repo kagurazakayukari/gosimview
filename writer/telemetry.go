@@ -15,14 +15,29 @@ import (
 	"gosimview/udp"
 )
 
-// calculateMaxSpeed 计算单圈最大速度
+// 遥测二进制布局（必须与 simview/html/js/analysis.js 的解析一致）：
+//
+//	头部 8 字节：version(int32) + trackLength(int32)
+//	每条记录 17 字节：nsp(float32) + gear(uint8) + speed(float32) + x(float32) + z(float32)
+//
+// 不写 Y 坐标、不写转速；速度单位为 km/h。
+const (
+	lapTelemetryVersion = int32(1)
+	lapTelemetryHeader  = 8  // version + trackLength
+	lapTelemetryRecord  = 17 // nsp + gear + speed + x + z
+)
+
+// velocityKMH 由速度向量模长(m/s)换算为 km/h
+func velocityKMH(v udp.Vec) float64 {
+	magnitude := math.Sqrt(float64(v.X*v.X + v.Y*v.Y + v.Z*v.Z))
+	return magnitude * 3.6
+}
+
+// calculateMaxSpeed 计算单圈最大速度（km/h）
 func calculateMaxSpeed(laps []udp.CarUpdate) float64 {
 	var maxSpeed float64 = 0
 	for _, lap := range laps {
-		// 将Velocity从m/s转换为km/h
-		// 计算速度向量模长(m/s)并转换为km/h
-		velocityMagnitude := math.Sqrt(float64(lap.Velocity.X*lap.Velocity.X + lap.Velocity.Y*lap.Velocity.Y + lap.Velocity.Z*lap.Velocity.Z))
-		currentSpeed := velocityMagnitude * 3.6
+		currentSpeed := velocityKMH(lap.Velocity)
 		if currentSpeed > maxSpeed {
 			maxSpeed = currentSpeed
 		}
@@ -30,67 +45,7 @@ func calculateMaxSpeed(laps []udp.CarUpdate) float64 {
 	return maxSpeed
 }
 
-// generateLapTelemetry 创建符合LapTelemetry格式的二进制文件
-func generateLapTelemetry(carID int, trackLength int32, telemetryData []udp.CarUpdate) ([]byte, error) {
-	fmt.Printf("生成车辆 %d 的遥测数据，赛道长度: %d\n", carID, trackLength)
-	// 使用内存缓冲区替代文件存储
-	var buffer bytes.Buffer
-
-	// 写入版本号 (1)，小端序
-	version := int32(1)
-	if err := binary.Write(&buffer, binary.LittleEndian, version); err != nil {
-		return nil, fmt.Errorf("写入版本号失败: %v", err)
-	}
-
-	// 写入赛道长度，使用小端序
-	length := trackLength
-	if err := binary.Write(&buffer, binary.LittleEndian, length); err != nil {
-		return nil, fmt.Errorf("写入赛道长度失败: %v", err)
-	}
-
-	// 写入每条遥测记录
-	for _, data := range telemetryData {
-		// 写入NSP (NormalisedSplinePos) - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, data.NormalisedSplinePos); err != nil {
-			return nil, fmt.Errorf("写入NSP失败: %v", err)
-		}
-
-		// 写入档位 (加1后存储，与前端解析对应)
-		gear := uint8(data.Gear + 1)
-		if err := binary.Write(&buffer, binary.LittleEndian, gear); err != nil {
-			return nil, fmt.Errorf("写入档位失败: %v", err)
-		}
-
-		// 写入速度 - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, data.Velocity); err != nil {
-			return nil, fmt.Errorf("写入速度失败: %v", err)
-		}
-
-		// 写入X坐标 - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, data.Pos.X); err != nil {
-			return nil, fmt.Errorf("写入X坐标失败: %v", err)
-		}
-
-		// 写入Y坐标 - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, data.Pos.Y); err != nil {
-			return nil, fmt.Errorf("写入Y坐标失败: %v", err)
-		}
-
-		// 写入Z坐标 - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, data.Pos.Z); err != nil {
-			return nil, fmt.Errorf("写入Z坐标失败: %v", err)
-		}
-
-		// 写入转速 - float32
-		if err := binary.Write(&buffer, binary.LittleEndian, float32(data.EngineRPM)); err != nil {
-			return nil, fmt.Errorf("写入转速失败: %v", err)
-		}
-	}
-
-	return buffer.Bytes(), nil
-}
-
-// calculateAverageSpeed 计算平均速度
+// calculateAverageSpeed 计算平均速度（km/h）
 func calculateAverageSpeed(laps []udp.CarUpdate) float64 {
 	if len(laps) == 0 {
 		return 0
@@ -98,10 +53,53 @@ func calculateAverageSpeed(laps []udp.CarUpdate) float64 {
 
 	var totalSpeed float64 = 0
 	for _, lap := range laps {
-		// 计算速度向量模长(m/s)并转换为km/h
-		velocityMagnitude := math.Sqrt(float64(lap.Velocity.X*lap.Velocity.X + lap.Velocity.Y*lap.Velocity.Y + lap.Velocity.Z*lap.Velocity.Z))
-		totalSpeed += velocityMagnitude * 3.6
+		totalSpeed += velocityKMH(lap.Velocity)
 	}
 
 	return totalSpeed / float64(len(laps))
+}
+
+// generateLapTelemetry 生成与前端分析页一致的圈速遥测二进制
+func generateLapTelemetry(carID int, trackLength int32, telemetryData []udp.CarUpdate) ([]byte, error) {
+	// 预分配：头部 + 每条记录
+	buffer := bytes.NewBuffer(make([]byte, 0, lapTelemetryHeader+lapTelemetryRecord*len(telemetryData)))
+
+	// 写入版本号 (1)，小端序
+	if err := binary.Write(buffer, binary.LittleEndian, lapTelemetryVersion); err != nil {
+		return nil, fmt.Errorf("写入版本号失败: %v", err)
+	}
+
+	// 写入赛道长度（米），小端序
+	if err := binary.Write(buffer, binary.LittleEndian, trackLength); err != nil {
+		return nil, fmt.Errorf("写入赛道长度失败: %v", err)
+	}
+
+	for _, data := range telemetryData {
+		// NSP (NormalisedSplinePos) - float32
+		if err := binary.Write(buffer, binary.LittleEndian, data.NormalisedSplinePos); err != nil {
+			return nil, fmt.Errorf("写入NSP失败: %v", err)
+		}
+
+		// 档位 - uint8（加1后存储，0 表示无效档位，与前端解析对应）
+		if err := binary.Write(buffer, binary.LittleEndian, uint8(data.Gear+1)); err != nil {
+			return nil, fmt.Errorf("写入档位失败: %v", err)
+		}
+
+		// 速度 - float32（km/h）
+		if err := binary.Write(buffer, binary.LittleEndian, float32(velocityKMH(data.Velocity))); err != nil {
+			return nil, fmt.Errorf("写入速度失败: %v", err)
+		}
+
+		// X 坐标 - float32
+		if err := binary.Write(buffer, binary.LittleEndian, data.Pos.X); err != nil {
+			return nil, fmt.Errorf("写入X坐标失败: %v", err)
+		}
+
+		// Z 坐标 - float32
+		if err := binary.Write(buffer, binary.LittleEndian, data.Pos.Z); err != nil {
+			return nil, fmt.Errorf("写入Z坐标失败: %v", err)
+		}
+	}
+
+	return buffer.Bytes(), nil
 }

@@ -17,7 +17,10 @@ Created initially out of frustration with naming conflicts between User and Team
 2. Install dependencies: `go mod download`
 3. Obtain required external files (see below)
 4. Configure: Edit `config/config.toml`
-5. Run: `go run http/http_main.go` (for HTTP server) and `go run writer/writer_main.go` (for UDP data processing)
+5. Run the complete packages: `go run ./http` (HTTP pages and WebSocket relay) and `go run ./writer` (UDP processing and real database collection by default).
+6. For simulation, explicitly use `go run ./writer -simulate=true`. Simulation does not connect to or write to MySQL; HTTP history pages still require the configured database.
+
+The existing SimView TOML format is unchanged. `[game].path` must be the manually configured AC **server directory**; server configuration is read from `cfg/server_cfg.ini`, and car/track content is resolved from the sibling `content/` directory. When using the bundled prototype layout, `simview/config/config.toml` and `simview/html/` are also supported. Import the database schema explicitly; neither process automatically runs the original destructive SQL dump.
 
 ### Required External Files
 

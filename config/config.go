@@ -224,6 +224,16 @@ func getMapStringValue(config map[string]interface{}, key string) map[string]str
 	return result
 }
 
+func mapConfigStrings(values map[string]interface{}) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		if s, ok := value.(string); ok {
+			out[key] = s
+		}
+	}
+	return out
+}
+
 // ExtractConfigFromTOML 从TOML数据中提取配置，统一使用字符串识别方式
 func ExtractConfigFromTOML(data []byte) (Config, error) {
 	// 初始化配置实例
@@ -294,8 +304,9 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	config.Writer.HTTP.Leaderboard.Broadcast.Interval.MS = getIntValue(config.Writer.RawConfig, "http.leaderboard.broadcast.interval.ms")
 
 	// 映射覆盖配置
-	config.Overrides.CarClass = getMapStringValue(config.Overrides.RawConfig, "car.class")
-	config.Overrides.UserCountry = getMapStringValue(config.Overrides.RawConfig, "user.country")
+	// 节内的车名/GUID 是叶子键，直接取子表，不能从已拍平的 RawConfig 再取 map。
+	config.Overrides.CarClass = mapConfigStrings(collectConfigSection(rawConfig, "overrides.car.class"))
+	config.Overrides.UserCountry = mapConfigStrings(collectConfigSection(rawConfig, "overrides.user.country"))
 
 	// 初始化空映射，避免nil指针错误
 	if config.Overrides.CarClass == nil {

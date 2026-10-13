@@ -28,7 +28,11 @@ var CurrentRealtimePosIntervalMs = -1
 var PosIntervalModifierEnabled = true
 
 func NewServerClient(addr string, receivePort, sendPort int, forward bool, forwardAddrStr string, forwardListenPort int, callback CallbackFunc) (*AssettoServerUDP, error) {
-	listener, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(addr), Port: receivePort}, &net.UDPAddr{IP: net.ParseIP(addr), Port: sendPort})
+	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(addr, fmt.Sprint(sendPort)))
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.DialUDP("udp", &net.UDPAddr{Port: receivePort}, remote)
 
 	if err != nil {
 		return nil, err
@@ -266,6 +270,12 @@ func readString(r io.Reader, sizeMultiplier int) string {
 	}
 
 	return string(b)
+}
+
+// SendGetCarInfo 请求指定槽位的既有车辆身份，报文为 event byte + slot byte。
+func (asu *AssettoServerUDP) SendGetCarInfo(slot CarID) error {
+	_, err := asu.listener.Write([]byte{byte(EventGetCarInfo), byte(slot)})
+	return err
 }
 
 func (asu *AssettoServerUDP) SendMessage(message Message) error {
