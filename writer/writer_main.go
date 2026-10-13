@@ -809,7 +809,7 @@ func handleNewSessionMessage(msg udp.SessionInfo, last *time.Time) {
 	}
 }
 
-func initializeSession(msg udp.SessionInfo, newSession bool) error {
+func updateEventFromSessionInfo(msg udp.SessionInfo) error {
 	track := &TrackConfig{TrackName: msg.Track, ConfigName: msg.TrackConfig}
 	trackID, err := globalDBWriter.FindOrCreateTrackConfigID(track)
 	if err != nil {
@@ -849,6 +849,14 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 		}
 		entryListLoaded = true
 	}
+	return nil
+}
+
+func initializeSession(msg udp.SessionInfo, newSession bool) error {
+	if err := updateEventFromSessionInfo(msg); err != nil {
+		return err
+	}
+	event := globalEvent
 	// SESSION_INFO 表示当前会话；重复响应不能再次创建会话。
 	if !newSession && globalSession != nil && globalSession.ID > 0 && globalSession.EventID == event.ID {
 		return nil
@@ -857,6 +865,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 		finishCurrentSession()
 	}
 	var session *Session
+	var err error
 	if !newSession && !globalDBWriter.SimulateSQL {
 		session, err = globalDBWriter.FindLatestSessionByEventID(event.ID)
 		if err != nil {
@@ -1181,8 +1190,13 @@ var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (.*?) \[[^\]]*\
 
 func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
-	if err := initializeSession(msg, false); err != nil {
-		logger.Printf("会话初始化失败: %v", err)
+	// 原 SESSION_INFO 只更新 event、恢复已有车辆，不创建 session 或清空采集状态。
+	if err := updateEventFromSessionInfo(msg); err != nil {
+		logger.Printf("更新会话事件失败: %v", err)
+		return
+	}
+	if err := restoreConnectionsFromSessionLog(); err != nil {
+		logger.Printf("恢复会话日志失败: %v", err)
 	}
 }
 
@@ -1797,7 +1811,7 @@ outerLoop:
 			select {
 			case <-sessionInfoChan:
 				stateMutex.RLock()
-				ready := globalSession != nil && globalSession.ID > 0
+				ready := globalEvent != nil && globalEvent.ID > 0
 				stateMutex.RUnlock()
 				if !ready {
 					retryCount++

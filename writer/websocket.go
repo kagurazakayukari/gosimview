@@ -78,6 +78,29 @@ func startWebSocketReconnect() {
 
 // 广播只读取内存快照，连接锁不跨越数据库查询或 UDP 状态锁。
 func buildAndSendWebSocketMessage() {
+	// 保留原广播逻辑：启动接入已有比赛时从数据库取得最新 session，
+	// SESSION_INFO 恢复本身不创建或替换 session。
+	stateMutex.RLock()
+	needsSession := globalSession == nil || globalSession.ID == 0
+	eventIDForLookup := 0
+	if globalEvent != nil {
+		eventIDForLookup = globalEvent.ID
+	}
+	stateMutex.RUnlock()
+	if needsSession && eventIDForLookup > 0 && !globalDBWriter.SimulateSQL {
+		latest, err := globalDBWriter.FindLatestSessionByEventID(eventIDForLookup)
+		if err != nil {
+			logger.Printf("读取已有 session 失败: %v", err)
+			return
+		}
+		if latest != nil {
+			stateMutex.Lock()
+			if globalEvent != nil && globalEvent.ID == eventIDForLookup && (globalSession == nil || globalSession.ID == 0) {
+				globalSession = latest
+			}
+			stateMutex.Unlock()
+		}
+	}
 	stateMutex.RLock()
 	if globalSession == nil || globalSession.ID == 0 {
 		stateMutex.RUnlock()
