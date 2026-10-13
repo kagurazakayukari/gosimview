@@ -63,6 +63,8 @@ var (
 	sessionMutex              sync.Mutex
 	// 数据收集控制
 	dataCollectionEnabled bool = false
+	// 周期 UDP 在文件恢复完成后才进入当前采集状态。
+	recoveryReady bool
 	// 全局变量用于暂存车辆信息，带互斥锁保证并发安全
 	carLapDataMap = make(map[int][]CarLapData)
 	stintLapData  = make(map[int]map[int][]StintLap)
@@ -424,7 +426,7 @@ type TrackConfig struct {
 
 func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	if globalSession == nil || globalSession.ID == 0 {
+	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
 		return
 	}
 	collectCarUpdates()
@@ -808,9 +810,13 @@ func importResultLaps(data *SessionData) {
 // 初始化会话使用同一条路径，启动接入已有比赛与换节都可采集。
 func handleNewSessionMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
+	recoveryReady = false
 	if err := initializeSession(msg, true); err != nil {
 		logger.Printf("新会话初始化失败: %v", err)
+		return
 	}
+	// 新节由服务器主动通知；ini 和会话初始化成功后进入新节采集。
+	recoveryReady = true
 }
 
 func updateEventFromSessionInfo(msg udp.SessionInfo) error {
@@ -1019,7 +1025,7 @@ func handleCollisionWithEnvMessage(msg udp.CollisionWithEnvironment, last *time.
 // 车辆更新事件处理函数
 func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	if globalSession == nil || globalSession.ID == 0 {
+	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
 		return
 	}
 	if time.Since(lastLogPoll) >= time.Second {
@@ -1202,6 +1208,7 @@ var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (.*?) \[[^\]]*\
 
 func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
+	recoveryReady = false
 	// 原 SESSION_INFO 只更新 event、恢复已有车辆，不创建 session 或清空采集状态。
 	if err := updateEventFromSessionInfo(msg); err != nil {
 		logger.Printf("更新会话事件失败: %v", err)
@@ -1210,10 +1217,13 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	// 沿用原查询路径接入已有会话，只启用解析，不 INSERT 新 session。
 	if err := adoptCurrentSession(msg); err != nil {
 		logger.Printf("接入已有会话失败: %v", err)
+		return
 	}
 	if err := restoreConnectionsFromSessionLog(); err != nil {
 		logger.Printf("恢复会话日志失败: %v", err)
+		return
 	}
+	recoveryReady = true
 }
 
 // 错误事件处理函数
@@ -1251,6 +1261,14 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 	client, err := udp.NewServerClient(host, localPort, serverPort, false, "", 0, func(msg udp.Message) {
 		stateMutex.Lock()
 		defer stateMutex.Unlock()
+		// 探活/新节是初始化入口；文件恢复前不处理车辆事件。
+		if !recoveryReady {
+			switch msg.Event() {
+			case udp.EventVersion, udp.EventSessionInfo, udp.EventNewSession, udp.EventError:
+			default:
+				return
+			}
+		}
 		// 处理接收到的消息
 		switch msg.Event() {
 		case udp.EventVersion:
@@ -1542,7 +1560,7 @@ outerLoop:
 			select {
 			case <-sessionInfoChan:
 				stateMutex.RLock()
-				ready := globalEvent != nil && globalEvent.ID > 0
+				ready := recoveryReady && globalEvent != nil && globalEvent.ID > 0
 				stateMutex.RUnlock()
 				if !ready {
 					retryCount++

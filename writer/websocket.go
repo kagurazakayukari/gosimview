@@ -102,7 +102,7 @@ func buildAndSendWebSocketMessage() {
 		}
 	}
 	stateMutex.RLock()
-	if globalSession == nil || globalSession.ID == 0 {
+	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
 		stateMutex.RUnlock()
 		return
 	}
