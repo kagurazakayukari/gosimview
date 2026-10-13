@@ -8,18 +8,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
 var restoredSessionLogPath string
+var recoveredLogSessionID int64
+var restoredSessionLogSize int64
 
 // restoreConnectionsFromSessionLog 恢复原 handleSessionInfoMessage 的启动职责。
 // 玩家状态行确定姓名，再与该文件的连接记录匹配；槽位取连接记录中的
 // DRIVER ACCEPTED FOR CAR，不能用状态行的编号或 SesID 代替。
-// 本函数由已持有 stateMutex 的会话处理器调用，只恢复身份，不重放圈和 feed。
+// 本函数由已持有 stateMutex 的会话处理器调用。
+// 当前节成绩仅恢复到内存，不把历史圈或 feed 再次写入数据库。
 func restoreConnectionsFromSessionLog() error {
 	file, err := findLatestSessionLogFile(logDir)
 	if err != nil {
@@ -33,10 +35,9 @@ func restoreConnectionsFromSessionLog() error {
 	// Windows 日志为 CRLF；统一换行后沿用原版正则和姓名匹配规则。
 	content := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(content, "\n")
-	playerPattern := regexp.MustCompile(`^(\d+)\) (.*?) BEST: (.*?) TOTAL: (.*?) Laps:(\d+) SesID:(\d+) HasFinished:(\w+)$`)
 	connections := connectionRegex.FindAllStringSubmatch(content, -1)
 	for lineIndex, line := range lines {
-		player := playerPattern.FindStringSubmatch(line)
+		player := playerLineRegex.FindStringSubmatch(line)
 		if len(player) < 8 {
 			continue
 		}
@@ -71,13 +72,53 @@ func restoreConnectionsFromSessionLog() error {
 		}
 	}
 	latestFile = file
+	// 原 collectCarUpdates 按最后一条 SESSION: 定位当前节。
+	// 先回放该节已生成的成绩，再接着处理新增字节。
+	newSnapshot := restoredSessionLogPath != path || int64(len(data)) < restoredSessionLogSize
+	if globalSession != nil && globalSession.ID > 0 && (newSnapshot || recoveredLogSessionID != globalSession.ID) {
+		start := 0
+		for i, line := range lines {
+			if strings.Contains(line, "SESSION:") {
+				start = i + 1
+			}
+		}
+		recoveredScores = make(map[int]*recoveredScore)
+		stintLapData[int(globalSession.ID)] = make(map[int][]StintLap)
+		for _, conn := range globalConnections {
+			userStintIDs[conn.DriverName] = 1
+			userTyres[conn.DriverName] = ""
+		}
+		// 原解析先读取分节标记之前的轮胎记录，当前节未再次换胎时沿用最后配方。
+		for _, line := range lines[:start] {
+			if match := tyreRegex.FindStringSubmatch(line); len(match) == 3 {
+				name := strings.TrimSpace(match[1])
+				if slotForLogName(name) >= 0 {
+					userTyres[name] = match[2]
+					userStintIDs[name]++
+				}
+			}
+		}
+		// 文件最后未换行的片段留给增量读取，不能提前当完整圈解析。
+		complete := lines
+		if !strings.HasSuffix(content, "\n") {
+			complete = lines[:len(lines)-1]
+		}
+		if start <= len(complete) {
+			processSessionLogLinesAt(complete[start:], true, start)
+		}
+		recoveredLogSessionID = globalSession.ID
+	}
 	// 恢复读取到的历史快照后，再继续读取文件新增的字节。
 	// 不用 Stat().Size()，避免跳过 ReadFile 之后才追加的新内容。
-	if restoredSessionLogPath != path {
+	if newSnapshot {
 		lastFileSize = int64(len(data))
 		lastLineIdx = strings.Count(content, "\n")
 		partialLine = ""
+		if !strings.HasSuffix(content, "\n") {
+			partialLine = lines[len(lines)-1]
+		}
 		restoredSessionLogPath = path
 	}
+	restoredSessionLogSize = int64(len(data))
 	return nil
 }

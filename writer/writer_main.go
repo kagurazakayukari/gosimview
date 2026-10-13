@@ -463,6 +463,10 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if lap.Tyre == "" {
 		lap.Tyre = userTyres[conn.DriverName]
 	}
+	// 接入前的圈数只是基线，不把周期消息中的旧完成圈再次写入。
+	if score := recoveredScores[slot]; score != nil && int(lap.Laps) <= score.Laps {
+		return
+	}
 	previous := carLapDataMap[slot]
 	if len(previous) > 0 && previous[len(previous)-1].Laps >= lap.Laps {
 		return
@@ -889,6 +893,11 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	dataCollectionEnabled = true
 	carLapDataMap = make(map[int][]CarLapData)
 	stintLapData = make(map[int]map[int][]StintLap)
+	recoveredScores = make(map[int]*recoveredScore)
+	restoredStintIDs = make(map[int]bool)
+	recoveredLogSessionID = 0
+	userTyres = make(map[string]string)
+	userStintIDs = make(map[string]int)
 	carLapData = make(map[int][]udp.CarUpdate)
 	telemetryData = make(map[int][]byte)
 	activeStints = make(map[int]*SessionStint)
@@ -904,6 +913,9 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 		if info, err := latestFile.Info(); err == nil {
 			lastFileSize = info.Size()
 		}
+		// 新节由服务器通知，旧日志快照不得在随后探活时再次回放。
+		restoredSessionLogPath = filepath.Join(logDir, latestFile.Name())
+		recoveredLogSessionID = session.ID
 	}
 	for _, conn := range globalConnections {
 		conn.TrackStatus = 3
@@ -1195,6 +1207,10 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 		logger.Printf("更新会话事件失败: %v", err)
 		return
 	}
+	// 沿用原查询路径接入已有会话，只启用解析，不 INSERT 新 session。
+	if err := adoptCurrentSession(msg); err != nil {
+		logger.Printf("接入已有会话失败: %v", err)
+	}
 	if err := restoreConnectionsFromSessionLog(); err != nil {
 		logger.Printf("恢复会话日志失败: %v", err)
 	}
@@ -1394,293 +1410,8 @@ func collectCarUpdates() {
 		chunkStart := lastLineIdx
 		lastLineIdx += len(lines)
 
-		// 查找最后一个"Session"行
-		for i, line := range lines {
-			if strings.Contains(line, "SESSION:") {
-				globalNextSessionLineIdx = chunkStart + i
-			}
-		}
-
-		// 初始化新连接用户的stintID为1
-		for _, conn := range globalConnections {
-			if _, exists := userStintIDs[conn.DriverName]; !exists {
-				userStintIDs[conn.DriverName] = 1
-			}
-		}
-		// 按用户存储最后轮胎类型（使用全局变量）
-		processLines := lines
-		if globalNextSessionLineIdx != -1 && globalNextSessionLineIdx >= lastLineIdx {
-			currentIdx := globalNextSessionLineIdx - lastLineIdx
-			if currentIdx < len(lines) {
-				processLines = lines[:currentIdx+1]
-			}
-		}
-		for i, line := range processLines {
-			currentLineIdx := chunkStart + i
-			if tyreMatch := tyreRegex.FindStringSubmatch(line); len(tyreMatch) == 3 {
-				username := tyreMatch[1]
-				tyreType := tyreMatch[2]
-				oldTyre := userTyres[username]
-				userTyres[username] = tyreType
-				userStintIDs[username]++
-
-				// 获取车辆ID
-				carID := -1
-				connectionsMutex.Lock()
-				for _, conn := range globalConnections {
-					if conn.DriverName == username {
-						carID = conn.CarID
-						break
-					}
-				}
-				connectionsMutex.Unlock()
-
-				if carID != -1 {
-					if oldTyre != "" && oldTyre != tyreType {
-						finishStint(carID)
-					}
-
-					// 插入轮胎更换事件（原版格式: {"user_id","car_id","old_t","new_t"}）
-					globalDBWriter.InsertSessionFeed(&SessionFeed{
-						SessionID: globalSession.ID,
-						Type:      16,
-						Detail:    feedDetail(carID, map[string]interface{}{"old_t": oldTyre, "new_t": tyreType}),
-						Time:      time.Now(),
-					})
-				}
-			} else if connectMatch := connectionRegex.FindStringSubmatch(line); len(connectMatch) == 6 {
-				// m[1]=IP, m[2]=用户名, m[3]=车型, m[4]=GUID, m[5]=CarID
-				username := connectMatch[2]
-				connectionsMutex.Lock()
-				for _, conn := range globalConnections {
-					if conn.DriverName == username {
-						conn.LastConnectionLine = currentLineIdx
-					}
-				}
-				connectionsMutex.Unlock()
-			} else if disconnectMatch := disconnectRegex.FindStringSubmatch(line); len(disconnectMatch) == 2 {
-				username := disconnectMatch[1]
-				connectionsMutex.Lock()
-				for _, conn := range globalConnections {
-					if conn.DriverName == username && currentLineIdx > conn.LastConnectionLine {
-						conn.ConnectionStatus = 2 // 离线状态
-						break
-					}
-				}
-				connectionsMutex.Unlock()
-			}
-		}
-
-		// 每个增量都处理分段与单圈，SESSION 标记不必与后续数据同批到达。
-		currentNextSessionIdx := -1
-		if globalSession != nil && globalSession.ID > 0 {
-			// 初始化当前session的stintLapData结构
-			currentSessionID := globalSession.ID
-			if stintLapData[int(currentSessionID)] == nil {
-				stintLapData[int(currentSessionID)] = make(map[int][]StintLap)
-			}
-			// 编译正则表达式
-			splitRegex := regexp.MustCompile(`Car\.onSplitCompleted (\d+) (\d+) (\d+)`)
-			envCollisionRegex := regexp.MustCompile(`COLLISION BETWEEN: (\w+) \[\] AND ENVIRONMENT`)
-			carCollisionRegex := regexp.MustCompile(`COLLISION BETWEEN: (\w+) \[\] AND (\w+) \[\]`)
-			cutsRegex := regexp.MustCompile(`LAP WITH CUTS: (\w+), (\d+) cuts`)
-			lapRegex := regexp.MustCompile(`LAP (.*?) (\d+):(\d+):(\d+)`)
-
-			// 处理NextSession之后的所有行
-			for i := currentNextSessionIdx + 1; i < len(lines); i++ {
-				line := lines[i]
-
-				// 检查实时轮胎更换
-				if tyreMatch := tyreRegex.FindStringSubmatch(line); len(tyreMatch) == 3 {
-					username := tyreMatch[1]
-					tyreType := tyreMatch[2]
-					userTyres[username] = tyreType
-				}
-
-				// 处理Split完成事件
-				if splitMatch := splitRegex.FindStringSubmatch(line); len(splitMatch) == 4 {
-					carID, _ := strconv.Atoi(splitMatch[1])
-					split, _ := strconv.Atoi(splitMatch[2])
-					time, _ := strconv.ParseInt(splitMatch[3], 10, 64)
-
-					// 根据split值区分处理逻辑
-					switch split {
-					case 0:
-						// 通过CarID获取用户名
-						var username string
-						if connInfo, exists := globalConnections[carID]; exists {
-							username = connInfo.DriverName
-						}
-						newLap := StintLap{
-							StintID:    userStintIDs[username],
-							Tyre:       userTyres[username],
-							Sector1:    int(time),
-							Sector2:    0,
-							Sector3:    0,
-							Time:       0,
-							Cuts:       0,
-							Crashes:    0,
-							CarCrashes: 0,
-						}
-						stintLapData[int(currentSessionID)][carID] = append(stintLapData[int(currentSessionID)][carID], newLap)
-						// 仅初始化Sector1，Sector3和Time将在Lap完成时计算
-					case 1:
-						// split为1时更新最新StintLap的Sector2
-						if laps, ok := stintLapData[int(currentSessionID)][carID]; ok && len(laps) > 0 {
-							lastIdx := len(laps) - 1
-							stintLapData[int(currentSessionID)][carID][lastIdx].Sector2 = int(time)
-						}
-					}
-				}
-				// 处理Lap完成事件
-				if lapMatch := lapRegex.FindStringSubmatch(line); len(lapMatch) == 5 {
-					// 解析用户名和分:秒:毫秒格式 (例如 LAP PlayerName 7:25:669)
-					username := lapMatch[1]
-					minutes, _ := strconv.Atoi(lapMatch[2])
-					seconds, _ := strconv.Atoi(lapMatch[3])
-					millis, _ := strconv.Atoi(lapMatch[4])
-
-					// 通过用户名查找CarID
-					carID := -1
-					for _, entry := range globalConnections {
-						if entry.DriverName == username {
-							carID = entry.CarID
-							break
-						}
-					}
-
-					if carID == -1 {
-						logger.Printf("警告: 未找到用户 '%s' 的CarID，无法处理轮胎数据", username)
-						continue
-					}
-
-					if carID != -1 {
-						// 计算Sector3和总Time
-						totalTime := int64(minutes*60*1000 + seconds*1000 + millis)
-						if laps, ok := stintLapData[int(currentSessionID)][carID]; ok && len(laps) > 0 {
-							lastIdx := len(laps) - 1
-							laps[lastIdx].Time = int(totalTime)
-							laps[lastIdx].Sector3 = int(totalTime) - (laps[lastIdx].Sector1 + laps[lastIdx].Sector2)
-
-							// 创建新的一圈
-							newLap := StintLap{
-								StintID:    userStintIDs[username],
-								Sector1:    0,
-								Sector2:    0,
-								Sector3:    0,
-								Tyre:       userTyres[username],
-								Time:       0,
-								Cuts:       0,
-								Crashes:    0,
-								CarCrashes: 0,
-							}
-							stintLapData[int(currentSessionID)][carID] = append(stintLapData[int(currentSessionID)][carID], newLap)
-						}
-					}
-				}
-
-				// 处理环境碰撞事件
-				if envCollisionMatch := envCollisionRegex.FindStringSubmatch(line); len(envCollisionMatch) == 2 {
-					username := envCollisionMatch[1]
-					carID := -1
-					for _, entry := range globalConnections {
-						if entry.DriverName == username {
-							carID = entry.CarID
-							break
-						}
-					}
-					if carID != -1 {
-						if _, ok := stintLapData[int(currentSessionID)]; !ok {
-							stintLapData[int(currentSessionID)] = make(map[int][]StintLap)
-						}
-						if laps, ok := stintLapData[int(currentSessionID)][carID]; !ok || len(laps) == 0 {
-							stintLapData[int(currentSessionID)][carID] = []StintLap{{
-								StintID:    userStintIDs[username],
-								Sector1:    0,
-								Sector2:    0,
-								Sector3:    0,
-								Tyre:       userTyres[username],
-								Time:       0,
-								Cuts:       0,
-								Crashes:    1,
-								CarCrashes: 0,
-							}}
-						} else {
-							lastIdx := len(laps) - 1
-							laps[lastIdx].Crashes++
-							stintLapData[int(currentSessionID)][carID] = laps
-						}
-					}
-				}
-				// 处理车辆碰撞事件
-				if carCollisionMatch := carCollisionRegex.FindStringSubmatch(line); len(carCollisionMatch) == 3 {
-					username := carCollisionMatch[1]
-					carID := -1
-					for _, entry := range globalConnections {
-						if entry.DriverName == username {
-							carID = entry.CarID
-							break
-						}
-					}
-					if carID != -1 {
-						if _, ok := stintLapData[int(currentSessionID)]; !ok {
-							stintLapData[int(currentSessionID)] = make(map[int][]StintLap)
-						}
-						if laps, ok := stintLapData[int(currentSessionID)][carID]; !ok || len(laps) == 0 {
-							stintLapData[int(currentSessionID)][carID] = []StintLap{{
-								StintID:    0,
-								Sector1:    0,
-								Sector2:    0,
-								Sector3:    0,
-								Tyre:       userTyres[username],
-								Time:       0,
-								Cuts:       0,
-								Crashes:    0,
-								CarCrashes: 1,
-							}}
-						} else {
-							lastIdx := len(laps) - 1
-							laps[lastIdx].CarCrashes++
-							stintLapData[int(currentSessionID)][carID] = laps
-						}
-					}
-				}
-				// 处理切弯事件
-				if cutsMatch := cutsRegex.FindStringSubmatch(line); len(cutsMatch) == 3 {
-					username := cutsMatch[1]
-					cuts, _ := strconv.Atoi(cutsMatch[2])
-					carID := -1
-					for _, entry := range globalConnections {
-						if entry.DriverName == username {
-							carID = entry.CarID
-							break
-						}
-					}
-					if carID != -1 {
-						if _, ok := stintLapData[int(currentSessionID)]; !ok {
-							stintLapData[int(currentSessionID)] = make(map[int][]StintLap)
-						}
-						if laps, ok := stintLapData[int(currentSessionID)][carID]; !ok || len(laps) == 0 {
-							stintLapData[int(currentSessionID)][carID] = []StintLap{{
-								StintID:    0,
-								Sector1:    0,
-								Sector2:    0,
-								Sector3:    0,
-								Tyre:       userTyres[username],
-								Time:       0,
-								Cuts:       cuts,
-								Crashes:    0,
-								CarCrashes: 0,
-							}}
-						} else {
-							lastIdx := len(laps) - 1
-							laps[lastIdx].Cuts = cuts
-							stintLapData[int(currentSessionID)][carID] = laps
-						}
-					}
-				}
-			}
-		}
+		// 连接恢复与成绩恢复沿用相同日志规则；这里只处理新增行。
+		processSessionLogLinesAt(lines, false, chunkStart)
 	}
 }
 

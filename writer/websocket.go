@@ -76,7 +76,7 @@ func startWebSocketReconnect() {
 	}()
 }
 
-// 广播只读取内存快照，连接锁不跨越数据库查询或 UDP 状态锁。
+// 广播读取已恢复的内存状态；接入已有 session 的查询不持连接锁。
 func buildAndSendWebSocketMessage() {
 	// 保留原广播逻辑：启动接入已有比赛时从数据库取得最新 session，
 	// SESSION_INFO 恢复本身不创建或替换 session。
@@ -182,6 +182,27 @@ func parseLeaderboardEntries(sessionID int, updates map[udp.CarID]udp.CarUpdate)
 		}
 		entry.Speed = uint16(speed)
 		entry.Gear &= 63
+		if score := recoveredScores[int(slot)]; score != nil {
+			entry.Laps = uint16(score.Laps)
+			entry.LastLapTime = int32(score.LastTime)
+			entry.ValidLaps = uint16(score.ValidLaps)
+			if score.Finished {
+				entry.StatusMask |= 1
+			}
+			if score.BestTime > 0 {
+				entry.BestLapTime = uint32(score.BestTime)
+				best := score.BestLap
+				if best.Time == score.BestTime {
+					entry.BestLapS1 = uint32(maxZero(best.Sector1))
+					entry.BestLapS2 = uint32(maxZero(best.Sector2))
+					entry.BestLapS3 = uint32(maxZero(best.Sector3))
+				}
+				// 只有 BEST 汇总而没有该圈分段时，只传已知总圈时。
+				if entry.BestLapS1+entry.BestLapS2+entry.BestLapS3 == 0 {
+					entry.BestLapS3 = uint32(score.BestTime)
+				}
+			}
+		}
 		if values := carLapDataMap[int(slot)]; len(values) > 0 {
 			last := values[len(values)-1]
 			entry.Laps = last.Laps
@@ -196,7 +217,22 @@ func parseLeaderboardEntries(sessionID int, updates map[udp.CarID]udp.CarUpdate)
 				validLaps += stint.ValidLaps
 			}
 		}
-		entry.ValidLaps = uint16(validLaps)
+		if uint16(validLaps) > entry.ValidLaps {
+			entry.ValidLaps = uint16(validLaps)
+		}
+		// 无已有 stint 时，恢复基线与接入后新采集计数相加；已有 stint 则避免双计数。
+		if score := recoveredScores[int(slot)]; score != nil {
+			known := false
+			for _, stint := range sessionStints {
+				if stint.GameCarID == int(slot) && restoredStintIDs[stint.ID] {
+					known = true
+					break
+				}
+			}
+			if !known {
+				entry.ValidLaps = uint16(score.ValidLaps + validLaps)
+			}
+		}
 		entry.Tyre = userTyres[conn.DriverName]
 		// 最快圈的三段必须属于同一圈，不能拼接三个不同圈的最佳分段。
 		for _, lap := range stintLapData[sessionID][int(slot)] {
