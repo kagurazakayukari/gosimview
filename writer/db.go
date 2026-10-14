@@ -890,9 +890,8 @@ func readTrackMetadata(trackName, configName string) (display, country, city str
 	if cfg == nil || cfg.Game.Path == "" {
 		return "", "", "", 0
 	}
-	// cfg.Game.Path 指向 server 目录，content 位于其父目录（与 http 端一致）
-	gameRoot := filepath.Dir(filepath.Clean(cfg.Game.Path))
-	base := filepath.Join(gameRoot, "content", "tracks", trackName)
+	// 原配置指定 AC server 根目录，赛道资料从该目录的 content 读取。
+	base := filepath.Join(cfg.Game.Path, "content", "tracks", trackName)
 	candidates := []string{
 		filepath.Join(base, configName, "ui", "ui_track.json"),
 		filepath.Join(base, "ui", configName, "ui_track.json"),

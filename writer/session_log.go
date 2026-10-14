@@ -23,16 +23,32 @@ type recoveredScore struct {
 	LastTime  int
 	Finished  bool
 	BestLap   StintLap
+	// OfficialBest 是玩家行给出的非哨兵 BEST，与本次回放的临时观测分开保存；
+	// 只有在日志窗口内没有任何完成圈可判定时才用它兜底，哨兵会使它归 0。
+	OfficialBest int
 }
+
+// AC 玩家行在“尚无有效圈”时给出的 BEST 哨兵 (16666:39:999)，等于 999999999 毫秒。
+// 它必须被丢弃，不能当成真实圈时参与最快圈比较。
+const logSentinelBestTime = 16666*60000 + 39*1000 + 999
 
 var recoveredScores = make(map[int]*recoveredScore)
 var restoredStintIDs = make(map[int]bool)
 var playerLineRegex = regexp.MustCompile(`^(\d+)\) (.*?) BEST: (.*?) TOTAL: (.*?) Laps:(\d+) SesID:(\d+) HasFinished:(\w+)$`)
 var splitLineRegex = regexp.MustCompile(`Car\.onSplitCompleted (\d+) (\d+) (\d+)`)
 var lapLineRegex = regexp.MustCompile(`LAP (.*?) (\d+):(\d+):(\d+)`)
-var cutsLineRegex = regexp.MustCompile(`LAP WITH CUTS: (.*?), (\d+) cuts`)
+
+// LAP WITH CUTS 的冒号后可能无空格（LAP WITH CUTS:Player），laptime 也可能缺省。
+var cutsLineRegex = regexp.MustCompile(`LAP WITH CUTS:\s*(.*?),\s*(\d+) cuts(?:,?\s*laptime\s*(\d+))?`)
 var environmentLineRegex = regexp.MustCompile(`COLLISION BETWEEN: (.*?) \[\] AND ENVIRONMENT`)
 var collisionLineRegex = regexp.MustCompile(`COLLISION BETWEEN: (.*?) \[\] AND (.*?) \[\]`)
+
+// cleanRequestedCarModel 规范化日志 REQUESTED CAR 字段：AC 在按皮肤通配选择时
+// 会追加尾随 '*'（如 rss_formula_hybrid_2022_s*）。该值用于匹配 entry_list 建立的
+// 车辆，必须先去掉空白再去掉尾随 '*'，否则会另建一台带星号的重复车辆。
+func cleanRequestedCarModel(raw string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "*"))
+}
 
 func slotForLogName(name string) int {
 	name = strings.TrimSpace(name)
@@ -61,6 +77,70 @@ func parseLogMilliseconds(value string) int {
 		return 0
 	}
 	return min*60000 + sec*1000 + ms
+}
+
+// applyLogCuts 把日志里的切弯数落到“按 laptime 匹配的最近一条已完成圈”。
+// LAP 行之后紧跟的 LAP WITH CUTS 行会落在随后新建的空圈之后，这里必须回退查找
+// 已完成圈（Time>0），不能写到下圈的空记录上；匹配只依赖已累积的 stintLapData，
+// 因此 LAP 与 LAP WITH CUTS 允许落在不同的增量批次里。
+func applyLogCuts(sid, slot, cuts, lapTime int) {
+	values := stintLapData[sid][slot]
+	for i := len(values) - 1; i >= 0; i-- {
+		if values[i].Time <= 0 {
+			continue
+		}
+		if lapTime > 0 && values[i].Time != lapTime {
+			continue
+		}
+		values[i].Cuts = cuts
+		return
+	}
+}
+
+// refreshRecoveredScores 在回放结束后按实际记录下来的已完成圈重算有效圈与最快圈。
+// LAP WITH CUTS 可能晚于 LAP 到达，有效性只能在全部行处理完后统一判定；
+// BestTime 始终由当前观测重算，不会保留已被 cuts/碰撞否定的旧值。
+func refreshRecoveredScores() {
+	if globalSession == nil {
+		return
+	}
+	sid := int(globalSession.ID)
+	for slot, score := range recoveredScores {
+		if score == nil {
+			continue
+		}
+		completed, valid, best := 0, 0, 0
+		var bestLap StintLap
+		for _, lap := range stintLapData[sid][slot] {
+			if lap.Time <= 0 {
+				continue
+			}
+			completed++
+			if lap.Cuts != 0 || lap.Crashes != 0 || lap.CarCrashes != 0 {
+				continue
+			}
+			valid++
+			if best == 0 || lap.Time < best {
+				best = lap.Time
+				bestLap = lap
+			}
+		}
+		score.ValidLaps = valid
+		if completed == 0 {
+			// 日志窗口内没有任何完成圈：只能采用官方 BEST（哨兵已归 0）。
+			score.BestTime = score.OfficialBest
+			score.BestLap = StintLap{}
+			continue
+		}
+		// 有完成圈时以回放观测为准：被 cuts/碰撞否定的圈一律不计，
+		// 既保证“无有效圈即 0”，也不会把被否定的记录当成最快圈。
+		score.BestTime = best
+		if best > 0 {
+			score.BestLap = bestLap
+		} else {
+			score.BestLap = StintLap{}
+		}
+	}
 }
 
 // replay=true 仅回放内存状态；不结束 stint，不产生历史 feed 或写圈。
@@ -139,12 +219,11 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 			}
 			continue
 		}
-		if m := cutsLineRegex.FindStringSubmatch(line); len(m) == 3 {
+		if m := cutsLineRegex.FindStringSubmatch(line); len(m) >= 4 {
 			slot := slotForLogName(m[1])
 			if slot >= 0 {
-				if lap := currentLap(slot); lap != nil {
-					lap.Cuts, _ = strconv.Atoi(m[2])
-				}
+				cuts, _ := strconv.Atoi(m[2])
+				applyLogCuts(sid, slot, cuts, parseLogMilliseconds(m[3]))
 			}
 			continue
 		}
@@ -193,13 +272,8 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 				score.Laps++
 				score.LastTime = ms
 				score.TotalTime += ms
-				if lap.Cuts == 0 && lap.Crashes == 0 && lap.CarCrashes == 0 {
-					score.ValidLaps++
-					if score.BestTime == 0 || ms < score.BestTime {
-						score.BestTime = ms
-						score.BestLap = *lap
-					}
-				}
+				// 有效圈与最快圈在回放结束后由 refreshRecoveredScores 统一重算：
+				// LAP WITH CUTS 行晚于 LAP 到达，这里无法判定本圈是否有效。
 			}
 			// 原日志解析在 LAP 后保留下一圈的空记录。
 			conn := globalConnections[slot]
@@ -220,12 +294,14 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 				if n, err := strconv.Atoi(m[5]); err == nil && n >= 0 {
 					score.Laps = n
 				}
-				if best := parseLogMilliseconds(m[3]); best > 0 {
-					score.BestTime = best
+				// 官方 BEST：哨兵 16666:39:999 代表“尚无有效圈”，必须归 0，不能泄漏为最快圈。
+				if best := parseLogMilliseconds(m[3]); best > 0 && best < logSentinelBestTime {
+					score.OfficialBest = best
+				} else {
+					score.OfficialBest = 0
 				}
-				if total := parseLogMilliseconds(m[4]); total > 0 {
-					score.TotalTime = total
-				}
+				// 官方 TOTAL 即使为 0 也要覆盖此前按圈累加出的无效总计。
+				score.TotalTime = parseLogMilliseconds(m[4])
 				score.Finished = strings.EqualFold(m[7], "true") || m[7] == "1"
 			}
 		} else {
@@ -236,6 +312,9 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 				}
 			}
 		}
+	}
+	if replay {
+		refreshRecoveredScores()
 	}
 }
 

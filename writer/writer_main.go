@@ -49,18 +49,17 @@ var (
 	globalTrackConfigs = make(map[int]*TrackConfig)
 	// 互斥锁
 	// UDP 状态由单个写锁保护，广播只读快照。
-	stateMutex                sync.RWMutex
-	activeStints              = make(map[int]*SessionStint)
-	entryListLoaded           bool
-	lastLogPoll               time.Time
-	bestLapTimes              = make(map[int]int)
-	classBestTimes            = make(map[string]int)
-	sessionStints             = make([]*SessionStint, 0)
-	completedTelemetrySamples = make(map[int][]udp.CarUpdate)
-	globalMutex               sync.Mutex
-	connectionsMutex          sync.Mutex
-	entryListMutex            sync.Mutex
-	sessionMutex              sync.Mutex
+	stateMutex       sync.RWMutex
+	activeStints     = make(map[int]*SessionStint)
+	entryListLoaded  bool
+	lastLogPoll      time.Time
+	bestLapTimes     = make(map[int]int)
+	classBestTimes   = make(map[string]int)
+	sessionStints    = make([]*SessionStint, 0)
+	globalMutex      sync.Mutex
+	connectionsMutex sync.Mutex
+	entryListMutex   sync.Mutex
+	sessionMutex     sync.Mutex
 	// 数据收集控制
 	dataCollectionEnabled bool = false
 	// 周期 UDP 在文件恢复完成后才进入当前采集状态。
@@ -69,8 +68,9 @@ var (
 	carLapDataMap = make(map[int][]CarLapData)
 	stintLapData  = make(map[int]map[int][]StintLap)
 	// 用于跟踪单圈数据的全局变量
-	carLapData        = make(map[int][]udp.CarUpdate)
-	telemetryData     = make(map[int][]byte)
+	carLapData = make(map[int][]udp.CarUpdate)
+	// 车辆至少经历一次完圈事件后，才收集下一整圈的持久化样本。
+	lapTelemetryReady = make(map[int]bool)
 	globalConnections = make(map[int]*ConnectionInfo)
 	globalEntryList   = make(map[int]EntryListDriver)
 	lapDataMutex      sync.Mutex
@@ -430,6 +430,8 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		return
 	}
 	collectCarUpdates()
+	// 完圈事件是采样边界；先消费本圈，即使后面被历史基线或无效圈过滤。
+	samples := completeLapSamples(int(lapMsg.CarID))
 	var completedCar *udp.LapCompletedCar
 	for _, car := range lapMsg.Cars {
 		if car != nil && car.CarID == lapMsg.CarID {
@@ -503,7 +505,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	valid := lap.Cuts == 0 && lap.Crashes == 0 && lap.CarCrashes == 0 && lap.LapTime > 0
 	record := &StintLap{StintID: stint.ID, Sector1: lap.Sector1, Sector2: lap.Sector2, Sector3: lap.Sector3,
 		Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lap.LapTime, Cuts: int(lap.Cuts), Crashes: int(lap.Crashes),
-		CarCrashes: int(lap.CarCrashes), MaxSpeed: int(calculateMaxSpeed(completedTelemetrySamples[slot])), FinishedAt: lap.Timestamp}
+		CarCrashes: int(lap.CarCrashes), MaxSpeed: int(calculateMaxSpeed(samples)), FinishedAt: lap.Timestamp}
 	if lap.LapTime > 0 {
 		record.AvgSpeed = int(float64(getTrackLength()) * 3600 / float64(lap.LapTime))
 	}
@@ -529,14 +531,11 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 			classBestTimes[carClass] = lap.LapTime
 			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 5, Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
 		}
-		if cfg.ACServer.Event.LapTelemetryEnable && len(telemetryData[slot]) == 0 && len(carLapData[slot]) > 0 {
-			data, err := generateLapTelemetry(slot, int32(getTrackLength()), carLapData[slot])
-			if err == nil {
-				telemetryData[slot] = data
-			}
-		}
-		if cfg.ACServer.Event.LapTelemetryEnable && len(telemetryData[slot]) > 0 {
-			if err := globalDBWriter.InsertLapTelemetry(lapID, telemetryData[slot]); err != nil {
+		if cfg.ACServer.Event.LapTelemetryEnable && len(samples) > 0 {
+			data, err := generateLapTelemetry(slot, int32(getTrackLength()), samples)
+			if err != nil {
+				logger.Printf("生成遥测失败: %v", err)
+			} else if err := globalDBWriter.InsertLapTelemetry(lapID, data); err != nil {
 				logger.Printf("写遥测失败: %v", err)
 			}
 		}
@@ -546,8 +545,6 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if err != nil {
 		logger.Printf("更新 stint 失败: %v", err)
 	}
-	delete(telemetryData, slot)
-	delete(completedTelemetrySamples, slot)
 	carLapDataMap[slot] = append(previous, lap)
 	globalSession.LastActivity = lap.Timestamp
 	globalDBWriter.UpdateSessionGrip(globalSession.ID, globalSession.CurrentGrip)
@@ -686,6 +683,8 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	*last = time.Now()
 	slot := int(msg.CarID)
 	previous := globalConnections[slot]
+	resetLapSamples(slot)
+	delete(latestCarUpdates, msg.CarID)
 	finishStint(slot)
 	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
@@ -912,13 +911,12 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	userTyres = make(map[string]string)
 	userStintIDs = make(map[string]int)
 	carLapData = make(map[int][]udp.CarUpdate)
-	telemetryData = make(map[int][]byte)
+	lapTelemetryReady = make(map[int]bool)
 	activeStints = make(map[int]*SessionStint)
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	bestLapTimes = make(map[int]int)
 	classBestTimes = make(map[string]int)
 	sessionStints = make([]*SessionStint, 0)
-	completedTelemetrySamples = make(map[int][]udp.CarUpdate)
 	lastFileSize, lastLineIdx, partialLine, globalNextSessionLineIdx = 0, 0, "", -1
 	latestFile, _ = findLatestSessionLogFile(logDir)
 	// 历史日志不属于本次采集；从接入时的文件末尾开始。
@@ -992,6 +990,7 @@ func feedDetail(slot int, detail map[string]interface{}) string {
 func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 	*last = time.Now()
 	slot := int(msg.CarID)
+	resetLapSamples(slot)
 	if globalSession != nil && globalSession.ID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
 	}
@@ -1040,44 +1039,10 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 		lastLogPoll = time.Now()
 	}
 	carID := int(updateMsg.CarID)
-	currentSplinePos := updateMsg.NormalisedSplinePos
 
-	// 实时更新最新车辆数据（wsMutex 保护，供主循环构建排行榜使用）
+	// 实时状态由外层 stateMutex 保护，和持久化遥测闸门无关。
 	latestCarUpdates[updateMsg.CarID] = updateMsg
-
-	// 圈跟踪数据用 lapDataMutex 保护
-	lapDataMutex.Lock()
-	lastUpdates, exists := carLapData[carID]
-
-	var lastPos float32
-	lapCompleted := false
-	if exists && len(lastUpdates) > 0 {
-		lastPos = lastUpdates[len(lastUpdates)-1].NormalisedSplinePos
-		lapCompleted = lastPos > 0.9 && currentSplinePos < 0.1
-	}
-
-	if lapCompleted {
-		completedTelemetrySamples[carID] = append([]udp.CarUpdate(nil), lastUpdates...)
-		// 生成遥测数据
-		if len(lastUpdates) > 0 {
-			telemetry, err := generateLapTelemetry(carID, int32(getTrackLength()), lastUpdates)
-			if err != nil {
-				logger.Printf("生成遥测数据失败: %v", err)
-			} else {
-				telemetryData[carID] = telemetry
-				logger.Printf("遥测数据已暂存: 车辆 %d，数据大小 %d 字节", carID, len(telemetry))
-			}
-		}
-	}
-	// 添加新数据点到圈跟踪
-	if lapCompleted {
-		carLapData[carID] = nil
-	}
-	if len(carLapData[carID]) >= 100000 {
-		carLapData[carID] = nil
-	}
-	carLapData[carID] = append(carLapData[carID], updateMsg)
-	lapDataMutex.Unlock()
+	collectLapSample(updateMsg)
 
 	// 判断是否在维修区
 	if len(pitBoundary) > 0 {
@@ -1195,7 +1160,7 @@ func loadPitBoundary(trackName, configName string) {
 		return
 	}
 	pitBoundary = nil
-	boundary, err := kn5conv.BatchProcess(filepath.Dir(cfg.Game.Path), cfg.App.Server.CachePath, trackName, configName)
+	boundary, err := kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
 	if err != nil {
 		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
 		return

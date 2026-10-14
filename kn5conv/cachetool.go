@@ -519,10 +519,18 @@ func parseFastLaneAI(filePath string) ([]TrackDetail, error) {
 		rawIdeal[i] = data
 	}
 
-	// 读取额外细节数据
-	extraCount := int(header[3])
-	if extraCount < 0 || extraCount > pointCount {
-		return nil, fmt.Errorf("fast_lane.ai 细节点数不合法: %d", extraCount)
+	// AC AI 文件的细节点数位于坐标数组之后，头部的后两项不表示点数或赛道长度。
+	var detailCount int32
+	if err := binary.Read(file, binary.LittleEndian, &detailCount); err != nil {
+		return nil, fmt.Errorf("读取细节点数失败: %w", err)
+	}
+	extraCount := int(detailCount)
+	if extraCount != pointCount || int64(extraCount)*72 > info.Size()-20-int64(pointCount)*20 {
+		return nil, fmt.Errorf("fast_lane.ai 细节点数与坐标或文件长度不一致: %d", extraCount)
+	}
+	trackLength := rawIdeal[pointCount-1][3].(float32)
+	if trackLength <= 0 || math.IsNaN(float64(trackLength)) || math.IsInf(float64(trackLength), 0) {
+		return nil, fmt.Errorf("fast_lane.ai 最后节点的累计距离无效")
 	}
 	details := make([]TrackDetail, extraCount)
 	for i := 0; i < extraCount; i++ {
@@ -552,7 +560,7 @@ func parseFastLaneAI(filePath string) ([]TrackDetail, error) {
 		details[i] = TrackDetail{
 			ID:        rawIdeal[i][4].(int32),
 			Position:  currPos,
-			Node:      rawIdeal[i][3].(float32) / float32(header[2]),
+			Node:      rawIdeal[i][3].(float32) / trackLength,
 			Distance:  rawIdeal[i][3].(float32),
 			Direction: float32(direction),
 			WallLeft:  wallLeft,
@@ -634,6 +642,10 @@ func parseSectionIni(filePath string) ([]Section, error) {
 }
 
 func generateTrackSVG(filePath string, trackDetails []TrackDetail, aiPoints [][3]float32, sections []Section) error {
+	// 先校验数据，防止生成失败留下空文件并被当作有效缓存。
+	if len(trackDetails) == 0 || len(aiPoints) == 0 {
+		return fmt.Errorf("trackDetails或aiPoints为空，无法生成SVG")
+	}
 	// 创建SVG文件
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -646,9 +658,6 @@ func generateTrackSVG(filePath string, trackDetails []TrackDetail, aiPoints [][3
 	defer writer.Flush()
 
 	// 收集所有关键坐标点（车道、墙体、边界）
-	if len(trackDetails) == 0 || len(aiPoints) == 0 {
-		return fmt.Errorf("trackDetails或aiPoints为空，无法生成SVG")
-	}
 	allPoints := make([][3]float32, 0, len(trackDetails)*2+len(aiPoints))
 	for _, detail := range trackDetails {
 		allPoints = append(allPoints, detail.Position)

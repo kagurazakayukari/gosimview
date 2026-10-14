@@ -58,7 +58,7 @@ func restoreConnectionsFromSessionLog() error {
 			entry := globalEntryList[slot]
 			conn := &ConnectionInfo{
 				CarID: slot, DriverName: name, DriverGUID: match[4],
-				CarModel: strings.TrimSpace(match[3]), CarSkin: entry.Skin,
+				CarModel: cleanRequestedCarModel(match[3]), CarSkin: entry.Skin,
 				CarName: entry.Name, ConnectionStatus: 0, TrackStatus: 3,
 				TrackStatusLastChangedTime: time.Now(), LastConnectionLine: lineIndex + 1,
 			}
