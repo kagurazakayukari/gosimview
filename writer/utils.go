@@ -73,8 +73,10 @@ func findLatestSessionLogFile(logDir string) (os.DirEntry, error) {
 			continue
 		}
 
-		// 检查文件名是否符合会话日志格式
-		if strings.HasPrefix(entry.Name(), "acServer_") && strings.HasSuffix(entry.Name(), ".log") {
+		// AC 启动脚本生成 output<日期>_<时间>.log；WMIC 无结果时为 output_.log。
+		// 按最后修改时间选当前会话日志，不使用原代码误设的 acServer_ 前缀。
+		name := entry.Name()
+		if strings.HasPrefix(name, "output") && strings.HasSuffix(name, ".log") {
 			// 获取文件修改时间
 			info, err := entry.Info()
 			if err != nil {
