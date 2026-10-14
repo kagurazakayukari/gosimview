@@ -441,6 +441,13 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		logger.Printf("完成圈消息缺少车辆 %d", lapMsg.CarID)
 		return
 	}
+	// 当前抓地力来自完成圈报文，不反推接入前的初始抓地力。
+	grip := float64(lapMsg.GripLevel)
+	if !math.IsNaN(grip) && !math.IsInf(grip, 0) && grip >= 0 && grip <= 1 {
+		globalSession.CurrentGrip = grip
+	} else {
+		logger.Printf("完成圈抓地力数值无效: %v", grip)
+	}
 	slot := int(lapMsg.CarID)
 	conn := globalConnections[slot]
 	if conn != nil && conn.UserID == 0 {
@@ -1552,7 +1559,7 @@ outerLoop:
 
 		for {
 			// 发送GetSessionInfo请求
-			if err := acClient.SendMessage(udp.GetSessionInfo{}); err != nil {
+			if err := acClient.SendMessage(udp.NewGetSessionInfo()); err != nil {
 				logger.Printf("请求当前会话失败: %v", err)
 			}
 

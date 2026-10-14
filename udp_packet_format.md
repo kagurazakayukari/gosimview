@@ -66,6 +66,7 @@ type LapCompleted struct {
     Cuts      uint8  `json:"Cuts"`      // 切弯次数
     CarsCount uint8  `json:"CarsCount"` // 车辆数量
     Cars      []*LapCompletedCar `json:"Cars"` // 所有车辆圈速信息
+    GripLevel float32 `json:"GripLevel"` // 排行榜车辆列表之后的尾部抓地力
 }
 
 type LapCompletedCar struct {
@@ -75,6 +76,8 @@ type LapCompletedCar struct {
     Completed uint8  `json:"Completed"` // 完成状态
 }
 ```
+
+完成圈报文按小端编码：事件 1 字节、圈头 7 字节、每辆排行榜车辆 8 字节、尾部抓地力 4 字节，总长为 `12 + 8 × CarsCount` 字节。尾字段依据 [Kunos UDP 样例](https://github.com/minolin/acplugins/blob/131d3fca6cbd6b8a5e14fba7dddc34bce555ef4c/acplugins4net/acRemoteServerUDP_Example/Program.cs) 和 [MsgLapCompleted](https://github.com/minolin/acplugins/blob/131d3fca6cbd6b8a5e14fba7dddc34bce555ef4c/acplugins4net/acPlugins4net/messages/MsgLapCompleted.cs)，未改变前面字段的顺序和类型。
 
 ### 3.2 CollisionWithCar (车辆碰撞数据)
 **事件类型**: EventCollisionWithCar (10)
@@ -235,15 +238,15 @@ type EnableRealtimePosInterval struct {
 **事件类型**: EventGetCarInfo (201)
 ```go
 type GetCarInfo struct {
-    // 无额外字段，仅用于触发服务器返回车辆信息
+    CarID CarID // 要查询的 AC 槽位，非数据库车辆 ID
 }
 ```
 
 **用法说明**：
 - **示例**：
   ```go
-  // 请求服务器返回所有车辆信息
-  client.SendMessage(udp.GetCarInfo{})
+  // 仅在业务明确需要时查询槽位 7；writer 启动不主动逐车查询
+  client.SendMessage(udp.GetCarInfo{CarID: 7})
   ```
 
 ### 4.3 SendChat (发送聊天消息)
@@ -297,7 +300,7 @@ type BroadcastChat struct {
 **事件类型**: EventGetSessionInfo (204)
 ```go
 type GetSessionInfo struct {
-    // 无额外字段，仅用于触发服务器返回会话信息
+    SessionIndex int16 // -1 为当前会话，0 为首个会话
 }
 ```
 
@@ -305,25 +308,20 @@ type GetSessionInfo struct {
 - **示例**：
   ```go
   // 请求服务器返回当前会话信息
-  client.SendMessage(udp.GetSessionInfo{})
+  client.SendMessage(udp.NewGetSessionInfo()) // 字节 CC FF FF
+  // 查询首个会话：GetSessionInfo{SessionIndex: 0}，字节 CC 00 00
   ```
 
 ### 4.6 SetSessionInfo (设置会话信息请求)
 **事件类型**: EventSetSessionInfo (205)
 ```go
 type SetSessionInfo struct {
-    Version             uint8       // 版本号
-    SessionIndex        uint8       // 会话索引
-    CurrentSessionIndex uint8       // 当前会话索引
-    SessionCount        uint8       // 会话数量
-    Name                string      // 会话名称
-    Type                SessionType // 会话类型
-    Time                uint16      // 会话时间（分钟）
-    Laps                uint16      // 圈数
-    WaitTime            uint16      // 等待时间（秒）
-    AmbientTemp         uint8       // 环境温度（摄氏度）
-    RoadTemp            uint8       // 赛道温度（摄氏度）
-    WeatherGraphics     string      // 天气图形
+    SessionIndex uint8
+    Name         string      // uint8 码点数 + UTF-32LE
+    Type         SessionType // uint8
+    Laps         uint32
+    Time         uint32      // 秒；不能复用响应的 uint16 宽度
+    WaitTime     uint32      // 秒
 }
 ```
 
@@ -334,11 +332,13 @@ type SetSessionInfo struct {
   msg := udp.SetSessionInfo{
       Name:  "Practice Session",
       Type:  udp.SessionTypePractice,
-      Time:  30, // 30分钟
+      Time:  1800, // 请求为秒，30分钟
       Laps:  0,  // 无圈数限制
   }
   client.SendMessage(msg)
   ```
+
+请求字段依据：[Kunos 样例](https://github.com/minolin/acplugins/blob/131d3fca6cbd6b8a5e14fba7dddc34bce555ef4c/acplugins4net/acRemoteServerUDP_Example/Program.cs)、[RequestSessionInfo](https://github.com/minolin/acplugins/blob/131d3fca6cbd6b8a5e14fba7dddc34bce555ef4c/acplugins4net/acPlugins4net/messages/RequestSessionInfo.cs)、[RequestSetSession](https://github.com/minolin/acplugins/blob/131d3fca6cbd6b8a5e14fba7dddc34bce555ef4c/acplugins4net/acPlugins4net/messages/RequestSetSession.cs)。接口提供发送能力，不代表 writer 在启动时自动查询车辆或修改会话。
 
 ### 4.7 KickUser (踢用户)
 **事件类型**: EventKickUser (206)

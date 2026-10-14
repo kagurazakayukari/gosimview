@@ -16,6 +16,7 @@ import (
 	"net"
 	"runtime"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/text/encoding/unicode/utf32"
@@ -272,6 +273,26 @@ func readString(r io.Reader, sizeMultiplier int) string {
 	return string(b)
 }
 
+// writeStringW 按 Kunos stringW 编码：码点数 uint8 + 无 BOM 的 UTF-32LE。
+func writeStringW(w io.Writer, value string) error {
+	if !utf8.ValidString(value) {
+		return errors.New("UDP 字符串不是有效 UTF-8")
+	}
+	count := utf8.RuneCountInString(value)
+	if count > 255 {
+		return errors.New("UDP 字符串超过 255 个码点")
+	}
+	encoded, err := utf32.UTF32(utf32.LittleEndian, utf32.IgnoreBOM).NewEncoder().Bytes([]byte(value))
+	if err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint8(count)); err != nil {
+		return err
+	}
+	_, err = w.Write(encoded)
+	return err
+}
+
 func (asu *AssettoServerUDP) SendMessage(message Message) error {
 	switch a := message.(type) {
 	case EnableRealtimePosInterval:
@@ -281,14 +302,45 @@ func (asu *AssettoServerUDP) SendMessage(message Message) error {
 
 		return nil
 
-	case GetSessionInfo, *RestartSession, *NextSession:
-		err := binary.Write(asu.listener, binary.LittleEndian, a.Event())
-
-		if err != nil {
+	case GetSessionInfo:
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.LittleEndian, a.Event()); err != nil {
 			return err
 		}
-
+		if err := binary.Write(buf, binary.LittleEndian, a.SessionIndex); err != nil {
+			return err
+		}
+		_, err := asu.listener.Write(buf.Bytes())
 		return err
+
+	case GetCarInfo:
+		_, err := asu.listener.Write([]byte{byte(a.Event()), byte(a.CarID)})
+		return err
+
+	case SetSessionInfo:
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.LittleEndian, a.Event()); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, a.SessionIndex); err != nil {
+			return err
+		}
+		if err := writeStringW(buf, a.Name); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, a.Type); err != nil {
+			return err
+		}
+		for _, value := range []uint32{a.Laps, a.Time, a.WaitTime} {
+			if err := binary.Write(buf, binary.LittleEndian, value); err != nil {
+				return err
+			}
+		}
+		_, err := asu.listener.Write(buf.Bytes())
+		return err
+
+	case *RestartSession, *NextSession:
+		return binary.Write(asu.listener, binary.LittleEndian, a.Event())
 
 	case *SendChat:
 		buf := new(bytes.Buffer)
@@ -611,6 +663,10 @@ func (asu *AssettoServerUDP) handleMessage(r io.Reader) (Message, error) {
 			lc.Cars = append(lc.Cars, &car)
 		}
 
+		// 原始 Kunos 样例和 MsgLapCompleted 均在列表后读取 float32 抓地力。
+		if err := binary.Read(r, binary.LittleEndian, &lc.GripLevel); err != nil {
+			return nil, fmt.Errorf("读取完成圈尾部抓地力失败: %w", err)
+		}
 		response = lc
 	case EventClientEvent:
 		var collisionType uint8

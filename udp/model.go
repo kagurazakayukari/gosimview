@@ -7,6 +7,7 @@
 package udp
 
 import (
+	"fmt"
 	"regexp"
 	"time"
 
@@ -101,6 +102,8 @@ type LapCompleted struct {
 	CarsCount uint8  `json:"CarsCount"`
 
 	Cars []*LapCompletedCar `json:"Cars"`
+	// Kunos 完成圈报文的尾字段，在全部排行榜车辆之后编码。
+	GripLevel float32 `json:"GripLevel"`
 }
 
 type LapCompletedCar struct {
@@ -251,19 +254,40 @@ func (s SessionInfo) Event() Event {
 	return s.EventType
 }
 
+// GetCarInfo 请求指定 AC 车辆槽位，不代表数据库车辆 ID。
 type GetCarInfo struct {
+	CarID CarID
 }
 
 func (GetCarInfo) Event() Event {
 	return EventGetCarInfo
 }
 
+// GetSessionInfo 的索引是有符号 int16；-1 表示当前会话，0 表示首个会话。
 type GetSessionInfo struct {
+	SessionIndex int16
+}
+
+func NewGetSessionInfo() GetSessionInfo {
+	return GetSessionInfo{SessionIndex: -1}
 }
 
 func (GetSessionInfo) Event() Event {
 	return EventGetSessionInfo
 }
+
+// SetSessionInfo 的请求字段遵循 Kunos 样例，不能套用接收 SessionInfo 的字段宽度。
+// Time、WaitTime 为秒；响应中的 Time、Laps、WaitTime 则是 uint16。
+type SetSessionInfo struct {
+	SessionIndex uint8
+	Name         string
+	Type         SessionType
+	Laps         uint32
+	Time         uint32
+	WaitTime     uint32
+}
+
+func (SetSessionInfo) Event() Event { return EventSetSessionInfo }
 
 type EnableRealtimePosInterval struct {
 	Type     uint8
@@ -296,7 +320,10 @@ func NewSendChat(carID CarID, data string) (*SendChat, error) {
 	// the Assetto Corsa chat seems to not cope well with non-ascii characters. remove them.
 	data = regexp.MustCompile("[[:^ascii:]]").ReplaceAllLiteralString(data, "")
 
-	strlen := len(data)
+	strlen := len([]rune(data))
+	if strlen > 255 {
+		return nil, fmt.Errorf("UDP 字符串超过 255 个码点")
+	}
 
 	encoded, err := utf32.UTF32(utf32.LittleEndian, utf32.IgnoreBOM).NewEncoder().Bytes([]byte(data))
 
@@ -326,7 +353,10 @@ func NewBroadcastChat(data string) (*BroadcastChat, error) {
 	// the Assetto Corsa chat seems to not cope well with non-ascii characters. remove them.
 	data = regexp.MustCompile("[[:^ascii:]]").ReplaceAllLiteralString(data, "")
 
-	strlen := len(data)
+	strlen := len([]rune(data))
+	if strlen > 255 {
+		return nil, fmt.Errorf("UDP 字符串超过 255 个码点")
+	}
 
 	encoded, err := utf32.UTF32(utf32.LittleEndian, utf32.IgnoreBOM).NewEncoder().Bytes([]byte(data))
 
@@ -382,7 +412,10 @@ func (AdminCommand) Event() Event {
 }
 
 func NewAdminCommand(data string) (*AdminCommand, error) {
-	strlen := len(data)
+	strlen := len([]rune(data))
+	if strlen > 255 {
+		return nil, fmt.Errorf("UDP 字符串超过 255 个码点")
+	}
 
 	encoded, err := utf32.UTF32(utf32.LittleEndian, utf32.IgnoreBOM).NewEncoder().Bytes([]byte(data))
 
