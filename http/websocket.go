@@ -50,6 +50,9 @@ type eventLiveState struct {
 	message WebSocketMessage
 	hasData bool
 	viewers int32
+	// 实时数据归属于最后发布该事件的连接，旧连接退出不得清除新连接数据。
+	publisher  *liveConn
+	receivedAt time.Time
 }
 
 func (st *eventLiveState) addViewer(delta int32) {
@@ -78,21 +81,21 @@ func hubState(eventID int) *eventLiveState {
 	return st
 }
 
-// hubStore 保存 Writer 推送的完整消息（含 Version/EventID/ViewerCount）
-func hubStore(msg WebSocketMessage) {
-	if msg.EventID <= 0 {
+// hubStore 保存当前发布连接的消息，事件身份必须与该连接绑定。
+func hubStore(publisher *liveConn, msg WebSocketMessage) {
+	if publisher == nil || msg.EventID <= 0 || msg.Session.SessionID <= 0 ||
+		msg.EventID != publisher.eventID || msg.Session.EventID != msg.EventID {
 		return
 	}
 	if msg.Version == 0 {
 		msg.Version = leaderboardVersion
 	}
-	if msg.Session.EventID == 0 {
-		msg.Session.EventID = msg.EventID
-	}
 	st := hubState(msg.EventID)
 	st.mu.Lock()
 	st.message = msg
 	st.hasData = true
+	st.publisher = publisher
+	st.receivedAt = time.Now()
 	st.mu.Unlock()
 }
 
@@ -106,7 +109,44 @@ func hubSnapshot(eventID int) (WebSocketMessage, bool, int32) {
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.message, st.hasData, st.viewers
+	return st.message, st.fresh(time.Now()), st.viewers
+}
+
+// fresh 按 HTTP 接收时间检查发布新鲜度，不依赖客户端时钟或旧 session.last_activity。
+// 连续三个广播周期未收到数据即离线；下限覆盖短暂调度抖动，上限不超过连接超时。
+// 调用者必须持有 st.mu。
+func (st *eventLiveState) fresh(now time.Time) bool {
+	if !st.hasData || st.publisher == nil {
+		return false
+	}
+	interval := time.Duration(st.message.BroadcastInterval) * time.Millisecond
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ttl := 3 * interval
+	if ttl < 10*time.Second {
+		ttl = 10 * time.Second
+	}
+	if ttl > pongWait {
+		ttl = pongWait
+	}
+	return now.Sub(st.receivedAt) < ttl
+}
+
+// hubDisconnect 只撤销该连接自己发布的数据，保留观众计数。
+func hubDisconnect(publisher *liveConn) {
+	liveHub.mu.Lock()
+	st := liveHub.events[publisher.eventID]
+	liveHub.mu.Unlock()
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.publisher == publisher {
+		st.publisher = nil
+		st.hasData = false
+	}
 }
 
 // hubLiveSession 返回某事件收到的实时会话（若有）
@@ -131,7 +171,7 @@ func hubLiveEventIDs() []int {
 	ids := []int{}
 	for id, st := range states {
 		st.mu.Lock()
-		live := st.hasData && st.message.Session.IsFinished == 0
+		live := st.fresh(time.Now()) && st.message.Session.IsFinished == 0
 		st.mu.Unlock()
 		if live {
 			ids = append(ids, id)
@@ -422,6 +462,9 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer stop()
 	defer conn.Close()
 	defer func() {
+		if c.producer {
+			hubDisconnect(c)
+		}
 		if c.viewerCounted {
 			hubState(c.eventID).addViewer(-1)
 			c.viewerCounted = false
@@ -466,9 +509,17 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 			if msg.EventID <= 0 {
 				msg.EventID = c.eventID
 			}
-			if msg.EventID <= 0 {
+			if msg.EventID <= 0 || msg.Session.SessionID <= 0 {
 				continue
 			}
+			if c.eventID == 0 {
+				c.eventID = msg.EventID
+			}
+			if msg.EventID != c.eventID || (msg.Session.EventID != 0 && msg.Session.EventID != msg.EventID) {
+				logger.Printf("拒绝与连接不符的实时事件: connection=%d, event=%d, session.event=%d", c.eventID, msg.EventID, msg.Session.EventID)
+				continue
+			}
+			msg.Session.EventID = msg.EventID
 			if !c.producer {
 				// 未声明为 Writer 的连接一旦推送排行榜消息，也视作生产者：不再向它发送二进制、不计入观众
 				c.producer = true
@@ -477,7 +528,7 @@ func handleACEventWebSocket(w http.ResponseWriter, r *http.Request) {
 					c.viewerCounted = false
 				}
 			}
-			hubStore(msg)
+			hubStore(c, msg)
 		case <-pingTicker.C:
 			writeMu.Lock()
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))

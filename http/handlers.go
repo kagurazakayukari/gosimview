@@ -148,26 +148,10 @@ func queryEvents(ids []int) []ACEventResponse {
 	return events
 }
 
-// collectLiveEvents 返回当前进行中的赛事；若没有实时推送则回退到 active=1 的事件
+// collectLiveEvents 只返回有新鲜 writer 推送的未结束赛事。
+// event.active 是持久化的赛事标记，不能证明 writer 或 AC 当前在线。
 func collectLiveEvents() []ACEventResponse {
-	if ids := hubLiveEventIDs(); len(ids) > 0 {
-		return queryEvents(ids)
-	}
-	events := []ACEventResponse{}
-	rows, err := db.Query(`SELECT ` + eventSelectColumns + ` FROM event WHERE active = 1 ORDER BY event_id DESC`)
-	if err != nil {
-		logger.Printf("查询活跃事件失败: %v", err)
-		return events
-	}
-	defer rows.Close()
-	for rows.Next() {
-		e, err := scanEventRow(rows)
-		if err != nil {
-			continue
-		}
-		events = append(events, e)
-	}
-	return events
+	return queryEvents(hubLiveEventIDs())
 }
 
 // 处理AC活跃事件请求
