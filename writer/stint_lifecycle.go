@@ -4,11 +4,14 @@
 
 package main
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // stint 生命周期集中在本文件。
-// 原版语义（simview/ChangeLog v0.4）：一个 driver stint 就是“从加入服务器到断开”这一段，
-// 换胎只记 session feed、不切分 stint；stint 的开始时间取连接时刻，而不是第一次完圈时间。
+// 按进站信息观察到区内停车时结束旧段，重新起步开启新段；驶过维修区不分段。
+// 断开与会话切换同样收尾，换胎日志本身不证明发生了停车。
 // 本文件不做完圈接收判定（那由 handleLapCompletedMessage 的调用方负责）。
 
 // connStintStartedAt 返回新建 stint 的 started_at。
@@ -21,6 +24,12 @@ func connStintStartedAt(conn *ConnectionInfo, observedAt time.Time) time.Time {
 	if globalSession != nil {
 		sessionStart = globalSession.StartTime
 	}
+	if conn != nil && !conn.StintStartedAt.IsZero() {
+		if !sessionStart.IsZero() && conn.StintStartedAt.Before(sessionStart) {
+			return sessionStart
+		}
+		return conn.StintStartedAt
+	}
 	if conn != nil && !conn.ConnectedAt.IsZero() {
 		if !sessionStart.IsZero() && conn.ConnectedAt.Before(sessionStart) {
 			return sessionStart
@@ -32,6 +41,46 @@ func connStintStartedAt(conn *ConnectionInfo, observedAt time.Time) time.Time {
 	}
 	logger.Printf("stint 缺少连接时刻与首次观测时间，无法确定 started_at")
 	return time.Time{}
+}
+
+// ensureCurrentStint 让完圈与进站后起步使用同一建段路径。
+// 按真实连接或本次起步时间建立区间，不把进站新段退回旧连接时间。
+func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
+	conn := globalConnections[slot]
+	if conn == nil || conn.UserID == 0 || conn.CarDBID == 0 || globalSession == nil || globalSession.ID == 0 {
+		return nil, fmt.Errorf("车辆 %d 身份或当前会话尚未恢复", slot)
+	}
+	stint := activeStints[slot]
+	if stint != nil && (stint.UserID != conn.UserID || stint.CarID != conn.CarDBID) {
+		if err := finishStint(slot); err != nil {
+			return nil, err
+		}
+		stint = nil
+	}
+	if stint != nil && stint.IsFinished == 0 {
+		return stint, nil
+	}
+	startedAt := connStintStartedAt(conn, observedAt)
+	if startedAt.IsZero() {
+		return nil, fmt.Errorf("车辆 %d 的 stint 起点缺失", slot)
+	}
+	stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
+	if globalEvent.TeamEvent == 1 {
+		for _, member := range globalTeamMembers {
+			if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
+				stint.TeamMemberID = member.ID
+				break
+			}
+		}
+	}
+	id, err := globalDBWriter.CreateSessionStint(stint)
+	if err != nil {
+		return nil, err
+	}
+	stint.ID = int(id)
+	activeStints[slot] = stint
+	sessionStints = append(sessionStints, stint)
+	return stint, nil
 }
 
 // finishStint 结束槽位当前未完成的 stint：先写库成功，再改内存；写库失败时返回错误并保留

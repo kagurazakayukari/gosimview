@@ -441,6 +441,10 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		logger.Printf("完成圈消息缺少车辆 %d", lapMsg.CarID)
 		return
 	}
+	if obs := pitObservations[int(lapMsg.CarID)]; obs != nil && obs.resumePending {
+		// 已停车但未重新起步，不能让完圈消息重新开启刚结束的旧段。
+		return
+	}
 	// 排行榜 Laps 不一定随无效圈增长，不能据此丢弃新的完圈事件。
 	if !acceptLapCompletion(lapMsg, *completedCar, time.Now()) {
 		return
@@ -480,35 +484,10 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	}
 	// 历史圈只由日志恢复到内存；恢复完成后收到的完圈事件属于新采集。
 	previous := carLapDataMap[slot]
-	stint := activeStints[slot]
-	if stint != nil && (stint.UserID != conn.UserID || stint.CarID != conn.CarDBID) {
-		if err := finishStint(slot); err != nil {
-			return
-		}
-		stint = nil
-	}
-	if stint == nil || stint.IsFinished != 0 {
-		startedAt := connStintStartedAt(conn, lap.Timestamp)
-		if startedAt.IsZero() {
-			return
-		}
-		stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
-		if globalEvent.TeamEvent == 1 {
-			for _, member := range globalTeamMembers {
-				if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
-					stint.TeamMemberID = member.ID
-					break
-				}
-			}
-		}
-		id, err := globalDBWriter.CreateSessionStint(stint)
-		if err != nil {
-			logger.Printf("创建 stint 失败: %v", err)
-			return
-		}
-		stint.ID = int(id)
-		activeStints[slot] = stint
-		sessionStints = append(sessionStints, stint)
+	stint, err := ensureCurrentStint(slot, lap.Timestamp)
+	if err != nil {
+		logger.Printf("建立当前 stint 失败: %v", err)
+		return
 	}
 	valid := lap.Cuts == 0 && lap.Crashes == 0 && lap.CarCrashes == 0 && lap.LapTime > 0
 	record := &StintLap{StintID: stint.ID, Sector1: lap.Sector1, Sector2: lap.Sector2, Sector3: lap.Sector3,
@@ -632,6 +611,8 @@ type ConnectionInfo struct {
 	// ConnectedAt 记录本段连接的建立时刻；stint 的 started_at 取它，而不是第一次完圈时间。
 	// 由 handleNewConnectionMessage 写入；日志恢复出的连接没有该时刻，为空。
 	ConnectedAt time.Time
+	// 新段从进站停车后的再次起步开始，不沿用旧连接的起点。
+	StintStartedAt time.Time
 }
 
 func getLapTimeByID(lapID int) float64 {
@@ -702,6 +683,7 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	}
 	previous := globalConnections[slot]
 	resetLapSamples(slot)
+	delete(pitObservations, slot)
 	delete(latestCarUpdates, msg.CarID)
 	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectedAt: time.Now(), ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
@@ -929,6 +911,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	carLapData = make(map[int][]udp.CarUpdate)
 	lapTelemetryReady = make(map[int]bool)
 	lastLapCompletions = make(map[int]lapCompletion)
+	pitObservations = make(map[int]*pitObservation)
 	activeStints = make(map[int]*SessionStint)
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	bestLapTimes = make(map[int]int)
@@ -947,6 +930,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	}
 	for _, conn := range globalConnections {
 		conn.TrackStatus = 3
+		conn.StintStartedAt = time.Time{}
 		initializeConnectionIdentity(conn)
 	}
 	loadPitBoundary(msg.Track, msg.TrackConfig)
@@ -1006,6 +990,7 @@ func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 		return
 	}
 	resetLapSamples(slot)
+	delete(pitObservations, slot)
 	if globalSession != nil && globalSession.ID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
 	}
@@ -1058,94 +1043,9 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	latestCarUpdates[updateMsg.CarID] = updateMsg
 	collectLapSample(updateMsg)
 
-	// 判断是否在维修区
-	if len(pitBoundary) > 0 {
-		vehiclePos := [2]float32{updateMsg.Pos.X, updateMsg.Pos.Z}
-		inPit := pointInPolygon(vehiclePos, pitBoundary)
-
-		connectionsMutex.Lock()
-		defer connectionsMutex.Unlock()
-
-		if connInfo, exists := globalConnections[carID]; exists {
-			oldStatus := connInfo.TrackStatus
-			if inPit {
-				// 进入维修区状态逻辑
-				if (oldStatus == 0 || oldStatus == 1) && connInfo.TrackStatus != 2 && connInfo.TrackStatus != 3 {
-					// 从赛道状态(1)进入维修区入口(2)
-					connInfo.TrackStatus = 2
-					connInfo.TrackStatusLastChangedTime = time.Now()
-
-					// 计算当前速度 (m/s)
-					velocityMagnitude := math.Sqrt(float64(updateMsg.Velocity.X*updateMsg.Velocity.X +
-						updateMsg.Velocity.Y*updateMsg.Velocity.Y +
-						updateMsg.Velocity.Z*updateMsg.Velocity.Z))
-
-					// 判断是否为teleport回维修区 (>400km/h = 111.11m/s)
-					isTeleport := velocityMagnitude > 111.11
-					sfType := 11
-					if isTeleport {
-						sfType = 15
-					}
-
-					// 记录新的维修区访问
-					currentVisit := PitVisit{EntryTime: time.Now()}
-					connInfo.PitVisits = append(connInfo.PitVisits, currentVisit)
-					// 插入维修区进入事件到session feed
-					sf := &SessionFeed{
-						SessionID: globalSession.ID,
-						Type:      sfType,
-						Detail:    feedDetail(connInfo.CarID, nil),
-						Time:      time.Now(),
-					}
-					if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
-						logger.Printf("Failed to insert pit entry session feed: %v", err)
-					}
-
-					connInfo.PitEntryTime = time.Now()
-				} else if connInfo.TrackStatus == 2 && time.Since(connInfo.TrackStatusLastChangedTime) >= 10*time.Second {
-					// 入口状态保持10秒后切换到维修区状态(3)
-					connInfo.TrackStatus = 3
-					connInfo.TrackStatusLastChangedTime = time.Now()
-				}
-			} else {
-				// 离开维修区状态逻辑
-				if oldStatus == 3 && connInfo.TrackStatus != 4 && connInfo.TrackStatus != 0 && connInfo.TrackStatus != 1 {
-					// 从维修区状态(3)进入出口状态(4)
-					connInfo.TrackStatus = 4
-					connInfo.TrackStatusLastChangedTime = time.Now()
-
-					// 记录维修区离开时间并更新session feed
-					for i := len(connInfo.PitVisits) - 1; i >= 0; i-- {
-						if connInfo.PitVisits[i].ExitTime.IsZero() {
-							connInfo.PitVisits[i].ExitTime = time.Now()
-							// 计算维修区停留时间
-							entryTime := connInfo.PitVisits[i].EntryTime
-							pitDuration := time.Since(entryTime)
-							// 插入维修区离开事件到session feed (Type=12)
-							sf := &SessionFeed{
-								SessionID: globalSession.ID,
-								Type:      12,
-								Detail:    feedDetail(connInfo.CarID, map[string]interface{}{"pit_time": pitDuration.Milliseconds()}),
-								Time:      time.Now(),
-							}
-							if err := globalDBWriter.InsertSessionFeed(sf); err != nil {
-								logger.Printf("Failed to insert pit exit session feed: %v", err)
-							}
-							break
-						}
-					}
-
-					connInfo.PitEntryTime = time.Time{}
-				} else if connInfo.TrackStatus == 4 && time.Since(connInfo.TrackStatusLastChangedTime) >= 10*time.Second {
-					// 出口状态保持10秒后切换到正常赛道状态(0)
-					connInfo.TrackStatus = 0
-					connInfo.TrackStatusLastChangedTime = time.Now()
-					// 重置维修区相关时间
-					connInfo.PitEntryTime = time.Time{}
-					connInfo.LastMoveTime = time.Time{}
-				}
-			}
-		}
+	if len(pitBoundary) >= 3 {
+		inPit := pointInPolygon([2]float32{updateMsg.Pos.X, updateMsg.Pos.Z}, pitBoundary)
+		observePitVisit(carID, inPit, updateMsg, time.Now())
 	}
 }
 
@@ -1167,16 +1067,19 @@ func getTrackLength() int {
 // 生成的 SVG 同时写入 cache.path/live-track-maps，供 HTTP 端赛道地图使用。
 func loadPitBoundary(trackName, configName string) {
 	if trackName == "" || cfg.App.Server.CachePath == "" {
+		pitBoundary = nil
+		pitBoundaryLoadedFor = ""
 		return
 	}
 	key := trackName + "|" + configName
-	if pitBoundaryLoadedFor == key {
+	if pitBoundaryLoadedFor == key && len(pitBoundary) >= 3 {
 		return
 	}
 	pitBoundary = nil
+	pitBoundaryLoadedFor = ""
 	boundary, err := kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
 	if err != nil {
-		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
+		logger.Printf("生成/读取维修区边界失败(%s)，沿用原换胎分段方式: %v", key, err)
 		return
 	}
 	pitBoundary = boundary
@@ -1209,6 +1112,8 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 		logger.Printf("恢复会话日志失败: %v", err)
 		return
 	}
+	// 中途接入与新节一样需要地图/维修区边界，不能只在 NEW_SESSION 时加载。
+	loadPitBoundary(msg.Track, msg.TrackConfig)
 	recoveryReady = true
 }
 

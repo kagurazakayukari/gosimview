@@ -187,12 +187,22 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 		if m := tyreRegex.FindStringSubmatch(line); len(m) == 3 {
 			name := strings.TrimSpace(m[1])
 			old := userTyres[name]
+			slot := slotForLogName(name)
+			if !replay && slot >= 0 && len(pitBoundary) < 3 && old != "" && old != m[2] {
+				// 用户指定无边界时沿用原方式：已知配方发生变化才结束段。
+				// 日志回放不触发写库；有边界时仅由区内停车处理，避免重复切段。
+				if err := finishStint(slot); err != nil {
+					return
+				}
+				globalConnections[slot].StintStartedAt = time.Now()
+				// collectCarUpdates 已持有 lapDataMutex，不在此递归加锁。
+				delete(carLapData, slot)
+				delete(lapTelemetryReady, slot)
+			}
 			userTyres[name] = m[2]
 			userStintIDs[name]++
-			slot := slotForLogName(name)
 			if slot >= 0 {
 				if !replay {
-					// 原版 v0.4：一个 stint 从加入服务器到断开；换胎只记 session feed，不切分 stint。
 					globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 16, Detail: feedDetail(slot, map[string]interface{}{"old_t": old, "new_t": m[2]}), Time: time.Now()})
 				}
 				if lap := currentLap(slot); lap != nil {

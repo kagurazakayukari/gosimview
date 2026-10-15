@@ -18,8 +18,8 @@ var recoveredLogSessionID int64
 var restoredSessionLogSize int64
 
 // restoreConnectionsFromSessionLog 恢复原 handleSessionInfoMessage 的启动职责。
-// 玩家状态行确定姓名，再与该文件的连接记录匹配；槽位取连接记录中的
-// DRIVER ACCEPTED FOR CAR，不能用状态行的编号或 SesID 代替。
+// 连接记录按文件顺序恢复各槽位最后一位车手；槽位取 DRIVER ACCEPTED FOR CAR，
+// 不能用状态行的编号或 SesID 代替。无完圈的已连接车手同样需要恢复。
 // 本函数由已持有 stateMutex 的会话处理器调用。
 // 当前节成绩仅恢复到内存，不把历史圈或 feed 再次写入数据库。
 func restoreConnectionsFromSessionLog() error {
@@ -35,46 +35,50 @@ func restoreConnectionsFromSessionLog() error {
 	// Windows 日志为 CRLF；统一换行后沿用原版正则和姓名匹配规则。
 	content := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(content, "\n")
-	connections := connectionRegex.FindAllStringSubmatch(content, -1)
-	for lineIndex, line := range lines {
-		player := playerLineRegex.FindStringSubmatch(line)
-		if len(player) < 8 {
+	// 同一份日志、同一节的重复探活仅消费新增行，不能用历史快照覆盖实时状态。
+	newSnapshot := restoredSessionLogPath != path || int64(len(data)) < restoredSessionLogSize
+	if !newSnapshot && globalSession != nil && recoveredLogSessionID == globalSession.ID {
+		collectCarUpdates()
+		return nil
+	}
+	connections := connectionRegex.FindAllStringSubmatchIndex(content, -1)
+	latestConnections := make(map[int][]int)
+	for _, indices := range connections {
+		slotText := content[indices[10]:indices[11]]
+		slot, err := strconv.Atoi(slotText)
+		if err != nil {
+			logger.Printf("日志中的车辆槽位无效: %s", slotText)
 			continue
 		}
-		name := strings.TrimSpace(player[2])
+		latestConnections[slot] = indices
+	}
+	for slot, indices := range latestConnections {
+		name := strings.TrimSpace(content[indices[4]:indices[5]])
 		if name == "" {
 			continue
 		}
-		// 与原版相同：按文件顺序选中第一条姓名一致的连接记录。
-		for _, match := range connections {
-			if len(match) < 6 || strings.TrimSpace(match[2]) != name {
-				continue
-			}
-			slot, err := strconv.Atoi(match[5])
-			if err != nil {
-				logger.Printf("日志中的车辆槽位无效: %s", match[5])
-				continue
-			}
-			entry := globalEntryList[slot]
-			conn := &ConnectionInfo{
-				CarID: slot, DriverName: name, DriverGUID: match[4],
-				CarModel: cleanRequestedCarModel(match[3]), CarSkin: entry.Skin,
-				CarName: entry.Name, ConnectionStatus: 0, TrackStatus: 3,
-				TrackStatusLastChangedTime: time.Now(), LastConnectionLine: lineIndex + 1,
-			}
-			initializeConnectionIdentity(conn)
-			if conn.UserID == 0 || conn.CarDBID == 0 {
-				logger.Printf("无法从日志解析车手身份: %s", name)
-				break
-			}
-			globalConnections[slot] = conn
-			break
+		entry := globalEntryList[slot]
+		conn := &ConnectionInfo{
+			CarID: slot, DriverName: name, DriverGUID: content[indices[8]:indices[9]],
+			CarModel: cleanRequestedCarModel(content[indices[6]:indices[7]]), CarSkin: entry.Skin,
+			CarName: entry.Name, ConnectionStatus: 0, TrackStatus: 3,
+			TrackStatusLastChangedTime: time.Now(), LastConnectionLine: strings.Count(content[:indices[0]], "\n"),
 		}
+		// 没有日志时间戳，不编造 ConnectedAt；只恢复可确认的最后连接状态。
+		for _, line := range strings.Split(content[indices[1]:], "\n") {
+			if match := disconnectRegex.FindStringSubmatch(line); len(match) == 2 && strings.TrimSpace(match[1]) == name {
+				conn.ConnectionStatus = 2
+			}
+		}
+		initializeConnectionIdentity(conn)
+		if conn.UserID == 0 || conn.CarDBID == 0 {
+			return fmt.Errorf("无法从日志解析车手身份: %s", name)
+		}
+		globalConnections[slot] = conn
 	}
 	latestFile = file
 	// 原 collectCarUpdates 按最后一条 SESSION: 定位当前节。
 	// 先回放该节已生成的成绩，再接着处理新增字节。
-	newSnapshot := restoredSessionLogPath != path || int64(len(data)) < restoredSessionLogSize
 	if globalSession != nil && globalSession.ID > 0 && (newSnapshot || recoveredLogSessionID != globalSession.ID) {
 		start := 0
 		for i, line := range lines {
