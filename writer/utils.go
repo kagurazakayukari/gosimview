@@ -98,6 +98,8 @@ func findLatestSessionLogFile(logDir string) (os.DirEntry, error) {
 	return latestFile, nil
 }
 
+var writerLogFile *os.File
+
 // initLogger 初始化日志系统
 func initLogger() {
 	logDir := "logs"
@@ -114,6 +116,7 @@ func initLogger() {
 		log.Fatalf("打开日志文件失败: %v", err)
 	}
 
+	writerLogFile = logFile
 	// 创建多输出写入器，同时输出到文件和控制台
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 
