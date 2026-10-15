@@ -430,8 +430,6 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		return
 	}
 	collectCarUpdates()
-	// 完圈事件是采样边界；先消费本圈，即使后面被历史基线或无效圈过滤。
-	samples := completeLapSamples(int(lapMsg.CarID))
 	var completedCar *udp.LapCompletedCar
 	for _, car := range lapMsg.Cars {
 		if car != nil && car.CarID == lapMsg.CarID {
@@ -443,6 +441,12 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 		logger.Printf("完成圈消息缺少车辆 %d", lapMsg.CarID)
 		return
 	}
+	// 排行榜 Laps 不一定随无效圈增长，不能据此丢弃新的完圈事件。
+	if !acceptLapCompletion(lapMsg, *completedCar, time.Now()) {
+		return
+	}
+	// 重复包不能消费当前新圈的样本；通过完圈判定后才切分采集缓存。
+	samples := completeLapSamples(int(lapMsg.CarID))
 	// 当前抓地力来自完成圈报文，不反推接入前的初始抓地力。
 	grip := float64(lapMsg.GripLevel)
 	if !math.IsNaN(grip) && !math.IsInf(grip, 0) && grip >= 0 && grip <= 1 {
@@ -474,17 +478,21 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if lap.Tyre == "" {
 		lap.Tyre = userTyres[conn.DriverName]
 	}
-	// 接入前的圈数只是基线，不把周期消息中的旧完成圈再次写入。
-	if score := recoveredScores[slot]; score != nil && int(lap.Laps) <= score.Laps {
-		return
-	}
+	// 历史圈只由日志恢复到内存；恢复完成后收到的完圈事件属于新采集。
 	previous := carLapDataMap[slot]
-	if len(previous) > 0 && previous[len(previous)-1].Laps >= lap.Laps {
-		return
-	}
 	stint := activeStints[slot]
-	if stint == nil || stint.UserID != conn.UserID || stint.IsFinished != 0 {
-		stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: lap.Timestamp}
+	if stint != nil && (stint.UserID != conn.UserID || stint.CarID != conn.CarDBID) {
+		if err := finishStint(slot); err != nil {
+			return
+		}
+		stint = nil
+	}
+	if stint == nil || stint.IsFinished != 0 {
+		startedAt := connStintStartedAt(conn, lap.Timestamp)
+		if startedAt.IsZero() {
+			return
+		}
+		stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
 		if globalEvent.TeamEvent == 1 {
 			for _, member := range globalTeamMembers {
 				if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
@@ -545,6 +553,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if err != nil {
 		logger.Printf("更新 stint 失败: %v", err)
 	}
+	lastLapCompletions[slot] = lapCompletion{lapMsg.LapTime, lapMsg.Cuts, completedCar.Laps, completedCar.Completed, lap.Timestamp}
 	carLapDataMap[slot] = append(previous, lap)
 	globalSession.LastActivity = lap.Timestamp
 	globalDBWriter.UpdateSessionGrip(globalSession.ID, globalSession.CurrentGrip)
@@ -619,6 +628,10 @@ type ConnectionInfo struct {
 	PitEntryTime               time.Time  // 进入维修区的时间
 	LastMoveTime               time.Time  // 最后移动的时间
 	PitVisits                  []PitVisit // 维修区访问历史记录
+
+	// ConnectedAt 记录本段连接的建立时刻；stint 的 started_at 取它，而不是第一次完圈时间。
+	// 由 handleNewConnectionMessage 写入；日志恢复出的连接没有该时刻，为空。
+	ConnectedAt time.Time
 }
 
 func getLapTimeByID(lapID int) float64 {
@@ -682,11 +695,15 @@ func initializeConnectionIdentity(conn *ConnectionInfo) {
 func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	*last = time.Now()
 	slot := int(msg.CarID)
+	// 旧段未成功结束前不覆盖连接与 stint，避免同槽位出现两条未收尾的 stint。
+	if err := finishStint(slot); err != nil {
+		logger.Printf("新连接前结束旧 stint 失败，保留旧连接等待重试(slot=%d): %v", slot, err)
+		return
+	}
 	previous := globalConnections[slot]
 	resetLapSamples(slot)
 	delete(latestCarUpdates, msg.CarID)
-	finishStint(slot)
-	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
+	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectedAt: time.Now(), ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
 	initializeConnectionIdentity(conn)
 	if globalSession != nil && globalSession.ID > 0 && conn.UserID > 0 {
@@ -722,11 +739,13 @@ func handleEndSessionMessage(msg udp.EndSession, last *time.Time) {
 	} else {
 		importResultLaps(data)
 	}
-	finishCurrentSession()
+	if err := finishCurrentSession(); err != nil {
+		logger.Printf("结束会话失败，保留当前采集状态: %v", err)
+	}
 }
 
 func importResultLaps(data *SessionData) {
-	seen := make(map[[3]int]int)
+	seen := make(map[[4]int]int)
 	for _, lap := range data.Laps {
 		slot := lap.CarId
 		conn := globalConnections[slot]
@@ -757,23 +776,18 @@ func importResultLaps(data *SessionData) {
 		if lapTime <= 0 {
 			continue
 		}
-		stint := activeStints[slot]
-		if stint != nil && stint.UserID != userID {
-			stint = nil
-		}
-		if stint == nil {
-			for i := len(sessionStints) - 1; i >= 0; i-- {
-				v := sessionStints[i]
-				if v.GameCarID == slot && v.UserID == userID {
-					stint = v
-					break
-				}
-			}
-		}
-		if stint == nil {
+		if lap.Timestamp <= 0 {
+			logger.Printf("成绩圈缺少 Timestamp，无法归属 stint，跳过(slot=%d, lap=%d)", slot, lapTime)
 			continue
 		}
-		key := [3]int{slot, userID, lapTime}
+		when := globalSession.StartTime.Add(time.Duration(lap.Timestamp) * time.Millisecond)
+		// 按 session_stint 的 started_at/finished_at 归属，不用无法证实的 JSON StintID。
+		stint := stintForResultLap(slot, userID, when)
+		if stint == nil {
+			logger.Printf("成绩圈无法唯一归属 stint，跳过(slot=%d, user=%d, when=%s, lap=%d)", slot, userID, when.Format(time.RFC3339Nano), lapTime)
+			continue
+		}
+		key := [4]int{slot, userID, lapTime, stint.ID}
 		seen[key]++
 		exists := false
 		if !globalDBWriter.SimulateSQL {
@@ -795,7 +809,7 @@ func importResultLaps(data *SessionData) {
 		if exists {
 			continue
 		}
-		record := &StintLap{StintID: stint.ID, Sector1: lap.Sectors[0], Sector2: lap.Sectors[1], Sector3: lap.Sectors[2], Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lapTime, Cuts: lap.Cuts, AvgSpeed: int(float64(getTrackLength()) * 3600 / float64(lapTime)), FinishedAt: globalSession.StartTime.Add(time.Duration(lap.Timestamp) * time.Millisecond)}
+		record := &StintLap{StintID: stint.ID, Sector1: lap.Sectors[0], Sector2: lap.Sectors[1], Sector3: lap.Sectors[2], Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lapTime, Cuts: lap.Cuts, AvgSpeed: int(float64(getTrackLength()) * 3600 / float64(lapTime)), FinishedAt: when}
 		id, err := globalDBWriter.InsertStintLap(record)
 		if err != nil {
 			logger.Printf("补成绩圈失败: %v", err)
@@ -878,7 +892,9 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 		return nil
 	}
 	if newSession {
-		finishCurrentSession()
+		if err := finishCurrentSession(); err != nil {
+			return err
+		}
 	}
 	var session *Session
 	var err error
@@ -912,6 +928,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	userStintIDs = make(map[string]int)
 	carLapData = make(map[int][]udp.CarUpdate)
 	lapTelemetryReady = make(map[int]bool)
+	lastLapCompletions = make(map[int]lapCompletion)
 	activeStints = make(map[int]*SessionStint)
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	bestLapTimes = make(map[int]int)
@@ -937,34 +954,27 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	return nil
 }
 
-func finishStint(slot int) {
-	stint := activeStints[slot]
-	if stint == nil || stint.IsFinished != 0 {
-		return
-	}
-	stint.IsFinished = 1
-	stint.FinishedAt = time.Now()
-	if _, err := globalDBWriter.executeSQL("UPDATE session_stint SET is_finished=1,finished_at=? WHERE session_stint_id=?", stint.FinishedAt, stint.ID); err != nil {
-		logger.Printf("结束 stint 失败: %v", err)
-	}
-	delete(activeStints, slot)
-}
-
-func finishCurrentSession() {
+func finishCurrentSession() error {
 	if globalSession == nil || globalSession.ID == 0 || globalSession.IsFinished != 0 {
-		return
+		return nil
 	}
 	for slot := range activeStints {
-		finishStint(slot)
+		if err := finishStint(slot); err != nil {
+			return err
+		}
 	}
-	globalSession.IsFinished = 1
-	globalSession.FinishTime = time.Now()
-	globalSession.LastActivity = time.Now()
-	globalSession.ElapsedMs = int(time.Since(globalSession.StartTime).Milliseconds())
-	if err := globalDBWriter.UpdateSession(globalSession); err != nil {
+	finished := *globalSession
+	finished.IsFinished = 1
+	finished.FinishTime = time.Now()
+	finished.LastActivity = finished.FinishTime
+	finished.ElapsedMs = int(time.Since(finished.StartTime).Milliseconds())
+	if err := globalDBWriter.UpdateSession(&finished); err != nil {
 		logger.Printf("结束会话失败: %v", err)
+		return err
 	}
+	*globalSession = finished
 	dataCollectionEnabled = false
+	return nil
 }
 
 // feed 的 car_id 是数据库车辆 ID，槽位只用于寻找当前身份。
@@ -990,11 +1000,15 @@ func feedDetail(slot int, detail map[string]interface{}) string {
 func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 	*last = time.Now()
 	slot := int(msg.CarID)
+	// 断开必须先把旧 stint 写库收尾；失败则保留原状态，不做“先删内存/先覆盖连接”。
+	if err := finishStint(slot); err != nil {
+		logger.Printf("断开时结束 stint 失败，保留连接状态等待重试(slot=%d): %v", slot, err)
+		return
+	}
 	resetLapSamples(slot)
 	if globalSession != nil && globalSession.ID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
 	}
-	finishStint(slot)
 	if conn := globalConnections[slot]; conn != nil {
 		conn.ConnectionStatus = 2
 	}

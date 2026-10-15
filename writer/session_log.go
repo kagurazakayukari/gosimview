@@ -192,9 +192,7 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 			slot := slotForLogName(name)
 			if slot >= 0 {
 				if !replay {
-					if old != "" && old != m[2] {
-						finishStint(slot)
-					}
+					// 原版 v0.4：一个 stint 从加入服务器到断开；换胎只记 session feed，不切分 stint。
 					globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 16, Detail: feedDetail(slot, map[string]interface{}{"old_t": old, "new_t": m[2]}), Time: time.Now()})
 				}
 				if lap := currentLap(slot); lap != nil {

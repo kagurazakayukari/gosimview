@@ -4,7 +4,38 @@
 
 package main
 
-import "gosimview/udp"
+import (
+	"time"
+
+	"gosimview/udp"
+)
+
+// 完圈报文没有唯一序号。仅拦截相同内容在一个圈时之内的重复报文；
+// 下一次跑出相同圈时和相同官方圈数（例如连续无效圈）仍能正常保存。
+// 这里不使用接入前的排行榜圈数作为新事件过滤条件。
+type lapCompletion struct {
+	Time       uint32
+	Cuts       uint8
+	Laps       uint16
+	Completed  uint8
+	ReceivedAt time.Time
+}
+
+var lastLapCompletions = make(map[int]lapCompletion)
+
+func acceptLapCompletion(msg udp.LapCompleted, car udp.LapCompletedCar, now time.Time) bool {
+	if msg.LapTime == 0 {
+		return false
+	}
+	slot := int(msg.CarID)
+	previous, exists := lastLapCompletions[slot]
+	if exists && previous.Time == msg.LapTime && previous.Cuts == msg.Cuts &&
+		previous.Laps == car.Laps && previous.Completed == car.Completed &&
+		now.Sub(previous.ReceivedAt) < time.Duration(msg.LapTime)*time.Millisecond {
+		return false
+	}
+	return true
+}
 
 // collectLapSample 只缓存完圈之后的新圈；最新车辆状态另由 Live Timing 使用。
 // 调用者持有 stateMutex，避免会话切换和车辆重连混入旧样本。
@@ -45,4 +76,5 @@ func resetLapSamples(slot int) {
 	defer lapDataMutex.Unlock()
 	delete(carLapData, slot)
 	delete(lapTelemetryReady, slot)
+	delete(lastLapCompletions, slot)
 }
