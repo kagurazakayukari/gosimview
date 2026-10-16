@@ -47,8 +47,8 @@ func connStintStartedAt(conn *ConnectionInfo, observedAt time.Time) time.Time {
 // 按真实连接或本次起步时间建立区间，不把进站新段退回旧连接时间。
 func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 	conn := globalConnections[slot]
-	if !sessionCollecting() || conn == nil || conn.UserID == 0 || conn.CarDBID == 0 {
-		return nil, fmt.Errorf("车辆 %d 身份未恢复或当前会话已停止采集", slot)
+	if conn == nil || conn.UserID == 0 || conn.CarDBID == 0 || globalSession == nil || globalSession.ID == 0 {
+		return nil, fmt.Errorf("车辆 %d 身份或当前会话尚未恢复", slot)
 	}
 	stint := activeStints[slot]
 	if stint != nil && (stint.UserID != conn.UserID || stint.CarID != conn.CarDBID) {

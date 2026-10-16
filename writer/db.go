@@ -31,7 +31,6 @@ import (
 type DBWriter struct {
 	DB             *sql.DB
 	Logger         *log.Logger
-	LogFile        *os.File // 日志文件句柄，Close 时一并关闭
 	SimulateSQL    bool
 	EventID        int
 	SessionID      int64
@@ -81,7 +80,6 @@ func NewDBWriter(dsn string, simulate bool) (*DBWriter, error) {
 	dbWriter := &DBWriter{
 		DB:          db,
 		Logger:      log.New(logFile, "[DBWriter] ", log.Ldate|log.Ltime|log.Lshortfile),
-		LogFile:     logFile,
 		SimulateSQL: simulate,
 	}
 
@@ -252,11 +250,8 @@ func (w *DBWriter) isNewerVersion(fileVersion, dbVersion string) bool {
 	return false
 }
 
-// Close 关闭数据库连接与日志文件
+// Close 关闭数据库连接
 func (w *DBWriter) Close() error {
-	if w.LogFile != nil {
-		w.LogFile.Close()
-	}
 	return w.DB.Close()
 }
 
@@ -293,16 +288,29 @@ func (w *DBWriter) UpdateSessionStint(ss *SessionStint) (int64, error) {
 
 // executeSQL 执行SQL语句并记录日志
 func (w *DBWriter) executeSQL(query string, args ...interface{}) (sql.Result, error) {
+	// 记录SQL语句
+	w.Logger.Printf("执行SQL: %s, 参数: %v", query, args)
+
 	if w.SimulateSQL {
-		// 记录SQL语句后跳过实际执行：不写库，返回稳定且非零的模拟ID（下游会直接取 LastInsertId）
-		w.Logger.Printf("执行SQL: %s, 参数: %v", query, args)
+		// 模拟SQL执行：不写库，返回稳定且非零的模拟ID（下游会直接取 LastInsertId）
 		id := nextSimulatedID()
 		w.Logger.Printf("SQL模拟模式：跳过实际执行，返回模拟ID %d", id)
 		return simResult{id: id}, nil
 	}
 
-	// 真实执行与日志统一走 execOn（见 lap_persistence.go）
-	return w.execOn(w.DB, query, args...)
+	// 执行SQL语句
+	result, err := w.DB.Exec(query, args...)
+	if err != nil {
+		w.Logger.Printf("SQL执行失败: %v", err)
+		return nil, err
+	}
+
+	// 记录执行结果
+	affected, _ := result.RowsAffected()
+	lastID, _ := result.LastInsertId()
+	w.Logger.Printf("SQL执行成功，受影响行数: %d, 最后插入ID: %d", affected, lastID)
+
+	return result, nil
 }
 
 // LoadServerConfig 加载服务器配置
@@ -722,7 +730,9 @@ func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 
 // CreateStintLap 创建StintLap
 func (w *DBWriter) CreateStintLap(lap *StintLap) (int64, error) {
-	result, err := w.executeSQL(sqlInsertStintLap, lap.StintID, lap.Time, lap.Sector1, lap.Sector2, lap.Sector3, lap.Grip, lap.Tyre, lap.AvgSpeed, lap.MaxSpeed, lap.Cuts, lap.Crashes, lap.CarCrashes, lap.FinishedAt)
+	query := `INSERT INTO stint_lap (stint_id, time, sector_1, sector_2, sector_3, grip, tyre, avg_speed, max_speed, cuts, crashes, car_crashes, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	result, err := w.executeSQL(query, lap.StintID, lap.Time, lap.Sector1, lap.Sector2, lap.Sector3, lap.Grip, lap.Tyre, lap.AvgSpeed, lap.MaxSpeed, lap.Cuts, lap.Crashes, lap.CarCrashes, lap.FinishedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -740,7 +750,9 @@ func (w *DBWriter) CreateStintLap(lap *StintLap) (int64, error) {
 
 // CreateLapTelemetry 创建LapTelemetry
 func (w *DBWriter) CreateLapTelemetry(telemetry *LapTelemetry) (int64, error) {
-	result, err := w.executeSQL(sqlInsertLapTelemetry, telemetry.LapID, telemetry.Telemetry)
+	query := `INSERT INTO lap_telemetry (lap_id, telemetry) VALUES (?, ?)`
+
+	result, err := w.executeSQL(query, telemetry.LapID, telemetry.Telemetry)
 	if err != nil {
 		return 0, err
 	}
@@ -758,7 +770,9 @@ func (w *DBWriter) CreateLapTelemetry(telemetry *LapTelemetry) (int64, error) {
 
 // CreateSessionFeed 创建SessionFeed
 func (w *DBWriter) CreateSessionFeed(feed *SessionFeed) (int64, error) {
-	result, err := w.executeSQL(sqlInsertSessionFeed, feed.SessionID, feed.Type, feed.Detail, feed.Time)
+	query := `INSERT INTO session_feed (session_id, type, detail, time) VALUES (?, ?, ?, ?)`
+
+	result, err := w.executeSQL(query, feed.SessionID, feed.Type, feed.Detail, feed.Time)
 	if err != nil {
 		return 0, err
 	}
@@ -1130,16 +1144,9 @@ func (w *DBWriter) InsertStintLap(lap *StintLap) (int, error) {
 	return int(lapID), nil
 }
 
-// InsertSessionFeed 插入SessionFeed记录（包装CreateSessionFeed）。
-// detail 超过 session_feed 的列容量时：聊天消息按 Unicode 字符截短到合法 JSON，
-// 其它 detail 返回明确错误，不截断结构。
+// InsertSessionFeed 插入SessionFeed记录（包装CreateSessionFeed）
 func (w *DBWriter) InsertSessionFeed(feed *SessionFeed) error {
-	normalized, err := normalizeSessionFeed(feed)
-	if err != nil {
-		w.Logger.Printf("session_feed 校验失败: %v", err)
-		return err
-	}
-	_, err = w.CreateSessionFeed(normalized)
+	_, err := w.CreateSessionFeed(feed)
 	return err
 }
 
@@ -1383,20 +1390,8 @@ func (w *DBWriter) FindOrCreateTrackConfigID(trackConfig *TrackConfig) (int, err
 	query := "SELECT track_config_id FROM track_config WHERE track_name = ? AND config_name = ?"
 	err := w.DB.QueryRow(query, trackConfig.TrackName, trackConfig.ConfigName).Scan(&configID)
 	if err == nil {
-		// 配置已存在：必须先读回完整元数据（含 length）再补缓存。
-		// 只缓存调用方传入的 ID 会把 0 长度写进 globalTrackConfigs，
-		// 而 getTrackLength() 命中缓存就不再回库，avg_speed 与圈遥测头长度会全变 0。
-		existing, loadErr := w.GetTrackConfigByID(configID)
-		if loadErr != nil {
-			return 0, loadErr
-		}
-		trackConfig.ID = existing.ID
-		trackConfig.TrackName = existing.TrackName
-		trackConfig.ConfigName = existing.ConfigName
-		trackConfig.DisplayName = existing.DisplayName
-		trackConfig.Country = existing.Country
-		trackConfig.City = existing.City
-		trackConfig.Length = existing.Length
+		// 配置已存在，返回ID并补缓存
+		trackConfig.ID = configID
 		cacheTrackConfig(trackConfig)
 		return configID, nil
 	}
@@ -1679,7 +1674,8 @@ func (w *DBWriter) InsertSession(session *Session) (int64, error) {
 
 // InsertLapTelemetry 插入圈速遥测数据
 func (w *DBWriter) InsertLapTelemetry(lapID int, telemetry []byte) error {
-	_, err := w.executeSQL(sqlInsertLapTelemetry, lapID, telemetry)
+	query := "INSERT INTO lap_telemetry (lap_id, telemetry) VALUES (?, ?)"
+	_, err := w.executeSQL(query, lapID, telemetry)
 	if err != nil {
 		return fmt.Errorf("插入遥测数据失败: %v", err)
 	}

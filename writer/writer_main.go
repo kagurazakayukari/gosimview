@@ -7,7 +7,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -16,13 +15,11 @@ import (
 	"log"
 	"math"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"gosimview/config"
@@ -34,14 +31,16 @@ import (
 
 // 全局变量
 var (
-	logger         *log.Logger
-	fatalLogger    *log.Logger
-	cfg            *config.Config
-	globalDBWriter *DBWriter
-	globalEvent    *Event
-	globalSession  *Session
-	logDir         string
-	latestFile     os.DirEntry
+	logger              *log.Logger
+	fatalLogger         *log.Logger
+	cfg                 *config.Config
+	globalDBWriter      *DBWriter
+	globalEvent         *Event
+	globalSession       *Session
+	logDir              string
+	latestFile          os.DirEntry
+	receivedSessionInfo bool
+	receivedVersionInfo bool
 	// 新增的全局变量（预初始化，避免向 nil map 写入导致 panic）
 	globalUsers        = make(map[int]*User)
 	globalTeams        = make(map[int]*Team)
@@ -65,9 +64,6 @@ var (
 	dataCollectionEnabled bool = false
 	// 周期 UDP 在文件恢复完成后才进入当前采集状态。
 	recoveryReady bool
-	// 新节初始化失败时保留真实通知，重试时不能把旧节当作新节继续采集。
-	pendingNewSession *udp.SessionInfo
-	pendingSessionEnd bool
 	// 全局变量用于暂存车辆信息，带互斥锁保证并发安全
 	carLapDataMap = make(map[int][]CarLapData)
 	stintLapData  = make(map[int]map[int][]StintLap)
@@ -430,15 +426,10 @@ type TrackConfig struct {
 
 func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	if !sessionCollecting() {
+	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
 		return
 	}
-	if err := collectCarUpdates(); err != nil {
-		// 本次过线未被正常切分，不能把跨圈样本拼成下一圈的遥测。
-		resetLapSamples(int(lapMsg.CarID))
-		logger.Printf("完圈前读取日志失败，跳过本次写圈: %v", err)
-		return
-	}
+	collectCarUpdates()
 	var completedCar *udp.LapCompletedCar
 	for _, car := range lapMsg.Cars {
 		if car != nil && car.CarID == lapMsg.CarID {
@@ -460,8 +451,6 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	}
 	// 重复包不能消费当前新圈的样本；通过完圈判定后才切分采集缓存。
 	samples := completeLapSamples(int(lapMsg.CarID))
-	// 去重记录属于已观测的过线，即使本次写库失败也不能让重复包切走下一圈样本。
-	lastLapCompletions[int(lapMsg.CarID)] = lapCompletion{lapMsg.LapTime, lapMsg.Cuts, completedCar.Laps, completedCar.Completed, time.Now()}
 	// 当前抓地力来自完成圈报文，不反推接入前的初始抓地力。
 	grip := float64(lapMsg.GripLevel)
 	if !math.IsNaN(grip) && !math.IsInf(grip, 0) && grip >= 0 && grip <= 1 {
@@ -507,48 +496,43 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if lap.LapTime > 0 {
 		record.AvgSpeed = int(float64(getTrackLength()) * 3600 / float64(lap.LapTime))
 	}
-	// 先准备下一状态；单圈、统计、遥测和最快圈消息提交后才能发布到内存。
-	updated := *stint
-	updated.Laps++
-	updated.FinishedAt = lap.Timestamp
-	newBest := valid && (stint.BestLapID == 0 || lap.LapTime < bestLapTimes[stint.ID])
-	carClass := "N/A"
-	if car := globalCars[conn.CarDBID]; car != nil {
-		carClass = car.CarClass
+	lapID, err := globalDBWriter.InsertStintLap(record)
+	if err != nil {
+		logger.Printf("写入单圈失败: %v", err)
+		return
 	}
-	newClassBest := valid && (classBestTimes[carClass] == 0 || lap.LapTime < classBestTimes[carClass])
-	var feeds []*SessionFeed
-	var telemetry []byte
+	stint.Laps++
 	if valid {
-		updated.ValidLaps++
-		if newBest {
-			updated.BestLapID = -1 // 事务插入后替换成真实单圈 ID。
-			feeds = append(feeds, &SessionFeed{SessionID: globalSession.ID, Type: 4,
+		stint.ValidLaps++
+		if stint.BestLapID == 0 || lap.LapTime < bestLapTimes[stint.ID] {
+			bestLapTimes[stint.ID] = lap.LapTime
+			stint.BestLapID = lapID
+			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 4,
 				Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
 		}
-		if newClassBest {
-			feeds = append(feeds, &SessionFeed{SessionID: globalSession.ID, Type: 5,
-				Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
+		carClass := "N/A"
+		if car := globalCars[conn.CarDBID]; car != nil {
+			carClass = car.CarClass
+		}
+		if classBestTimes[carClass] == 0 || lap.LapTime < classBestTimes[carClass] {
+			classBestTimes[carClass] = lap.LapTime
+			globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 5, Detail: feedDetail(slot, map[string]interface{}{"lap_time": lap.LapTime}), Time: lap.Timestamp})
 		}
 		if cfg.ACServer.Event.LapTelemetryEnable && len(samples) > 0 {
-			telemetry, err = generateLapTelemetry(slot, int32(getTrackLength()), samples)
+			data, err := generateLapTelemetry(slot, int32(getTrackLength()), samples)
 			if err != nil {
-				logger.Printf("生成遥测失败，跳过本圈写入: %v", err)
-				return
+				logger.Printf("生成遥测失败: %v", err)
+			} else if err := globalDBWriter.InsertLapTelemetry(lapID, data); err != nil {
+				logger.Printf("写遥测失败: %v", err)
 			}
 		}
 	}
-	if _, err := globalDBWriter.PersistLap(record, &updated, telemetry, feeds, true); err != nil {
-		logger.Printf("提交单圈失败，未更新圈数及最快圈: %v", err)
-		return
+	_, err = globalDBWriter.executeSQL("UPDATE session_stint SET laps=?, valid_laps=?, best_lap_id=?, finished_at=? WHERE session_stint_id=?",
+		stint.Laps, stint.ValidLaps, nullableLapID(stint.BestLapID), lap.Timestamp, stint.ID)
+	if err != nil {
+		logger.Printf("更新 stint 失败: %v", err)
 	}
-	*stint = updated
-	if newBest {
-		bestLapTimes[stint.ID] = lap.LapTime
-	}
-	if newClassBest {
-		classBestTimes[carClass] = lap.LapTime
-	}
+	lastLapCompletions[slot] = lapCompletion{lapMsg.LapTime, lapMsg.Cuts, completedCar.Laps, completedCar.Completed, lap.Timestamp}
 	carLapDataMap[slot] = append(previous, lap)
 	globalSession.LastActivity = lap.Timestamp
 	globalDBWriter.UpdateSessionGrip(globalSession.ID, globalSession.CurrentGrip)
@@ -631,15 +615,26 @@ type ConnectionInfo struct {
 	StintStartedAt time.Time
 }
 
-func getLapTimeByID(lapID int) (int, error) {
-	var lapTime sql.NullInt64
-	if err := globalDBWriter.DB.QueryRow("SELECT time FROM stint_lap WHERE stint_lap_id = ?", lapID).Scan(&lapTime); err != nil {
-		return 0, err
+func getLapTimeByID(lapID int) float64 {
+	if globalDBWriter.SimulateSQL {
+		for _, values := range carLapDataMap {
+			for _, v := range values {
+				if v.LapTime > 0 {
+					return float64(v.LapTime)
+				}
+			}
+		}
+		return math.MaxFloat64
 	}
-	if !lapTime.Valid || lapTime.Int64 <= 0 {
-		return 0, fmt.Errorf("最快圈 %d 缺少有效圈时", lapID)
+	var lapTime sql.NullFloat64
+	err := globalDBWriter.DB.QueryRow("SELECT time FROM stint_lap WHERE stint_lap_id = ?", lapID).Scan(&lapTime)
+	if err != nil {
+		return math.MaxFloat64 // 返回最大浮点数确保当前圈速成为最佳圈
 	}
-	return int(lapTime.Int64), nil
+	if !lapTime.Valid {
+		return math.MaxFloat64
+	}
+	return lapTime.Float64
 }
 
 // 身份查询只在车辆接入时执行；广播只使用已解析的数据库 ID。
@@ -693,7 +688,7 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectedAt: time.Now(), ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
 	initializeConnectionIdentity(conn)
-	if sessionCollecting() && conn.UserID > 0 {
+	if globalSession != nil && globalSession.ID > 0 && conn.UserID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 2, Detail: feedDetail(slot, nil), Time: time.Now()})
 		if previous != nil && conn.TeamID > 0 && previous.UserID > 0 && previous.UserID != conn.UserID {
 			data, _ := json.Marshal(map[string]interface{}{"team_id_1": conn.TeamID, "user_id_1": previous.UserID, "user_id_2": conn.UserID})
@@ -704,7 +699,7 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 
 func handleChatMessage(msg udp.Chat, last *time.Time) {
 	*last = time.Now()
-	if !cfg.App.Live.SessionFeedShowChat || !sessionCollecting() {
+	if !cfg.App.Live.SessionFeedShowChat || globalSession == nil || globalSession.ID == 0 {
 		return
 	}
 	conn := globalConnections[int(msg.CarID)]
@@ -716,11 +711,9 @@ func handleChatMessage(msg udp.Chat, last *time.Time) {
 
 func handleEndSessionMessage(msg udp.EndSession, last *time.Time) {
 	*last = time.Now()
-	if !sessionCollecting() {
+	if globalSession == nil || globalSession.ID == 0 {
 		return
 	}
-	// 收到真实结束通知即关闭持久化入口；收尾失败由探活重试，不能另开旧节 stint。
-	pendingSessionEnd = true
 	// 成绩 JSON 按槽位和 GUID 归属补充，绝不把全场圈写入每辆车。
 	data, err := readSessionDataFromJSON(filepath.Join(cfg.Game.Path, string(msg)))
 	if err != nil {
@@ -799,23 +792,20 @@ func importResultLaps(data *SessionData) {
 			continue
 		}
 		record := &StintLap{StintID: stint.ID, Sector1: lap.Sectors[0], Sector2: lap.Sectors[1], Sector3: lap.Sectors[2], Grip: globalSession.CurrentGrip, Tyre: lap.Tyre, Time: lapTime, Cuts: lap.Cuts, AvgSpeed: int(float64(getTrackLength()) * 3600 / float64(lapTime)), FinishedAt: when}
-		updated := *stint
-		updated.Laps++
-		newBest := lap.Cuts == 0 && (stint.BestLapID == 0 || lapTime < bestLapTimes[stint.ID])
-		if lap.Cuts == 0 {
-			updated.ValidLaps++
-			if newBest {
-				updated.BestLapID = -1
-			}
-		}
-		if _, err := globalDBWriter.PersistLap(record, &updated, nil, nil, false); err != nil {
+		id, err := globalDBWriter.InsertStintLap(record)
+		if err != nil {
 			logger.Printf("补成绩圈失败: %v", err)
 			continue
 		}
-		*stint = updated
-		if newBest {
-			bestLapTimes[stint.ID] = lapTime
+		stint.Laps++
+		if lap.Cuts == 0 {
+			stint.ValidLaps++
+			if stint.BestLapID == 0 || lapTime < bestLapTimes[stint.ID] {
+				stint.BestLapID = id
+				bestLapTimes[stint.ID] = lapTime
+			}
 		}
+		globalDBWriter.executeSQL("UPDATE session_stint SET laps=?,valid_laps=?,best_lap_id=? WHERE session_stint_id=?", stint.Laps, stint.ValidLaps, nullableLapID(stint.BestLapID), stint.ID)
 	}
 }
 
@@ -823,12 +813,10 @@ func importResultLaps(data *SessionData) {
 func handleNewSessionMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
 	recoveryReady = false
-	pendingNewSession = &msg
 	if err := initializeSession(msg, true); err != nil {
 		logger.Printf("新会话初始化失败: %v", err)
 		return
 	}
-	pendingNewSession = nil
 	// 新节由服务器主动通知；ini 和会话初始化成功后进入新节采集。
 	recoveryReady = true
 }
@@ -950,15 +938,8 @@ func initializeSession(msg udp.SessionInfo, newSession bool) error {
 	return nil
 }
 
-// sessionCollecting 只约束持久化；实时车辆状态可在结束后继续刷新。
-// 调用者持有 stateMutex。
-func sessionCollecting() bool {
-	return recoveryReady && dataCollectionEnabled && !pendingSessionEnd && globalSession != nil && globalSession.ID > 0 && globalSession.IsFinished == 0
-}
-
 func finishCurrentSession() error {
 	if globalSession == nil || globalSession.ID == 0 || globalSession.IsFinished != 0 {
-		pendingSessionEnd = false
 		return nil
 	}
 	for slot := range activeStints {
@@ -976,12 +957,7 @@ func finishCurrentSession() error {
 		return err
 	}
 	*globalSession = finished
-	pendingSessionEnd = false
 	dataCollectionEnabled = false
-	lapDataMutex.Lock()
-	carLapData = make(map[int][]udp.CarUpdate)
-	lapTelemetryReady = make(map[int]bool)
-	lapDataMutex.Unlock()
 	return nil
 }
 
@@ -1015,7 +991,7 @@ func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 	}
 	resetLapSamples(slot)
 	delete(pitObservations, slot)
-	if sessionCollecting() {
+	if globalSession != nil && globalSession.ID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
 	}
 	if conn := globalConnections[slot]; conn != nil {
@@ -1025,7 +1001,7 @@ func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 
 func handleCollisionWithCarMessage(msg udp.CollisionWithCar, last *time.Time) {
 	*last = time.Now()
-	if !sessionCollecting() {
+	if globalSession == nil || globalSession.ID == 0 {
 		return
 	}
 	a, b := globalConnections[int(msg.CarID)], globalConnections[int(msg.OtherCarID)]
@@ -1045,7 +1021,7 @@ func handleCollisionWithCarMessage(msg udp.CollisionWithCar, last *time.Time) {
 
 func handleCollisionWithEnvMessage(msg udp.CollisionWithEnvironment, last *time.Time) {
 	*last = time.Now()
-	if !sessionCollecting() {
+	if globalSession == nil || globalSession.ID == 0 {
 		return
 	}
 	globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 1, Detail: feedDetail(int(msg.CarID), map[string]interface{}{"speed": int(msg.ImpactSpeed), "nsp": latestCarUpdates[msg.CarID].NormalisedSplinePos}), Time: time.Now()})
@@ -1057,19 +1033,14 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
 		return
 	}
-	// 实时状态由外层 stateMutex 保护，和持久化遥测闸门无关。
-	latestCarUpdates[updateMsg.CarID] = updateMsg
-	if !sessionCollecting() {
-		return
-	}
 	if time.Since(lastLogPoll) >= time.Second {
+		collectCarUpdates()
 		lastLogPoll = time.Now()
-		if err := collectCarUpdates(); err != nil {
-			logger.Printf("读取增量日志失败，保留游标待重试: %v", err)
-			return
-		}
 	}
 	carID := int(updateMsg.CarID)
+
+	// 实时状态由外层 stateMutex 保护，和持久化遥测闸门无关。
+	latestCarUpdates[updateMsg.CarID] = updateMsg
 	collectLapSample(updateMsg)
 
 	if len(pitBoundary) >= 3 {
@@ -1126,17 +1097,7 @@ var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (.*?) \[[^\]]*\
 
 func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
-	if pendingNewSession != nil {
-		handleNewSessionMessage(*pendingNewSession, last)
-		return
-	}
 	recoveryReady = false
-	if pendingSessionEnd {
-		if err := finishCurrentSession(); err != nil {
-			logger.Printf("重试结束会话失败: %v", err)
-			return
-		}
-	}
 	// 原 SESSION_INFO 只更新 event、恢复已有车辆，不创建 session 或清空采集状态。
 	if err := updateEventFromSessionInfo(msg); err != nil {
 		logger.Printf("更新会话事件失败: %v", err)
@@ -1205,18 +1166,22 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 			if versionMsg, ok := msg.(udp.Version); ok {
 				logger.Printf("AC服务器版本信息: %v", versionMsg)
 				handleVersionMessage(versionMsg, lastDataTime)
-				select {
-				case versionInfoChan <- struct{}{}:
-				default:
+				if !receivedVersionInfo {
+					select {
+					case versionInfoChan <- struct{}{}:
+					default:
+					}
 				}
 			}
 		case udp.EventNewSession:
 			if sessionMsg, ok := msg.(udp.SessionInfo); ok {
 				logger.Printf("新比赛节开始: %+v", sessionMsg)
 				handleNewSessionMessage(sessionMsg, lastDataTime)
-				select {
-				case sessionInfoChan <- struct{}{}:
-				default:
+				if !receivedSessionInfo {
+					select {
+					case sessionInfoChan <- struct{}{}:
+					default:
+					}
 				}
 			}
 		case udp.EventEndSession:
@@ -1271,9 +1236,11 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 			if sessionMsg, ok := msg.(udp.SessionInfo); ok {
 				//logger.Printf("比赛节信息事件: %+v", sessionMsg)
 				handleSessionInfoMessage(sessionMsg, lastDataTime)
-				select {
-				case sessionInfoChan <- struct{}{}:
-				default:
+				if !receivedSessionInfo {
+					select {
+					case sessionInfoChan <- struct{}{}:
+					default:
+					}
 				}
 			}
 		case udp.EventError:
@@ -1292,9 +1259,9 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 	return client, nil
 }
 
-func collectCarUpdates() error {
+func collectCarUpdates() {
 	if !dataCollectionEnabled {
-		return nil
+		return
 	}
 	lapDataMutex.Lock()
 	defer lapDataMutex.Unlock()
@@ -1305,13 +1272,15 @@ func collectCarUpdates() error {
 		filePath := filepath.Join(logDir, latestFile.Name())
 		file, err := os.Open(filePath)
 		if err != nil {
-			return fmt.Errorf("打开日志文件: %w", err)
+			logger.Printf("无法打开日志文件: %v", err)
+			return
 		}
 		defer file.Close()
 
 		fileInfo, err := file.Stat()
 		if err != nil {
-			return fmt.Errorf("获取日志文件信息: %w", err)
+			logger.Printf("无法获取文件信息: %v", err)
+			return
 		}
 
 		// 检查文件是否已轮换（大小变小表示可能轮换或截断）
@@ -1326,54 +1295,37 @@ func collectCarUpdates() error {
 
 		// 定位到上次读取位置
 		if _, err := file.Seek(lastFileSize, io.SeekStart); err != nil {
-			return fmt.Errorf("定位日志文件: %w", err)
+			logger.Printf("无法定位文件: %v", err)
+			return
 		}
 
 		// 读取新增内容
 		newContent := make([]byte, currentFileSize-lastFileSize)
-		if _, err := io.ReadFull(file, newContent); err != nil {
-			return fmt.Errorf("读取日志新增内容: %w", err)
+		if _, err := io.ReadFull(file, newContent); err != nil && err != io.EOF {
+			logger.Printf("无法读取文件内容: %v", err)
+			return
 		}
 
-		// partialLine 已包含上次读取但尚未消费的字节，失败时从该行真实起点重读。
-		chunkOffset := lastFileSize - int64(len(partialLine))
-		fullContent := partialLine + string(newContent)
-		lines := strings.Split(fullContent, "\n")
-		tail := lines[len(lines)-1]
-		lines = lines[:len(lines)-1]
-		consumed, err := processSessionLogLinesAt(lines, false, lastLineIdx)
-		lastLineIdx += consumed
-		if err != nil {
-			lastFileSize = chunkOffset
-			for _, line := range lines[:consumed] {
-				lastFileSize += int64(len(line) + 1)
-			}
-			partialLine = ""
-			return err
-		}
 		lastFileSize = currentFileSize
 		lastFileModTime = currentFileModTime
-		partialLine = tail
-	}
-	return nil
-}
 
-func waitWriterContext(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+		// 处理新增内容
+		fullContent := partialLine + string(newContent)
+		lines := strings.Split(fullContent, "\n")
+		partialLine = lines[len(lines)-1]
+		lines = lines[:len(lines)-1] // 移除最后一个元素（可能不完整的行）
+
+		// 文件已经按字节增量读取，不再次用累计行号切片。
+		chunkStart := lastLineIdx
+		lastLineIdx += len(lines)
+
+		// 连接恢复与成绩恢复沿用相同日志规则；这里只处理新增行。
+		processSessionLogLinesAt(lines, false, chunkStart)
 	}
 }
 
 func main() {
 	initLogger()
-	defer writerLogFile.Close()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	logger.Println("Writer应用程序启动")
 
 	// 默认真实采集；只有显式指定 -simulate=true 才隔离数据库。
@@ -1424,8 +1376,7 @@ func main() {
 
 	// 加载并验证server_cfg.ini配置
 	if err := dbWriter.LoadServerConfig(cfg.Game.Path); err != nil {
-		logger.Printf("server_cfg.ini验证失败: %v", err)
-		return
+		fatalLogger.Fatalf("server_cfg.ini验证失败: %v", err)
 	}
 	// 用 server_cfg.ini 的 session 时长初始化 event 默认值（模仿原版写入 event 表）
 	if sc := dbWriter.ServerCfg; sc != nil {
@@ -1452,37 +1403,14 @@ func main() {
 	acPort := cfg.ACServer.UDP.Port
 	acLocalPort := cfg.ACServer.UDP.LocalPort
 
-	// UDP 配置只在创建 goroutine 前设置，运行期状态由客户端实例管理。
-	if cfg.ACServer.UDP.Realtime.Update.Interval.MS > 0 {
-		udp.RealtimePosIntervalMs = cfg.ACServer.UDP.Realtime.Update.Interval.MS
-	}
 	var acClient *udp.AssettoServerUDP
-	var wsDone <-chan struct{}
-	defer func() {
-		stop()
-		if acClient != nil {
-			acClient.Close()
-		}
-		closeWebSocket()
-		if wsDone != nil {
-			<-wsDone
-		}
-	}()
 	var reconnectInterval = 3 * time.Second
+	receivedSessionInfo = false
+	receivedVersionInfo = false
 
 	// 连接循环 - 支持重连
 outerLoop:
 	for {
-		if ctx.Err() != nil {
-			return
-		}
-		stateMutex.Lock()
-		recoveryReady = false
-		lastDataTime = time.Now()
-		stateMutex.Unlock()
-		stateMutex.RLock()
-		hasSessionLog := latestFile != nil
-		stateMutex.RUnlock()
 		var err error
 		// 创建用于SessionInfo通知的通道
 		sessionInfoChan := make(chan struct{}, 1)
@@ -1490,20 +1418,18 @@ outerLoop:
 		acClient, err = createUDPClient(acHost, acLocalPort, acPort, &lastDataTime, sessionInfoChan, versionInfoChan)
 		if err != nil {
 			logger.Printf("创建UDP连接失败: %v, 将在%d秒后重试", err, reconnectInterval/time.Second)
-			if !waitWriterContext(ctx, reconnectInterval) {
-				return
-			}
+			time.Sleep(reconnectInterval)
 			continue
 		}
+		// 移除defer，改为显式关闭
 
 		// 根据日志文件存在性决定是否等待version包
-		if !hasSessionLog {
+		if latestFile == nil {
 			logger.Println("等待AC服务器发送version包...")
 			select {
-			case <-ctx.Done():
-				return
 			case <-versionInfoChan:
 				logger.Println("成功接收version包")
+				receivedVersionInfo = true
 			case <-time.After(3 * time.Second):
 				logger.Println("未收到version包，主动请求当前会话")
 			}
@@ -1523,8 +1449,6 @@ outerLoop:
 
 			// 等待SessionInfo响应或超时
 			select {
-			case <-ctx.Done():
-				return
 			case <-sessionInfoChan:
 				stateMutex.RLock()
 				ready := recoveryReady && globalEvent != nil && globalEvent.ID > 0
@@ -1533,9 +1457,6 @@ outerLoop:
 					retryCount++
 					if retryCount >= 3 {
 						goto sessionInfoTimeout
-					}
-					if !waitWriterContext(ctx, retryInterval) {
-						return
 					}
 					continue
 				}
@@ -1548,9 +1469,7 @@ outerLoop:
 					goto sessionInfoTimeout
 				}
 				logger.Printf("获取SessionInfo超时，%d秒后重试...", retryInterval/time.Second)
-				if !waitWriterContext(ctx, retryInterval) {
-					return
-				}
+				time.Sleep(retryInterval)
 			}
 		}
 
@@ -1561,50 +1480,35 @@ outerLoop:
 	sessionInfoReceived:
 		logger.Println("已获取SessionInfo，开始主循环")
 
+		// 使用 UDP 包原有的实时更新请求，不额外构造车辆查询报文。
+		if cfg.ACServer.UDP.Realtime.Update.Interval.MS > 0 {
+			udp.RealtimePosIntervalMs = cfg.ACServer.UDP.Realtime.Update.Interval.MS
+		}
 		if err := acClient.SendMessage(udp.NewEnableRealtimePosInterval(udp.RealtimePosIntervalMs)); err != nil {
 			logger.Printf("开启车辆更新失败: %v", err)
 		}
-		// WebSocket 生命周期独立于 UDP 重连，只启动一个读取/重连协程。
-		if wsDone == nil {
-			wsDone = startWebSocketReconnect(ctx)
+		// 初始化WebSocket连接
+		wsPort := cfg.App.Server.Port
+		if err := waitForWebSocketServer(wsPort); err != nil {
+			logger.Printf("等待WebSocket服务器失败: %v", err)
 		}
-		interval := cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS
-		if interval <= 0 {
-			interval = 2000
+
+		if err := initWebSocket(); err != nil {
+			logger.Printf("WebSocket初始连接失败: %v", err)
 		}
-		broadcast := time.NewTicker(time.Duration(interval) * time.Millisecond)
-		heartbeat := time.NewTicker(10 * time.Second)
+		startWebSocketReconnect()
+
+		// 主循环
 		for {
-			select {
-			case <-ctx.Done():
-				broadcast.Stop()
-				heartbeat.Stop()
-				return
-			case <-broadcast.C:
-				buildAndSendWebSocketMessage()
-			case <-heartbeat.C:
-				stateMutex.Lock()
-				stale := time.Since(lastDataTime) > 30*time.Second
-				if stale {
-					recoveryReady = false
-					// 失联间隔不构成完整圈，重连后重新等一次完圈。
-					for slot := range globalConnections {
-						resetLapSamples(slot)
-					}
-				}
-				stateMutex.Unlock()
-				if stale {
-					logger.Println("UDP超过30秒未收报，重新连接并恢复当前会话")
-					broadcast.Stop()
-					heartbeat.Stop()
-					acClient.Close()
-					continue outerLoop
-				}
-				// 同一恢复入口也重试临时数据库/日志失败，不跳过恢复步骤。
-				if err := acClient.SendMessage(udp.NewGetSessionInfo()); err != nil {
-					logger.Printf("会话探活请求失败: %v", err)
-				}
+			// 构建并发送WebSocket消息
+			buildAndSendWebSocketMessage()
+
+			// 定期检查连接状态
+			interval := cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS
+			if interval <= 0 {
+				interval = 2000
 			}
+			time.Sleep(time.Duration(interval) * time.Millisecond)
 		}
 	}
 }

@@ -5,7 +5,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -23,7 +22,7 @@ var wsEventID int
 var reconnectDelay = 5 * time.Second
 
 // initWebSocket 建立 writer 专用发布连接；事件切换后必须更新 cookie。
-func initWebSocket(ctx context.Context) error {
+func initWebSocket() error {
 	stateMutex.RLock()
 	eventID := globalEvent.ID
 	stateMutex.RUnlock()
@@ -38,18 +37,11 @@ func initWebSocket(ctx context.Context) error {
 	header := http.Header{}
 	header.Set("Cookie", fmt.Sprintf("eventId=%d", eventID))
 	header.Set("X-SimView-Writer", "1")
-	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = 5 * time.Second
-	conn, _, err := dialer.DialContext(ctx, u.String(), header)
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
 	if err != nil {
 		return err
 	}
 	wsMutex.Lock()
-	if ctx.Err() != nil {
-		wsMutex.Unlock()
-		conn.Close()
-		return ctx.Err()
-	}
 	if wsConn != nil {
 		wsConn.Close()
 	}
@@ -58,32 +50,16 @@ func initWebSocket(ctx context.Context) error {
 	return nil
 }
 
-func closeWebSocket() {
-	wsMutex.Lock()
-	defer wsMutex.Unlock()
-	if wsConn != nil {
-		wsConn.Close()
-		wsConn = nil
-	}
-}
-
-func startWebSocketReconnect(ctx context.Context) <-chan struct{} {
-	done := make(chan struct{})
+func startWebSocketReconnect() {
 	go func() {
-		defer close(done)
-		for ctx.Err() == nil {
+		for {
 			wsMutex.Lock()
 			conn := wsConn
 			wsMutex.Unlock()
 			if conn == nil {
-				if err := initWebSocket(ctx); err != nil {
-					if ctx.Err() != nil {
-						return
-					}
+				if err := initWebSocket(); err != nil {
 					logger.Printf("WS重连失败: %v", err)
-					if !waitWriterContext(ctx, reconnectDelay) {
-						return
-					}
+					time.Sleep(reconnectDelay)
 				}
 				continue
 			}
@@ -98,7 +74,6 @@ func startWebSocketReconnect(ctx context.Context) <-chan struct{} {
 			}
 		}
 	}()
-	return done
 }
 
 // 广播读取已恢复的内存状态；接入已有 session 的查询不持连接锁。
@@ -175,6 +150,18 @@ func buildAndSendWebSocketMessage() {
 		wsConn.Close()
 		wsConn = nil
 	}
+}
+
+func waitForWebSocketServer(port int) error {
+	for i := 0; i < 30; i++ {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)), 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("等待HTTP WS端口超时: %d", port)
 }
 
 // 调用者持有 stateMutex.RLock；所有身份来自接入时建立的缓存。

@@ -115,7 +115,7 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // eventSelectColumns 事件统一查询列（对应 ACEventResponse 的字段顺序）
-const eventSelectColumns = "event_id, COALESCE(name, ''), COALESCE(server_name, ''), track_config_id, team_event, active, livery_preview, use_number, practice_duration, quali_duration, race_duration, race_duration_type, race_wait_time, race_extra_laps, reverse_grid_positions"
+const eventSelectColumns = "event_id, name, server_name, track_config_id, team_event, active, livery_preview, use_number, practice_duration, quali_duration, race_duration, race_duration_type, race_wait_time, race_extra_laps, reverse_grid_positions"
 
 // scanEventRow 扫描一行事件数据
 func scanEventRow(sc rowScanner) (ACEventResponse, error) {
@@ -187,10 +187,10 @@ func handleACTeams(w http.ResponseWriter, r *http.Request) {
 			args[i] = idInt
 		}
 
-		query = fmt.Sprintf("SELECT team_id, COALESCE(name, ''), car_id, COALESCE(team_no, 0), COALESCE(livery_name, '') FROM team WHERE team_id IN (%s)", strings.Join(placeholders, ","))
+		query = fmt.Sprintf("SELECT team_id, name, car_id, team_no, livery_name FROM team WHERE team_id IN (%s)", strings.Join(placeholders, ","))
 	} else {
 		// 如果没有提供ID参数，返回所有团队
-		query = "SELECT team_id, COALESCE(name, ''), car_id, COALESCE(team_no, 0), COALESCE(livery_name, '') FROM team"
+		query = "SELECT team_id, name, car_id, team_no, livery_name FROM team"
 	}
 
 	rows, err := db.Query(query, args...)
@@ -201,7 +201,7 @@ func handleACTeams(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	teams := []ACTeam{}
+	var teams []ACTeam
 	for rows.Next() {
 		var t ACTeam = ACTeam{}
 		if err := rows.Scan(&t.TeamID, &t.Name, &t.CarID, &t.TeamNo, &t.LiveryName); err != nil {
@@ -243,7 +243,7 @@ func handleACCars(w http.ResponseWriter, r *http.Request) {
 			args[i] = id
 		}
 
-		query = fmt.Sprintf("SELECT car_id, name, COALESCE(display_name, ''), manufacturer, car_class FROM car WHERE car_id IN (%s)", strings.Join(placeholders, ","))
+		query = fmt.Sprintf("SELECT car_id, name, display_name, manufacturer, car_class FROM car WHERE car_id IN (%s)", strings.Join(placeholders, ","))
 		// Validate single ID format for /api/ac/car/
 		if pathParts[3] == "car" && len(ids) > 1 {
 			sendErrorResponse(w, http.StatusBadRequest, "单个车辆查询不支持多个ID", "car")
@@ -251,7 +251,7 @@ func handleACCars(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 如果没有提供ID参数，返回所有车辆
-		query = "SELECT car_id, name, COALESCE(display_name, ''), manufacturer, car_class FROM car"
+		query = "SELECT car_id, name, display_name, manufacturer, car_class FROM car"
 	}
 
 	rows, err := db.Query(query, args...)
@@ -262,7 +262,7 @@ func handleACCars(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	cars := []ACCar{}
+	var cars []ACCar
 	for rows.Next() {
 		var c ACCar = ACCar{}
 		if err := rows.Scan(&c.CarID, &c.Name, &c.DisplayName, &c.Manufacturer, &c.CarClass); err != nil {
@@ -339,7 +339,7 @@ func handleACUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	users := []ACUser{}
+	var users []ACUser
 	for rows.Next() {
 		u := ACUser{}
 		if err := rows.Scan(&u.UserID, &u.Name, &u.Country); err != nil {
@@ -374,7 +374,7 @@ func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 
 	// 基础用户信息
 	user := ACUser{}
-	err := db.QueryRow("SELECT user_id, name, COALESCE(prev_name, ''), COALESCE(country, '') FROM user WHERE user_id = ?", driverId).Scan(
+	err := db.QueryRow("SELECT user_id, name, prev_name, country FROM user WHERE user_id = ?", driverId).Scan(
 		&user.UserID, &user.Name, &user.PrevName, &user.Country)
 
 	if err != nil {
@@ -397,11 +397,11 @@ func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 	// 查询用户参与的事件列表及统计
 	eventsQuery := `
 		SELECT 
-			e.event_id, COALESCE(e.name, '') as event_name, COALESCE(tc.track_name, 'Unknown') as track_name,
+			e.event_id, e.name as event_name, COALESCE(tc.track_name, 'Unknown') as track_name, 
 			COALESCE(MAX(t.name), 'N/A') as team_name, 
 			COALESCE(SUM(l.time * l.avg_speed / 3600000), 0) as distance_driven_km,
 			COALESCE(COUNT(l.stint_lap_id), 0) as total_laps,
-			COALESCE(SUM(CASE WHEN l.cuts = 0 AND l.crashes = 0 AND l.car_crashes = 0 THEN 1 ELSE 0 END), 0) as total_valid_laps,
+			COALESCE(SUM(CASE WHEN l.cuts = 0 AND l.crashes = 0 THEN 1 ELSE 0 END), 0) as total_valid_laps, 
 			CAST(UNIX_TIMESTAMP(COALESCE(MAX(s.last_activity), FROM_UNIXTIME(0))) * 1000000 AS UNSIGNED) as event_time
 		FROM event e
 		LEFT JOIN session s ON e.event_id = s.event_id
@@ -495,7 +495,7 @@ func handleACUserDetails(w http.ResponseWriter, r *http.Request) {
 
 	// 查询顶级赛道
 	topTracksQuery := `
-		SELECT COALESCE(tc.track_name, ''), SUM(l.time * l.avg_speed / 3600000) as distance_driven
+		SELECT tc.track_name, SUM(l.time * l.avg_speed / 3600000) as distance_driven
 		FROM session s
 		JOIN session_stint st ON s.session_id = st.session_id
 		JOIN stint_lap l ON st.session_stint_id = l.stint_id
@@ -638,7 +638,7 @@ func handleACTrack(w http.ResponseWriter, r *http.Request) {
 	default:
 		// 原始赛道信息查询逻辑
 		track := ACTrackConfig{}
-		err := db.QueryRow("SELECT track_config_id, COALESCE(track_name, ''), COALESCE(config_name, ''), COALESCE(display_name, ''), COALESCE(country, ''), COALESCE(city, ''), COALESCE(length, 0) FROM track_config WHERE track_config_id = ?", trackID).Scan(
+		err := db.QueryRow("SELECT track_config_id, track_name, config_name, display_name, country, city, length FROM track_config WHERE track_config_id = ?", trackID).Scan(
 			&track.TrackConfigID, &track.TrackName, &track.ConfigName, &track.DisplayName, &track.Country, &track.City, &track.Length)
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -656,7 +656,7 @@ func handleACTrack(w http.ResponseWriter, r *http.Request) {
 
 // 处理AC赛道列表请求
 func handleACTracks(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT track_config_id, COALESCE(track_name, ''), COALESCE(config_name, ''), COALESCE(display_name, ''), COALESCE(country, ''), COALESCE(city, ''), COALESCE(length, 0) FROM track_config")
+	rows, err := db.Query("SELECT track_config_id, track_name, config_name, display_name, country, city, length FROM track_config")
 	if err != nil {
 		logger.Printf("数据库查询失败: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "数据库查询失败", "tracks")
@@ -664,7 +664,7 @@ func handleACTracks(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	tracks := []ACTrackConfig{}
+	var tracks []ACTrackConfig
 
 	for rows.Next() {
 		t := ACTrackConfig{}
@@ -842,7 +842,7 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 	case "event":
 		// 按事件查询逻辑
 		// 验证URL格式
-		if len(pathParts) < 7 || pathParts[3] != "event" || pathParts[5] != "cars" {
+		if len(pathParts) < 6 || pathParts[3] != "event" || pathParts[5] != "cars" {
 			logger.Printf("无效的URL路径格式")
 			sendErrorResponse(w, http.StatusBadRequest, "无效的URL路径格式", "bestlap")
 			return
@@ -916,7 +916,7 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
                 JOIN car c ON ss.car_id = c.car_id
                 JOIN session s ON ss.session_id = s.session_id
                 JOIN event e ON s.event_id = e.event_id
-                WHERE e.event_id = ? AND l.cuts = 0 AND l.crashes = 0 AND l.car_crashes = 0 AND l.time > 0 %s
+                WHERE e.event_id = ? AND l.cuts = 0 AND l.crashes = 0 AND l.time > 0 %s
             ),
             ranked_laps AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id, car_id ORDER BY time ASC) as rn
@@ -1026,7 +1026,7 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
                 JOIN event e ON s.event_id = e.event_id
                 JOIN user u ON ss.user_id = u.user_id
                 JOIN car c ON ss.car_id = c.car_id
-                WHERE e.track_config_id = ? AND ss.car_id IN (%s) AND l.cuts = 0 AND l.crashes = 0 AND l.car_crashes = 0 AND l.time > 0
+                WHERE e.track_config_id = ? AND ss.car_id IN (%s) AND l.cuts = 0 AND l.crashes = 0 AND l.time > 0
             )
             SELECT lap_id, user_id, car_id, time, sector_1, sector_2, sector_3, grip, tyre, avg_speed, max_speed, finished_at
             FROM ranked_laps
@@ -1309,7 +1309,7 @@ func handleACEventDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	case "cars":
 		// 查询事件车辆数据
-		carRows, err := db.Query("SELECT DISTINCT c.car_id, c.name, COALESCE(c.display_name, ''), c.manufacturer, c.car_class FROM session_stint ss JOIN session s ON ss.session_id = s.session_id JOIN car c ON ss.car_id = c.car_id WHERE s.event_id = ?", eventID)
+		carRows, err := db.Query("SELECT DISTINCT c.car_id, c.name, c.display_name, c.manufacturer, c.car_class FROM session_stint ss JOIN session s ON ss.session_id = s.session_id JOIN car c ON ss.car_id = c.car_id WHERE s.event_id = ?", eventID)
 		if err != nil {
 			logger.Printf("车辆查询失败: %v", err)
 			sendErrorResponse(w, http.StatusInternalServerError, "车辆数据查询失败", "vehicles")
@@ -1317,7 +1317,7 @@ func handleACEventDetails(w http.ResponseWriter, r *http.Request) {
 		}
 		defer carRows.Close()
 
-		cars := []ACCar{}
+		var cars []ACCar
 		for carRows.Next() {
 			c := ACCar{}
 			if err := carRows.Scan(&c.CarID, &c.Name, &c.DisplayName, &c.Manufacturer, &c.CarClass); err != nil {
@@ -1430,77 +1430,6 @@ func handleTrackSVG(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, file)
 }
 
-// imageExts 图片资源的候选扩展名（浏览器可直接解码的 PNG/JPEG）；不含 DDS。
-var imageExts = []string{".png", ".jpg", ".jpeg"}
-
-// sniffImageContentType 依据字节签名判断是否为浏览器可解码的 PNG/JPEG；
-// 其它（含 DDS 等）返回空字符串，避免把伪 PNG/DDS 字节当作图片响应。
-func sniffImageContentType(data []byte) string {
-	ct := http.DetectContentType(data)
-	if ct == "image/png" || ct == "image/jpeg" {
-		return ct
-	}
-	return ""
-}
-
-// isSafePathSegment 判断 URL 片段能否安全拼进文件路径：
-// 拒绝空、"."、".."、路径分隔符与冒号（Windows 盘符/ADS，如 "C:"、"x:stream"）。
-func isSafePathSegment(s string) bool {
-	if s == "" || s == "." || s == ".." {
-		return false
-	}
-	return !strings.ContainsAny(s, `/\:`)
-}
-
-// serveCachedImage 提供一张图片资源：先按扩展名顺序命中 cacheBase 的缓存文件，
-// 未命中则在 sources 各候选前缀上按同一扩展名查找真实 PNG/JPEG，复制到缓存后提供。
-// 只接受字节签名校验通过的 PNG/JPEG（忽略 DDS 等伪 PNG 的旧缓存）；
-// 缓存与候选都不合格时返回 false。
-func serveCachedImage(w http.ResponseWriter, cacheDir, cacheBase string, sources []string) bool {
-	for _, ext := range imageExts {
-		cachePath := filepath.Join(cacheDir, cacheBase+ext)
-		if data, err := os.ReadFile(cachePath); err == nil {
-			// 旧缓存可能是 DDS 字节伪装成的 PNG：签名不符即忽略，改读真实 PNG/JPEG。
-			if ct := sniffImageContentType(data); ct != "" {
-				writeImageBytes(w, ct, data)
-				return true
-			}
-		}
-		for _, src := range sources {
-			data, err := os.ReadFile(src + ext)
-			if err != nil {
-				continue
-			}
-			ct := sniffImageContentType(data)
-			if ct == "" {
-				logger.Printf("忽略非 PNG/JPEG 图片: %s", src+ext)
-				continue
-			}
-			if err := os.MkdirAll(cacheDir, 0755); err != nil {
-				logger.Printf("创建缓存目录失败: %v", err)
-			}
-			if err := os.WriteFile(cachePath, data, 0644); err != nil {
-				logger.Printf("复制图片到缓存目录失败: %v", err)
-			} else {
-				logger.Printf("成功将图片复制到缓存目录: %s", cachePath)
-			}
-			// 即使缓存写入失败也直接返回已读到的字节
-			writeImageBytes(w, ct, data)
-			return true
-		}
-	}
-	return false
-}
-
-// writeImageBytes 写出已校验的图片字节（contentType 由字节签名嗅探得到）。
-func writeImageBytes(w http.ResponseWriter, contentType string, data []byte) {
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	if _, err := w.Write(data); err != nil {
-		logger.Printf("写入图片响应失败: %v", err)
-	}
-}
-
 // 处理赛道图片请求
 func handleTrackImage(w http.ResponseWriter, r *http.Request) {
 	// 从查询参数获取track_config_id
@@ -1523,64 +1452,157 @@ func handleTrackImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 赛道资料与 Writer 使用同一根目录（<game.path>/content），只接受可解码的 PNG/JPEG。
-	base := filepath.Join(cfg.Game.Path, "content", "tracks", trackName)
-	sources := []string{
-		filepath.Join(base, configName, "ui", "outline"),
-		filepath.Join(base, "ui", configName, "outline"),
-		filepath.Join(base, "ui", "outline"),
-	}
-	cacheBase := fmt.Sprintf("preview_%s_%s", safeFileName(trackName), safeFileName(configName))
-	if !serveCachedImage(w, filepath.Join(cfg.App.Server.CachePath, "tracks"), cacheBase, sources) {
-		logger.Printf("赛道图片未找到: %s", r.URL.Path)
-		http.NotFound(w, r)
-	}
-}
+	// 清理名称以创建安全的文件名
+	filename := fmt.Sprintf("preview_%s_%s.png", safeFileName(trackName), safeFileName(configName))
 
-// 处理车辆资源请求
-//
-//	images/ac/car/{car_id}/badge
-//	images/ac/car/{car_name}/livery/{livery_name}/preview
-func handleCarResource(w http.ResponseWriter, r *http.Request) {
-	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(pathParts) < 5 || pathParts[2] != "car" {
-		logger.Printf("无效的车辆资源请求路径: %s, 路径部分: %v", r.URL.Path, pathParts)
+	// 构建完整文件路径
+	filePath := filepath.Join(cfg.App.Server.CachePath, "tracks", filename)
+
+	// 提供文件，先尝试从缓存路径加载
+	file, err := os.Open(filePath)
+	if err != nil {
+		logger.Printf("缓存赛道图片不存在: %s，尝试备选路径", filePath)
+		// 构建GameConfig.Path父目录下的备选路径
+		gameConfigParentDir := filepath.Dir(cfg.Game.Path)
+		fallbackPath := filepath.Join(gameConfigParentDir, "content", "tracks", trackName, configName, "ui", "outline.png")
+		file, err = os.Open(fallbackPath)
+		if err != nil {
+			// 尝试新的路径组合: trackName/ui/configName
+			fallbackPath2 := filepath.Join(gameConfigParentDir, "content", "tracks", trackName, "ui", configName, "outline.png")
+			file, err = os.Open(fallbackPath2)
+			if err != nil {
+				// 尝试新的路径组合: trackName/ui
+				fallbackPath2 := filepath.Join(gameConfigParentDir, "content", "tracks", trackName, "ui", "outline.png")
+				file, err = os.Open(fallbackPath2)
+				if err != nil {
+					logger.Printf("赛道图片路径加载失败: %v", err)
+					http.NotFound(w, r)
+					return
+				}
+			}
+		}
+
+		// 确保缓存目录存在
+		cacheDir := filepath.Dir(filePath)
+		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			logger.Printf("创建缓存目录失败: %v", err)
+		}
+
+		// 从备选路径复制文件到缓存目录
+		fallbackContent, err := io.ReadAll(file)
+		if err != nil {
+			logger.Printf("读取备选文件失败: %v", err)
+		} else {
+			if err := os.WriteFile(filePath, fallbackContent, 0644); err != nil {
+				logger.Printf("复制文件到缓存目录失败: %v", err)
+			} else {
+				logger.Printf("成功将赛道图片复制到缓存目录: %s", filePath)
+			}
+			// 重新打开文件以读取
+			file, _ = os.Open(filePath)
+		}
+	}
+	if file == nil {
 		http.NotFound(w, r)
 		return
 	}
-	cacheDir := filepath.Join(cfg.App.Server.CachePath, "cars")
+	defer file.Close()
 
-	switch {
-	case len(pathParts) == 5 && pathParts[4] == "badge":
-		// 徽标：{car_id} 解析出车名，读 <game.path>/content/cars/{name}/ui/badge.*
-		var carName string
-		if err := db.QueryRow(`SELECT name FROM car WHERE car_id = ?`, pathParts[3]).Scan(&carName); err != nil {
-			logger.Printf("查询车辆名称失败: %v", err)
-			http.NotFound(w, r)
-			return
-		}
-		sources := []string{filepath.Join(cfg.Game.Path, "content", "cars", carName, "ui", "badge")}
-		if !serveCachedImage(w, cacheDir, "badge_"+safeFileName(carName), sources) {
-			logger.Printf("车辆徽标未找到: %s", r.URL.Path)
-			http.NotFound(w, r)
-		}
-	case len(pathParts) == 7 && pathParts[4] == "livery" && pathParts[6] == "preview":
-		// 车贴预览：{car_name} 与 {livery_name} 直接对应 content/cars/{name}/skins/{livery}/preview.*
-		carName, livery := pathParts[3], pathParts[5]
-		if !isSafePathSegment(carName) || !isSafePathSegment(livery) {
-			logger.Printf("无效的车贴预览路径: %s", r.URL.Path)
-			http.NotFound(w, r)
-			return
-		}
-		sources := []string{filepath.Join(cfg.Game.Path, "content", "cars", carName, "skins", livery, "preview")}
-		if !serveCachedImage(w, cacheDir, "livery_"+safeFileName(carName)+"_"+safeFileName(livery), sources) {
-			logger.Printf("车贴预览未找到: %s", r.URL.Path)
-			http.NotFound(w, r)
-		}
-	default:
-		logger.Printf("无效的车辆资源请求路径: %s, 路径部分: %v", r.URL.Path, pathParts)
+	fi, err := file.Stat()
+	if err != nil {
 		http.NotFound(w, r)
+		return
 	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	io.Copy(w, file)
+}
+
+// 处理车辆资源请求
+func handleCarResource(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	// 路径格式应为: images/ac/car/{car_id}/badge
+	if len(pathParts) != 5 || pathParts[2] != "car" || pathParts[4] != "badge" {
+		logger.Printf("无效的车辆徽章请求路径: %s, 路径部分: %v", r.URL.Path, pathParts)
+		http.NotFound(w, r)
+		return
+	}
+
+	// 提取car_id
+	carID := pathParts[3]
+
+	// 查询车辆名称
+	var carName string
+	query := `SELECT name FROM car WHERE car_id = ?`
+	err := db.QueryRow(query, carID).Scan(&carName)
+	if err != nil {
+		logger.Printf("查询车辆名称失败: %v", err)
+		http.NotFound(w, r)
+		return
+	}
+
+	// 清理文件名并构建路径
+	fileName := fmt.Sprintf("badge_%s.png", safeFileName(carName))
+	filePath := filepath.Join(cfg.App.Server.CachePath, "cars", fileName)
+
+	// 读取并返回文件
+	file, err := os.Open(filePath)
+	if err != nil {
+		// 构建GameConfig.Path父目录下的备选路径
+		gameConfigParentDir := filepath.Dir(cfg.Game.Path)
+		fallbackPath := filepath.Join(gameConfigParentDir, "content", "cars", carName, "ui", "badge.png")
+		file, err = os.Open(fallbackPath)
+		if err != nil {
+			logger.Printf("车辆徽章文件不存在: %s，尝试备选路径: %s", filePath, fallbackPath)
+			// 尝试另一种路径格式
+			fallbackPath2 := filepath.Join(gameConfigParentDir, "content", "cars", carName, "ui", "badge.dds")
+			file, err = os.Open(fallbackPath2)
+			if err != nil {
+				logger.Printf("所有车辆徽章路径都不存在: %s, %s", filePath, fallbackPath2)
+				http.NotFound(w, r)
+				return
+			}
+		}
+
+		// 确保缓存目录存在
+		cacheDir := filepath.Dir(filePath)
+		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			logger.Printf("创建缓存目录失败: %v", err)
+		}
+
+		// 从备选路径复制文件到缓存目录
+		fallbackContent, err := io.ReadAll(file)
+		if err != nil {
+			logger.Printf("读取备选文件失败: %v", err)
+		} else {
+			if err := os.WriteFile(filePath, fallbackContent, 0644); err != nil {
+				logger.Printf("复制文件到缓存目录失败: %v", err)
+			} else {
+				logger.Printf("成功将车辆徽章复制到缓存目录: %s", filePath)
+			}
+			// 重新打开文件以读取
+			file, _ = os.Open(filePath)
+		}
+	}
+	if file == nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	// 设置正确的Content-Type
+	if strings.HasSuffix(filePath, ".dds") {
+		w.Header().Set("Content-Type", "image/vnd.ms-dds")
+	} else {
+		w.Header().Set("Content-Type", "image/png")
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	io.Copy(w, file)
 }
 
 // 根路径处理器

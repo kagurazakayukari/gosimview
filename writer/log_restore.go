@@ -38,7 +38,8 @@ func restoreConnectionsFromSessionLog() error {
 	// 同一份日志、同一节的重复探活仅消费新增行，不能用历史快照覆盖实时状态。
 	newSnapshot := restoredSessionLogPath != path || int64(len(data)) < restoredSessionLogSize
 	if !newSnapshot && globalSession != nil && recoveredLogSessionID == globalSession.ID {
-		return collectCarUpdates()
+		collectCarUpdates()
+		return nil
 	}
 	connections := connectionRegex.FindAllStringSubmatchIndex(content, -1)
 	latestConnections := make(map[int][]int)
@@ -107,9 +108,7 @@ func restoreConnectionsFromSessionLog() error {
 			complete = lines[:len(lines)-1]
 		}
 		if start <= len(complete) {
-			if _, err := processSessionLogLinesAt(complete[start:], true, start); err != nil {
-				return err
-			}
+			processSessionLogLinesAt(complete[start:], true, start)
 		}
 		recoveredLogSessionID = globalSession.ID
 	}

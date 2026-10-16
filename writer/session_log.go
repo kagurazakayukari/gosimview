@@ -145,14 +145,11 @@ func refreshRecoveredScores() {
 
 // replay=true 仅回放内存状态；不结束 stint，不产生历史 feed 或写圈。
 // 增量与恢复共用原代码里的日志字段规则，保证两条路径一致。
-func processSessionLogLines(lines []string, replay bool) {
-	_, _ = processSessionLogLinesAt(lines, replay, 0)
-}
+func processSessionLogLines(lines []string, replay bool) { processSessionLogLinesAt(lines, replay, 0) }
 
-// 返回已消费行数；失败行及其后内容由调用方保留游标，下次继续处理。
-func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, error) {
+func processSessionLogLinesAt(lines []string, replay bool, lineStart int) {
 	if globalSession == nil || globalSession.ID == 0 {
-		return 0, fmt.Errorf("当前会话尚未恢复")
+		return
 	}
 	sid := int(globalSession.ID)
 	if stintLapData[sid] == nil {
@@ -195,7 +192,7 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 				// 用户指定无边界时沿用原方式：已知配方发生变化才结束段。
 				// 日志回放不触发写库；有边界时仅由区内停车处理，避免重复切段。
 				if err := finishStint(slot); err != nil {
-					return index, err
+					return
 				}
 				globalConnections[slot].StintStartedAt = time.Now()
 				// collectCarUpdates 已持有 lapDataMutex，不在此递归加锁。
@@ -327,7 +324,6 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 	if replay {
 		refreshRecoveredScores()
 	}
-	return len(lines), nil
 }
 
 // 接入当前会话只查已有 session，不向数据库创建新 session。
@@ -354,29 +350,14 @@ func adoptCurrentSession(msg udp.SessionInfo) error {
 		}
 		session = &Session{ID: nextSimulatedID(), EventID: globalEvent.ID, Type: databaseSessionType(msg), Name: msg.Name, TrackTime: "0", StartTime: time.Now().Add(-time.Duration(msg.ElapsedMilliseconds) * time.Millisecond), DurationMin: int(msg.Time), ElapsedMs: int(msg.ElapsedMilliseconds), Laps: int(msg.Laps), Weather: msg.WeatherGraphics, AirTemp: float64(msg.AmbientTemp), RoadTemp: float64(msg.RoadTemp), StartGrip: -1, CurrentGrip: -1, HTTPPort: port, LastActivity: time.Now()}
 	}
-	// 完整读取后才发布 session，查询失败后的下一次恢复不能跳过未完成的步骤。
-	var stints []*SessionStint
-	restoredBestTimes := make(map[int]int)
-	if !globalDBWriter.SimulateSQL {
-		var err error
-		stints, err = globalDBWriter.FindSessionStintsBySessionID(session.ID)
-		if err != nil {
-			return err
-		}
-		for _, stint := range stints {
-			if stint.BestLapID > 0 {
-				lapTime, err := getLapTimeByID(stint.BestLapID)
-				if err != nil {
-					return fmt.Errorf("恢复 stint %d 最快圈: %w", stint.ID, err)
-				}
-				restoredBestTimes[stint.ID] = lapTime
-			}
-		}
-	}
 	globalSession = session
 	dataCollectionEnabled = session.IsFinished == 0
 	// 续用已有 stint，避免接入后另起一条并丢失已有计数。
 	if !globalDBWriter.SimulateSQL {
+		stints, err := globalDBWriter.FindSessionStintsBySessionID(session.ID)
+		if err != nil {
+			return err
+		}
 		sessionStints = stints
 		restoredStintIDs = make(map[int]bool)
 		for _, stint := range stints {
@@ -390,7 +371,7 @@ func adoptCurrentSession(msg udp.SessionInfo) error {
 				}
 			}
 			if stint.BestLapID > 0 {
-				bestLapTimes[stint.ID] = restoredBestTimes[stint.ID]
+				bestLapTimes[stint.ID] = int(getLapTimeByID(stint.BestLapID))
 			}
 		}
 	}

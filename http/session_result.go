@@ -298,7 +298,7 @@ func handleQualiStandings(w http.ResponseWriter, sessionID int) {
 		FROM stint_lap sl
 		JOIN session_stint ss ON sl.stint_id = ss.session_stint_id
 		LEFT JOIN team_member tm ON ss.team_member_id = tm.team_member_id
-		WHERE ss.session_id = ? AND sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0 AND sl.time > 0
+		WHERE ss.session_id = ? AND sl.cuts = 0 AND sl.crashes = 0 AND sl.time > 0
 		ORDER BY sl.stint_lap_id ASC`, sessionID)
 	if err != nil {
 		logger.Printf("查询quali standings失败: %v", err)
