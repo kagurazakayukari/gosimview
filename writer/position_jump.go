@@ -66,10 +66,19 @@ func observePositionJump(update udp.CarUpdate, now time.Time) bool {
 		current.pending = true
 		return false
 	}
-	if previous.pending && stopped {
-		current.stoppedFrames = previous.stoppedFrames + 1
-		current.teleported = current.stoppedFrames >= 2
-		current.pending = !current.teleported
+	if previous.pending {
+		if stopped {
+			current.pending = true
+			current.stoppedFrames = previous.stoppedFrames + 1
+			if current.stoppedFrames >= 2 {
+				current.teleported = true
+				current.pending = false
+			}
+		} else {
+			// 停止序列被打断，等待下一次新的位置突变候选。
+			current.pending = false
+			current.stoppedFrames = 0
+		}
 	}
 	return current.teleported
 }
