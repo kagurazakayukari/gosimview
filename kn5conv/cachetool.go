@@ -1169,8 +1169,9 @@ func distance2D(a, b [3]float32) float32 {
 // --------------------------- 批量处理函数 ---------------------------
 // BatchProcess 批量处理指定目录下的models_gp.ini中的KN5文件
 func BatchProcess(gameDir, cacheDir, trackName, configName string) ([][3]float32, error) {
-	trackDir := filepath.Join(gameDir, "content", "tracks", trackName)
-	layoutDir := filepath.Join(trackDir, configName)
+	// 与降级判据共用同一套目录解析（game/content 或 parent/content）：只判断目录存在，
+	// 不要求 fast_lane.ai，缺它的赛道也要能选到带 models 的目录去建凸包。
+	trackDir, layoutDir, layoutErr := resolveTrackDirs(gameDir, trackName, configName)
 	key := trackName + "_" + configName
 	pnPath := filepath.Join(cacheDir, "tracks", "pit_node_"+key+".pn")
 	var boundary [][3]float32
@@ -1189,6 +1190,9 @@ func BatchProcess(gameDir, cacheDir, trackName, configName string) ([][3]float32
 		}
 	}
 	if len(boundary) == 0 {
+		if layoutErr != nil {
+			return nil, layoutErr
+		}
 		modelsName := "models.ini"
 		if configName != "" {
 			modelsName = "models_" + configName + ".ini"
@@ -1224,6 +1228,10 @@ func BatchProcess(gameDir, cacheDir, trackName, configName string) ([][3]float32
 		if len(boundary) < 3 {
 			return nil, fmt.Errorf("未找到有效维修区边界: %s", key)
 		}
+	}
+	if layoutErr != nil {
+		// 有缓存边界但没有赛道内容目录：先返回边界，地图等目录就绪后再生成。
+		return boundary, nil
 	}
 	// 地图是独立产物，失败不能丢掉已取得的维修区边界。
 	details, err := parseFastLaneAI(filepath.Join(layoutDir, "ai", "fast_lane.ai"))

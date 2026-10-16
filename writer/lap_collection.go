@@ -72,6 +72,7 @@ func completeLapSamples(slot int) []udp.CarUpdate {
 
 // resetLapSamples 在断开、重连时丢弃未完成圈，防止跨车手或跨连接拼接遥测。
 func resetLapSamples(slot int) {
+	resetRaceObservations(slot)
 	lapDataMutex.Lock()
 	defer lapDataMutex.Unlock()
 	delete(carLapData, slot)

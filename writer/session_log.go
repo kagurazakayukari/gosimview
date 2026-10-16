@@ -191,9 +191,9 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 			name := strings.TrimSpace(m[1])
 			old := userTyres[name]
 			slot := slotForLogName(name)
-			if !replay && slot >= 0 && len(pitBoundary) < 3 && old != "" && old != m[2] {
-				// 用户指定无边界时沿用原方式：已知配方发生变化才结束段。
-				// 日志回放不触发写库；有边界时仅由区内停车处理，避免重复切段。
+			if !replay && slot >= 0 && !hasPitDetection() && old != "" && old != m[2] {
+				// KN5/AI 都不可用时才用配方变化近似分段，轮胎显示和 feed 始终更新。
+				// 日志回放不触发写库；任一维修区判据可用时只由区内停车切段。
 				if err := finishStint(slot); err != nil {
 					return index, err
 				}

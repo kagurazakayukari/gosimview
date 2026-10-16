@@ -14,6 +14,12 @@ import (
 // 判停只容忍速度浮点抖动，不以停留时长或轮胎配方猜测进站用途。
 const pitStoppedSpeedMS = 0.1
 
+// hasPitDetection 统一分段条件：KN5 或 AI 判据可用时，以区内停车为准；
+// 两者都不可用才允许日志换胎分段。
+func hasPitDetection() bool {
+	return len(pitBoundary) >= 3 || pitLaneFallback != nil
+}
+
 type pitObservation struct {
 	inPit         bool
 	stopped       bool
@@ -56,11 +62,11 @@ func observePitVisit(slot int, inPit bool, update udp.CarUpdate, now time.Time) 
 		obs.split = false
 		conn.PitVisits = append(conn.PitVisits, PitVisit{EntryTime: now})
 		conn.PitEntryTime = now
-		feedType := 11
-		if speed > 111.11 {
-			feedType = 15
+		// 传送候选由独立的连续 UDP 观测确认并发 type=15，不能先误报正常驶入。
+		jump := positionObservations[slot]
+		if jump == nil || !jump.pending || !stopped {
+			insertPitFeed(slot, 11, nil, now)
 		}
-		insertPitFeed(slot, feedType, nil, now)
 	}
 	if inPit && stopped && !obs.split && (entered || !obs.stopped) {
 		if err := finishStint(slot); err != nil {

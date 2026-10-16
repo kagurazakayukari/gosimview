@@ -53,7 +53,6 @@ var (
 	stateMutex       sync.RWMutex
 	activeStints     = make(map[int]*SessionStint)
 	entryListLoaded  bool
-	lastLogPoll      time.Time
 	bestLapTimes     = make(map[int]int)
 	classBestTimes   = make(map[string]int)
 	sessionStints    = make([]*SessionStint, 0)
@@ -94,6 +93,8 @@ var (
 	pitBoundary [][3]float32
 	// 已加载边界的赛道标识（track|config），避免重复生成
 	pitBoundaryLoadedFor string
+	// 凸包不可用时的降级判据（pit_lane 折线 + NSP 区间），同一赛道只加载一次
+	pitLaneFallback *kn5conv.PitLaneWindow
 	// 新增：用于实时发送遥测数据的全局变量
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	wsMutex          sync.Mutex
@@ -438,6 +439,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if !sessionCollecting() {
 		return
 	}
+	observeRaceLapCounts(lapMsg.Cars, *lastDataTime)
 	var completedCar *udp.LapCompletedCar
 	for _, car := range lapMsg.Cars {
 		if car != nil && car.CarID == lapMsg.CarID {
@@ -487,6 +489,7 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 			v := stintLapData[int(globalSession.ID)][slot][i]
 			if v.Time == lap.LapTime {
 				lap.Sector1, lap.Sector2, lap.Sector3, lap.Tyre = v.Sector1, v.Sector2, v.Sector3, v.Tyre
+				lap.Cuts = max(lap.Cuts, uint8(v.Cuts))
 				lap.Crashes, lap.CarCrashes = uint8(v.Crashes), uint8(v.CarCrashes)
 				break
 			}
@@ -670,8 +673,18 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 		return
 	}
 	previous := globalConnections[slot]
+	resetRaceTiming(slot)
+	if previous != nil && (previous.DriverGUID != string(msg.DriverGUID) || previous.CarModel != msg.CarModel) {
+		// 槽位换人或换车时，旧身份的实时成绩不能投影到新条目。
+		delete(carLapDataMap, slot)
+		delete(recoveredScores, slot)
+		if globalSession != nil {
+			delete(stintLapData[int(globalSession.ID)], slot)
+		}
+	}
 	resetLapSamples(slot)
 	delete(pitObservations, slot)
+	delete(positionObservations, slot)
 	delete(latestCarUpdates, msg.CarID)
 	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectedAt: time.Now(), ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
@@ -941,8 +954,10 @@ func initializeSession(msg udp.SessionInfo, newSession bool, startTime time.Time
 	lapTelemetryReady = make(map[int]bool)
 	lastLapCompletions = make(map[int]lapCompletion)
 	pitObservations = make(map[int]*pitObservation)
+	positionObservations = make(map[int]*positionObservation)
 	activeStints = make(map[int]*SessionStint)
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
+	resetAllRaceTiming()
 	bestLapTimes = make(map[int]int)
 	classBestTimes = make(map[string]int)
 	sessionStints = make([]*SessionStint, 0)
@@ -1038,6 +1053,7 @@ func handleConnectionClosedMessage(msg udp.SessionCarInfo, last *time.Time) {
 	}
 	resetLapSamples(slot)
 	delete(pitObservations, slot)
+	delete(positionObservations, slot)
 	if sessionCollecting() {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 3, Detail: feedDetail(slot, nil), Time: time.Now()})
 	}
@@ -1085,18 +1101,20 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	if !sessionCollecting() {
 		return
 	}
-	if time.Since(lastLogPoll) >= time.Second {
-		lastLogPoll = time.Now()
-		if err := collectCarUpdates(); err != nil {
-			logger.Printf("读取增量日志失败，保留游标待重试: %v", err)
-			return
-		}
-	}
 	carID := int(updateMsg.CarID)
+	// teleport feed 独立于维修区几何，不用该判据清理计时点或遥测记录。
+	if observePositionJump(updateMsg, *lastDataTime) {
+		insertPitFeed(carID, 15, nil, *lastDataTime)
+	}
+	observeRacePosition(updateMsg, *lastDataTime)
 	collectLapSample(updateMsg)
 
 	if len(pitBoundary) >= 3 {
 		inPit := pointInPolygon([2]float32{updateMsg.Pos.X, updateMsg.Pos.Z}, pitBoundary)
+		observePitVisit(carID, inPit, updateMsg, time.Now())
+	} else if pitLaneFallback != nil {
+		// 凸包不可用时按“pit_lane 折线 + NSP 区间”判，横向容差仍是近似。
+		inPit := pitLaneFallback.Contains(updateMsg.Pos.X, updateMsg.Pos.Z, updateMsg.NormalisedSplinePos)
 		observePitVisit(carID, inPit, updateMsg, time.Now())
 	}
 }
@@ -1118,25 +1136,42 @@ func getTrackLength() int {
 // loadPitBoundary 调用 kn5conv 生成/读取当前赛道的维修区边界（同一赛道只处理一次）。
 // 生成的 SVG 同时写入 cache.path/live-track-maps，供 HTTP 端赛道地图使用。
 func loadPitBoundary(trackName, configName string) {
-	if trackName == "" || cfg.App.Server.CachePath == "" {
+	if trackName == "" {
 		pitBoundary = nil
 		pitBoundaryLoadedFor = ""
+		pitLaneFallback = nil
 		return
 	}
 	key := trackName + "|" + configName
-	if pitBoundaryLoadedFor == key && len(pitBoundary) >= 3 {
+	if pitBoundaryLoadedFor == key && hasPitDetection() {
 		return
 	}
 	pitBoundary = nil
 	pitBoundaryLoadedFor = ""
-	boundary, err := kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
-	if err != nil {
-		logger.Printf("生成/读取维修区边界失败(%s)，沿用原换胎分段方式: %v", key, err)
+	pitLaneFallback = nil
+	var boundary [][3]float32
+	var err error
+	if cfg.App.Server.CachePath != "" {
+		boundary, err = kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
+	}
+	if err == nil && len(boundary) >= 3 {
+		pitBoundary = boundary
+		pitBoundaryLoadedFor = key
+		logger.Printf("维修区边界已加载: %s, 顶点数: %d", key, len(boundary))
 		return
 	}
-	pitBoundary = boundary
+	if err != nil {
+		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
+	}
+	// 凸包拿不到（赛道内容缺 KN5/pit 网格不合规）时降级到 pit_lane 折线判据。
+	fallback, ferr := kn5conv.LoadPitLaneWindow(cfg.Game.Path, trackName, configName)
+	if ferr != nil {
+		logger.Printf("维修区降级判据也不可用(%s)，不做进站判定: %v", key, ferr)
+		return
+	}
+	pitLaneFallback = fallback
 	pitBoundaryLoadedFor = key
-	logger.Printf("维修区边界已加载: %s, 顶点数: %d", key, len(boundary))
+	logger.Printf("维修区改用降级判据(pit_lane 折线 %d 点): %s", len(fallback.Points), key)
 }
 
 var currentLogFile string = ""
@@ -1342,6 +1377,22 @@ func collectCarUpdates() error {
 	lapDataMutex.Lock()
 	defer lapDataMutex.Unlock()
 
+	// 切换文件前先消费旧文件尾部，避免丢掉轮转时尚未读取的完圈或计时点。
+	previous := latestFile
+	if err := readCurrentSessionLog(); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := discoverSessionLog(); err != nil {
+		return err
+	}
+	if latestFile != nil && (previous == nil || previous.Name() != latestFile.Name()) {
+		return readCurrentSessionLog()
+	}
+	return nil
+}
+
+// readCurrentSessionLog 只读取当前文件新增内容；调用者持有 stateMutex 和 lapDataMutex。
+func readCurrentSessionLog() error {
 	if latestFile != nil {
 		//logger.Printf("最新日志文件: %s", latestFile.Name())
 		// 读取日志文件内容
@@ -1423,9 +1474,14 @@ func main() {
 	simulateMode := flag.Bool("simulate", false, "显式指定 -simulate=true 时模拟运行，不连接或写入数据库；默认真实采集")
 	flag.Parse()
 
-	configPath := firstExistingPath("config/config.toml", "simview/config/config.toml", "config.toml")
-	if configPath == "" {
-		fatalLogger.Fatalf("未找到 config.toml（已尝试 config/config.toml、simview/config/config.toml）")
+	if flag.NArg() > 1 {
+		logger.Println("用法: writer [-simulate=true] [config.toml路径]")
+		return
+	}
+	configPath, err := config.ResolvePath(flag.Arg(0))
+	if err != nil {
+		logger.Printf("选择配置文件失败: %v", err)
+		return
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -1502,6 +1558,7 @@ func main() {
 	var acClient *udp.AssettoServerUDP
 	var wsDone <-chan struct{}
 	var retryDone <-chan struct{}
+	var logDone <-chan struct{}
 	defer func() {
 		stop()
 		if acClient != nil {
@@ -1510,6 +1567,9 @@ func main() {
 		closeWebSocket()
 		if retryDone != nil {
 			<-retryDone
+		}
+		if logDone != nil {
+			<-logDone
 		}
 		stateMutex.Lock()
 		if pendingSessionEnd && globalSession != nil && globalSession.ID > 0 {
@@ -1528,6 +1588,7 @@ func main() {
 
 	// 待处理圈的后台重试独立于 UDP 连接与探活节奏。
 	retryDone = startPendingLapRetry(ctx)
+	logDone = startSessionLogPoll(ctx)
 
 	// 连接循环 - 支持重连
 outerLoop:

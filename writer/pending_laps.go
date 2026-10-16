@@ -117,7 +117,10 @@ func submitPendingLap(entry *pendingLap) error {
 			logger.Printf("写入单圈遥测失败，单圈已保存(slot=%d): %v", entry.slot, err)
 		}
 	}
-	carLapDataMap[entry.slot] = append(carLapDataMap[entry.slot], entry.carLap)
+	// 旧身份的排队圈仍可落库，但不能回填到同槽位的新车手实时成绩里。
+	if conn := globalConnections[entry.slot]; conn != nil && conn.UserID == entry.stint.UserID && conn.CarDBID == entry.stint.CarID {
+		carLapDataMap[entry.slot] = append(carLapDataMap[entry.slot], entry.carLap)
+	}
 	if globalSession != nil && globalSession.ID == entry.sessionID {
 		if globalSession.LastActivity.Before(entry.timestamp) {
 			globalSession.LastActivity = entry.timestamp
@@ -140,6 +143,8 @@ func supplementPendingLapFromLog(entry *pendingLap) {
 			continue
 		}
 		entry.record.Sector1, entry.record.Sector2, entry.record.Sector3 = v.Sector1, v.Sector2, v.Sector3
+		entry.record.Cuts = max(entry.record.Cuts, v.Cuts)
+		entry.carLap.Cuts = max(entry.carLap.Cuts, uint8(v.Cuts))
 		entry.record.Crashes, entry.record.CarCrashes = v.Crashes, v.CarCrashes
 		entry.carLap.Sector1, entry.carLap.Sector2, entry.carLap.Sector3 = v.Sector1, v.Sector2, v.Sector3
 		entry.carLap.Crashes, entry.carLap.CarCrashes = uint8(v.Crashes), uint8(v.CarCrashes)

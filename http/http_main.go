@@ -42,9 +42,20 @@ func main() {
 	initLogger()
 	logger.Println("应用程序启动")
 
-	configPath := firstExistingPath("config/config.toml", "simview/config/config.toml", "config.toml")
-	if configPath == "" {
-		fatalLogger.Fatalf("未找到 config.toml（已尝试 config/config.toml、simview/config/config.toml）")
+	// 配置路径入口：只接受一个可选参数（os.Args[1]），多参数直接报错。
+	// 无参数时由 config.ResolvePath 按约定顺序查找：config.toml 优先于 config/config.toml。
+	var explicitConfig string
+	switch len(os.Args) {
+	case 1:
+	case 2:
+		explicitConfig = os.Args[1]
+	default:
+		fatalLogger.Fatalf("参数过多: 只接受一个可选的配置文件路径，实际收到 %d 个", len(os.Args)-1)
+	}
+
+	configPath, err := config.ResolvePath(explicitConfig)
+	if err != nil {
+		fatalLogger.Fatalf("配置解析失败: %v", err)
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {

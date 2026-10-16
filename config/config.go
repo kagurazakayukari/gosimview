@@ -140,6 +140,43 @@ type OverridesConfig struct {
 	RawConfig   map[string]interface{} `toml:"-"`
 }
 
+// defaultConfigPaths 是无显式参数时的配置文件查找顺序：
+// 先当前工作目录的 config.toml，再 config/config.toml，
+// 最后是仓库当前保留的原版资源布局 simview/config/config.toml。
+var defaultConfigPaths = []string{
+	"config.toml",
+	"config/config.toml",
+	"simview/config/config.toml",
+}
+
+// ResolvePath 解析配置文件路径，供 HTTP 与 Writer 两个进程共用。
+// explicit 非空时只认它：必须是存在的普通文件，否则返回错误，不回退到默认路径。
+// explicit 为空时按 defaultConfigPaths 顺序取第一个存在的普通文件；都没有时返回错误。
+func ResolvePath(explicit string) (string, error) {
+	if explicit != "" {
+		info, err := os.Stat(explicit)
+		if err != nil {
+			return "", fmt.Errorf("指定的配置文件无法访问: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("指定的配置路径不是普通文件: %s", explicit)
+		}
+		return explicit, nil
+	}
+
+	for _, path := range defaultConfigPaths {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.Mode().IsRegular() {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("未找到配置文件（已尝试 %s）", strings.Join(defaultConfigPaths, "、"))
+}
+
 // LoadConfig 从文件加载配置
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
