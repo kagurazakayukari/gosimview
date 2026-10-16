@@ -28,6 +28,15 @@ func restoreConnectionsFromSessionLog() error {
 		return fmt.Errorf("查找最新会话日志: %w", err)
 	}
 	path := filepath.Join(logDir, file.Name())
+	info, err := file.Info()
+	if err != nil {
+		return fmt.Errorf("读取会话日志信息: %w", err)
+	}
+	// 同一日志及会话只消费新增字节，先判断身份和截断，避免反复读取整个文件。
+	if restoredSessionLogPath == path && info.Size() >= restoredSessionLogSize &&
+		globalSession != nil && recoveredLogSessionID == globalSession.ID {
+		return collectCarUpdates()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取会话日志: %w", err)
@@ -37,10 +46,6 @@ func restoreConnectionsFromSessionLog() error {
 	lines := strings.Split(content, "\n")
 	// 同一份日志、同一节的重复探活仅消费新增行，不能用历史快照覆盖实时状态。
 	newSnapshot := restoredSessionLogPath != path || int64(len(data)) < restoredSessionLogSize
-	if !newSnapshot && globalSession != nil && recoveredLogSessionID == globalSession.ID {
-		collectCarUpdates()
-		return nil
-	}
 	connections := connectionRegex.FindAllStringSubmatchIndex(content, -1)
 	latestConnections := make(map[int][]int)
 	for _, indices := range connections {
@@ -108,7 +113,9 @@ func restoreConnectionsFromSessionLog() error {
 			complete = lines[:len(lines)-1]
 		}
 		if start <= len(complete) {
-			processSessionLogLinesAt(complete[start:], true, start)
+			if _, err := processSessionLogLinesAt(complete[start:], true, start); err != nil {
+				return err
+			}
 		}
 		recoveredLogSessionID = globalSession.ID
 	}

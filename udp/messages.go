@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -24,9 +25,21 @@ import (
 
 // RealtimePosIntervalMs is the interval to request real time positional information.
 // Set this to greater than 0 to enable.
+// 外部配置：只在创建客户端前读取一次；运行期修改用 SetRealtimePosInterval。
 var RealtimePosIntervalMs = 200
-var CurrentRealtimePosIntervalMs = -1
+
+// PosIntervalModifierEnabled 控制是否按消息队列积压自适应调整实时位置间隔。
+// 外部配置：只在创建客户端前读取一次；运行期修改用 SetPosIntervalModifierEnabled。
 var PosIntervalModifierEnabled = true
+
+// maxUDPPayload 是 IPv4 上单个 UDP 数据报的最大净荷（65535 - 20 字节 IP 头 - 8 字节 UDP 头）。
+// 接收缓冲按该上界分配，避免截断协议允许的长报文（长服务器名、多车完圈报文）。
+const maxUDPPayload = 65507
+
+// readErrorBackoff 是接收循环遇到非致命读取错误后的退避时长。
+// 已连接 UDP socket 会把对端 ICMP 错误（如 port unreachable）回传给读取，
+// 这类瞬时错误不应终止接收，退避后再继续读。
+const readErrorBackoff = 100 * time.Millisecond
 
 func NewServerClient(addr string, receivePort, sendPort int, forward bool, forwardAddrStr string, forwardListenPort int, callback CallbackFunc) (*AssettoServerUDP, error) {
 	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(addr, fmt.Sprint(sendPort)))
@@ -53,6 +66,11 @@ func NewServerClient(addr string, receivePort, sendPort int, forward bool, forwa
 		callback: callback,
 		forward:  forward,
 		listener: listener,
+
+		// 包级配置在创建时读入实例，之后不再被并发读写。
+		posInterval:                RealtimePosIntervalMs,
+		currentPosInterval:         RealtimePosIntervalMs,
+		posIntervalModifierEnabled: PosIntervalModifierEnabled,
 	}
 
 	if forward && forwardAddrStr != "" && forwardListenPort != 0 {
@@ -69,6 +87,7 @@ func NewServerClient(addr string, receivePort, sendPort int, forward bool, forwa
 		}
 	}
 
+	u.wg.Add(3) // serve、forwardServe、消息处理协程各一个
 	go u.serve()
 	go u.forwardServe()
 	logrus.Debugf("Started new UDP server connection")
@@ -88,54 +107,98 @@ type AssettoServerUDP struct {
 	ctx      context.Context
 	callback CallbackFunc
 
-	closed bool
+	// 实时位置间隔的运行时状态：包级配置只在创建时读入，之后一律走方法，
+	// 避免处理协程与外部写包级变量产生数据竞争。
+	posIntervalMutex           sync.Mutex
+	posInterval                int
+	currentPosInterval         int
+	posIntervalModifierEnabled bool
+
+	closeOnce sync.Once
+	closeErr  error
+	wg        sync.WaitGroup
 }
 
+// RealtimePosInterval 返回请求的实时位置间隔。
+func (asu *AssettoServerUDP) RealtimePosInterval() int {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+	return asu.posInterval
+}
+
+// SetRealtimePosInterval 更新请求的实时位置间隔；负值表示不启用。
+func (asu *AssettoServerUDP) SetRealtimePosInterval(interval int) {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+	asu.posInterval = interval
+	asu.currentPosInterval = interval
+}
+
+// CurrentRealtimePosInterval 返回当前实际下发的实时位置间隔。
+func (asu *AssettoServerUDP) CurrentRealtimePosInterval() int {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+	return asu.currentPosInterval
+}
+
+// PosIntervalModifierEnabled 返回是否允许按队列积压自适应调整间隔。
+func (asu *AssettoServerUDP) PosIntervalModifierEnabled() bool {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+	return asu.posIntervalModifierEnabled
+}
+
+// SetPosIntervalModifierEnabled 开关按队列积压自适应调整间隔。
+func (asu *AssettoServerUDP) SetPosIntervalModifierEnabled(enabled bool) {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+	asu.posIntervalModifierEnabled = enabled
+}
+
+// Close 关闭连接并等待所有收发协程退出；重复调用返回首次结果。
 func (asu *AssettoServerUDP) Close() error {
-	if asu.closed {
-		return nil
-	}
+	asu.closeOnce.Do(asu.shutdown)
+	return asu.closeErr
+}
 
-	defer func() {
-		asu.closed = true
-	}()
-
+// shutdown 先取消 context 让接收与转发循环退出，再关闭 socket，
+// 最后等待处理协程结束：返回后不会再有旧 callback 改动外部状态。
+func (asu *AssettoServerUDP) shutdown() {
 	asu.cfn()
+
 	err := asu.listener.Close()
-
-	if err != nil {
-		return err
-	}
-
 	if asu.forwarder != nil {
-		err = asu.forwarder.Close()
-
-		if err != nil {
-			return err
+		if forwardErr := asu.forwarder.Close(); forwardErr != nil && err == nil {
+			err = forwardErr
 		}
 	}
 
+	asu.wg.Wait()
+	asu.closeErr = err
 	logrus.Debugf("Closed UDP server connection")
-
-	return nil
 }
 
 func (asu *AssettoServerUDP) forwardServe() {
+	defer asu.wg.Done()
+
 	if !asu.forward || asu.forwarder == nil {
 		return
 	}
 
+	// 接收缓冲按 UDP 最大净荷分配一次，避免逐报文重复分配。
+	buf := make([]byte, maxUDPPayload)
+
 	for {
 		select {
 		case <-asu.ctx.Done():
-			asu.forwarder.Close()
 			return
 		default:
-			buf := make([]byte, 1024)
-
 			n, _, err := asu.forwarder.ReadFromUDP(buf)
 
 			if err != nil {
+				if asu.ctx.Err() != nil {
+					return
+				}
 				continue
 			}
 
@@ -149,18 +212,34 @@ func (asu *AssettoServerUDP) forwardServe() {
 }
 
 func (asu *AssettoServerUDP) serve() {
+	defer asu.wg.Done()
+
 	messageChan := make(chan []byte, 1000)
+	// 唯一关闭点：读循环退出后关闭通道，处理协程据此结束，不会读到 nil 空转。
 	defer close(messageChan)
 
-	CurrentRealtimePosIntervalMs = RealtimePosIntervalMs
 	lastQueueSize := 0
 
 	go func() {
+		defer asu.wg.Done()
+
 		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 
 		for {
+			// 收到关闭信号时立即退出，不再消费队列里残留的报文。
 			select {
-			case buf := <-messageChan:
+			case <-asu.ctx.Done():
+				return
+			default:
+			}
+
+			select {
+			case buf, ok := <-messageChan:
+				if !ok {
+					return
+				}
+
 				msg, err := asu.handleMessage(bytes.NewReader(buf))
 
 				if err != nil {
@@ -175,69 +254,93 @@ func (asu *AssettoServerUDP) serve() {
 					_, _ = asu.forwarder.Write(buf)
 				}
 			case <-ticker.C:
-				if RealtimePosIntervalMs < 0 || !PosIntervalModifierEnabled {
-					// there is no real time pos interval set or stracker is enabled, we don't need to check if we're keeping up with messages
-					continue
-				}
-
-				currentQueueSize := len(messageChan)
-
-				if currentQueueSize > lastQueueSize {
-					logrus.Warnf("Can't keep up! queue size: %d vs %d: changed by %d", currentQueueSize, lastQueueSize, currentQueueSize-lastQueueSize)
-
-					// update as infrequently as we can, within sensible limits
-					if currentQueueSize > 5 { // at this point we are half a second behind
-						CurrentRealtimePosIntervalMs += (currentQueueSize * 2) + 1
-
-						logrus.Debugf("Adjusting real time pos interval: %d", CurrentRealtimePosIntervalMs)
-						err := asu.SendMessage(NewEnableRealtimePosInterval(CurrentRealtimePosIntervalMs))
-
-						if err != nil {
-							logrus.WithError(err).Error("Could not send realtime pos interval adjustment")
-						}
-					}
-				} else if currentQueueSize <= lastQueueSize && currentQueueSize < 5 && CurrentRealtimePosIntervalMs > RealtimePosIntervalMs {
-					logrus.Debugf("Catching up, queue size: %d vs %d: changed by %d", currentQueueSize, lastQueueSize, currentQueueSize-lastQueueSize)
-
-					if CurrentRealtimePosIntervalMs-1 >= RealtimePosIntervalMs {
-						CurrentRealtimePosIntervalMs--
-
-						logrus.Debugf("Adjusting real time pos interval, is now: %d", CurrentRealtimePosIntervalMs)
-						err := asu.SendMessage(NewEnableRealtimePosInterval(CurrentRealtimePosIntervalMs))
-
-						if err != nil {
-							logrus.WithError(err).Error("Could not send realtime pos interval adjustment")
-						}
-					}
-				}
-
-				lastQueueSize = currentQueueSize
+				asu.adjustPosInterval(len(messageChan), &lastQueueSize)
 			case <-asu.ctx.Done():
-				ticker.Stop()
 				return
 			}
 		}
 	}()
 
+	// 接收缓冲按 UDP 最大净荷分配一次，逐报文只按实际长度复制。
+	readBuf := make([]byte, maxUDPPayload)
+
 	for {
-		select {
-		case <-asu.ctx.Done():
-			asu.listener.Close()
-			return
-		default:
-			buf := make([]byte, 1024)
+		n, _, err := asu.listener.ReadFromUDP(readBuf)
 
-			// read message from assetto
-			n, _, err := asu.listener.ReadFromUDP(buf)
-
-			if err != nil {
-				logrus.WithError(err).Debug("could not read from UDP")
+		if err != nil {
+			// 只有 ctx 取消或 socket 被关闭才真正退出；其余错误视为瞬时，
+			// 记录后短退避再继续，退避期间同样可被 ctx 取消。
+			if asu.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
+			logrus.WithError(err).Error("could not read from UDP, retrying")
+			select {
+			case <-time.After(readErrorBackoff):
+			case <-asu.ctx.Done():
+				return
+			}
+			continue
+		}
 
-			messageChan <- buf[:n]
+		msg := make([]byte, n)
+		copy(msg, readBuf[:n])
+
+		select {
+		case messageChan <- msg:
+		case <-asu.ctx.Done():
+			return
 		}
 	}
+}
+
+// adjustPosInterval 按消息队列积压调整下发的实时位置间隔。
+func (asu *AssettoServerUDP) adjustPosInterval(currentQueueSize int, lastQueueSize *int) {
+	interval, changed := asu.nextPosInterval(currentQueueSize, *lastQueueSize)
+	*lastQueueSize = currentQueueSize
+
+	if !changed {
+		return
+	}
+
+	logrus.Debugf("Adjusting real time pos interval, is now: %d", interval)
+
+	if err := asu.SendMessage(NewEnableRealtimePosInterval(interval)); err != nil {
+		logrus.WithError(err).Error("Could not send realtime pos interval adjustment")
+	}
+}
+
+// nextPosInterval 计算新的实时位置间隔；第二个返回值表示是否需下发。
+func (asu *AssettoServerUDP) nextPosInterval(currentQueueSize, lastQueueSize int) (int, bool) {
+	asu.posIntervalMutex.Lock()
+	defer asu.posIntervalMutex.Unlock()
+
+	if asu.posInterval < 0 || !asu.posIntervalModifierEnabled {
+		// 未设置实时位置间隔或已关闭自适应，不需要检查是否跟得上消息
+		return asu.currentPosInterval, false
+	}
+
+	switch {
+	case currentQueueSize > lastQueueSize:
+		logrus.Warnf("Can't keep up! queue size: %d vs %d: changed by %d", currentQueueSize, lastQueueSize, currentQueueSize-lastQueueSize)
+
+		// 尽早更新，但保持在合理范围内
+		if currentQueueSize > 5 { // 此时已经落后半秒
+			asu.currentPosInterval += (currentQueueSize * 2) + 1
+			return asu.currentPosInterval, true
+		}
+	case currentQueueSize <= lastQueueSize && currentQueueSize < 5 && asu.currentPosInterval > asu.posInterval:
+		logrus.Debugf("Catching up, queue size: %d vs %d: changed by %d", currentQueueSize, lastQueueSize, currentQueueSize-lastQueueSize)
+
+		if asu.currentPosInterval-1 >= asu.posInterval {
+			asu.currentPosInterval--
+			return asu.currentPosInterval, true
+		}
+	}
+
+	return asu.currentPosInterval, false
 }
 
 func readStringW(r io.Reader) string {
@@ -296,7 +399,7 @@ func writeStringW(w io.Writer, value string) error {
 func (asu *AssettoServerUDP) SendMessage(message Message) error {
 	switch a := message.(type) {
 	case EnableRealtimePosInterval:
-		if PosIntervalModifierEnabled {
+		if asu.PosIntervalModifierEnabled() {
 			return binary.Write(asu.listener, binary.LittleEndian, a)
 		}
 
@@ -624,11 +727,10 @@ func (asu *AssettoServerUDP) handleMessage(r io.Reader) (Message, error) {
 
 		response = sessionInfo
 
-		if RealtimePosIntervalMs > 0 && eventType == EventNewSession {
-			err = asu.SendMessage(NewEnableRealtimePosInterval(RealtimePosIntervalMs))
-
-			if err != nil {
-				return nil, err
+		if interval := asu.RealtimePosInterval(); interval > 0 && eventType == EventNewSession {
+			// 副作用失败不能丢弃已解析的报文：会话信息必须送达回调。
+			if err := asu.SendMessage(NewEnableRealtimePosInterval(interval)); err != nil {
+				logrus.WithError(err).Error("could not enable realtime pos interval on new session")
 			}
 		}
 	case EventError:

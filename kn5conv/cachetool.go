@@ -314,7 +314,7 @@ func generatePitBoundary(model *KN5Model, aiPoints [][3]float32, cacheDir, kn5Fi
 	// 1. 筛选pit相关节点（名称包含pit，不区分大小写）
 	var pitVertices [][3]float32
 	for _, node := range model.Nodes {
-		if strings.Contains(strings.ToUpper(node.Name), surfaceName) && node.VertexCount > 0 {
+		if strings.Contains(strings.ToUpper(node.Name), strings.ToUpper(surfaceName)) && node.VertexCount > 0 {
 			// 提取顶点数据（x,y,z）
 			for i := 0; i < len(node.Position); i += 3 {
 				if i+2 >= len(node.Position) {
@@ -1079,6 +1079,23 @@ func readNodes(r io.ReadSeeker, nodeList []*KN5Node, parentID int32) ([]*KN5Node
 			return nil, fmt.Errorf("读取bcd字节失败: %w", err)
 		}
 
+		// animated mesh 的骨骼块位于顶点数据之前：先读骨骼，再读顶点数量。
+		if newNode.Type == 3 {
+			var boneCount int32
+			if err := binary.Read(r, binary.LittleEndian, &boneCount); err != nil {
+				return nil, fmt.Errorf("读取骨骼数量失败: %w", err)
+			}
+			for b := 0; b < int(boneCount); b++ {
+				var boneNameLen int32
+				if err := binary.Read(r, binary.LittleEndian, &boneNameLen); err != nil {
+					return nil, fmt.Errorf("读取骨骼名称长度[%d]失败: %w", b, err)
+				}
+				if _, err := r.Seek(int64(boneNameLen)+64, io.SeekCurrent); err != nil { // 骨骼名称 + 64字节矩阵
+					return nil, fmt.Errorf("跳过骨骼数据[%d]失败: %w", b, err)
+				}
+			}
+		}
+
 		// 读取顶点数量（int32）
 		if err := binary.Read(r, binary.LittleEndian, &newNode.VertexCount); err != nil {
 			return nil, fmt.Errorf("读取顶点数量失败: %w", err)
@@ -1116,23 +1133,6 @@ func readNodes(r io.ReadSeeker, nodeList []*KN5Node, parentID int32) ([]*KN5Node
 		}
 		if _, err := r.Seek(skipLen, io.SeekCurrent); err != nil {
 			return nil, fmt.Errorf("跳过索引/材质ID失败: %w", err)
-		}
-
-		// animated mesh额外跳过骨骼数据
-		if newNode.Type == 3 {
-			var boneCount int32
-			if err := binary.Read(r, binary.LittleEndian, &boneCount); err != nil {
-				return nil, fmt.Errorf("读取骨骼数量失败: %w", err)
-			}
-			for b := 0; b < int(boneCount); b++ {
-				var boneNameLen int32
-				if err := binary.Read(r, binary.LittleEndian, &boneNameLen); err != nil {
-					return nil, fmt.Errorf("读取骨骼名称长度[%d]失败: %w", b, err)
-				}
-				if _, err := r.Seek(int64(boneNameLen)+64, io.SeekCurrent); err != nil { // 骨骼名称 + 64字节矩阵
-					return nil, fmt.Errorf("跳过骨骼数据[%d]失败: %w", b, err)
-				}
-			}
 		}
 	}
 

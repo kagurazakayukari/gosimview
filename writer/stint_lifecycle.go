@@ -47,8 +47,8 @@ func connStintStartedAt(conn *ConnectionInfo, observedAt time.Time) time.Time {
 // 按真实连接或本次起步时间建立区间，不把进站新段退回旧连接时间。
 func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 	conn := globalConnections[slot]
-	if conn == nil || conn.UserID == 0 || conn.CarDBID == 0 || globalSession == nil || globalSession.ID == 0 {
-		return nil, fmt.Errorf("车辆 %d 身份或当前会话尚未恢复", slot)
+	if !sessionCollecting() || conn == nil || conn.UserID == 0 || conn.CarDBID == 0 {
+		return nil, fmt.Errorf("车辆 %d 身份未恢复或当前会话已停止采集", slot)
 	}
 	stint := activeStints[slot]
 	if stint != nil && (stint.UserID != conn.UserID || stint.CarID != conn.CarDBID) {
@@ -58,7 +58,7 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 		stint = nil
 	}
 	if stint != nil && stint.IsFinished == 0 {
-		return stint, nil
+		return stint, persistStint(stint)
 	}
 	startedAt := connStintStartedAt(conn, observedAt)
 	if startedAt.IsZero() {
@@ -73,14 +73,24 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 			}
 		}
 	}
-	id, err := globalDBWriter.CreateSessionStint(stint)
-	if err != nil {
-		return nil, err
-	}
-	stint.ID = int(id)
+	// 先保留已观测段的身份与起点；建段失败时完圈仍能绑定同一对象重试。
 	activeStints[slot] = stint
 	sessionStints = append(sessionStints, stint)
-	return stint, nil
+	return stint, persistStint(stint)
+}
+
+// persistStint 将已观测的内存段写库，失败不丢弃其身份或原始起点。
+// 调用者持有 stateMutex。
+func persistStint(stint *SessionStint) error {
+	if stint.ID != 0 {
+		return nil
+	}
+	id, err := globalDBWriter.CreateSessionStint(stint)
+	if err != nil {
+		return err
+	}
+	stint.ID = int(id)
+	return nil
 }
 
 // finishStint 结束槽位当前未完成的 stint：先写库成功，再改内存；写库失败时返回错误并保留
@@ -89,6 +99,9 @@ func finishStint(slot int) error {
 	stint := activeStints[slot]
 	if stint == nil || stint.IsFinished != 0 {
 		return nil
+	}
+	if err := persistStint(stint); err != nil {
+		return err
 	}
 	finishedAt := time.Now()
 	if _, err := globalDBWriter.executeSQL("UPDATE session_stint SET is_finished=1,finished_at=? WHERE session_stint_id=?", finishedAt, stint.ID); err != nil {
