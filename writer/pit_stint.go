@@ -100,13 +100,13 @@ func observePitVisit(slot int, inPit bool, update udp.CarUpdate, now time.Time) 
 		}
 		conn.PitEntryTime = time.Time{}
 		obs.entryTime = time.Time{}
-		conn.TrackStatus = 4
+		conn.TrackStatus = 0
 	} else if inPit {
-		if stopped {
-			conn.TrackStatus = 3
-		} else {
-			conn.TrackStatus = 2
-		}
+		// 整个维修区逗留（先行驶、再停稳）原版都只发 PIT_LANE(3)，不会发 PIT_ENTRY(2)；
+		// 离开时直接回到 ON_TRACK(0)，也不用 PIT_EXIT(4)。
+		// 现场验证：真实赛道 sx_lemans 上沿维修道开进、停稳、开出，帧里依次是 0→3→3→…→0。
+		// 页面只对 PIT_LANE 加 lb-row-pit 高亮，发 2 会让行车中的车丢高亮。
+		conn.TrackStatus = 3
 	} else {
 		conn.TrackStatus = 0
 	}

@@ -22,7 +22,9 @@ var wsEventID int
 var reconnectDelay = 5 * time.Second
 
 // 名次字段及 feed 编码有原版证据；相邻快照名次差是 Go 侧采用的计算规则。
-// 基线只由广播快照更新，受 stateMutex 保护；槽位换人、换车或换队须建立新基线。
+// 已用双车换位抓帧对照原版：posChange 只在顺序变化的那一次广播出现 ±1，
+// 下一帧即归零，正为升位；圈数反超与 NSP 反超走同一计算，不区分原因。
+// 基线与 session 绑定；槽位换人、换车或换队须建立新基线。
 type positionIdentity struct {
 	slot   int
 	userID int64
@@ -61,23 +63,11 @@ func applyPositionChanges(entries []Entry, sessionID int) {
 	prevPositions = current
 }
 
-// recordPositionChangeFeeds 给发生名次变动的车写入 type=10 feed；
-// detail 字段与 live.js getPositionChangeMsg 一致（final_pos 为 0 基名次）。
-// 调用者持有 stateMutex，身份和 session 与本次名次快照一致。
-func recordPositionChangeFeeds(sessionID int64, entries []Entry) {
-	for i := range entries {
-		if entries[i].PosChange == 0 {
-			continue
-		}
-		detail := feedDetail(entries[i].GameCarID, map[string]interface{}{
-			"pos_change": int(entries[i].PosChange),
-			"final_pos":  i,
-		})
-		if err := globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: sessionID, Type: 10, Detail: detail, Time: time.Now()}); err != nil {
-			logger.Printf("插入名次变化 feed 失败: %v", err)
-		}
-	}
-}
+// recordPositionChangeFeeds 已移除：原版不产 type=10 feed。
+// 依据（原版直接证据）：反编译原版 SimViewWriter 时，11 个 session_feed 插入点
+// 的 type 常量只有 0/1/2/3/4/5/6/7/11/12/16 加一个动态值（传送 15），没有 10；
+// 运行时也验证过：双车换位产生 posChange 的 107 帧里，feed 只出现 2 和 5。
+// 名次变化只走二进制帧字段，页面据此显示升降位提示。
 
 // initWebSocket 建立 writer 专用发布连接；事件切换后必须更新 cookie。
 func initWebSocket(ctx context.Context) error {
@@ -167,12 +157,8 @@ func buildAndSendWebSocketMessage() {
 	}
 	s := *globalSession
 	eventID := globalEvent.ID
-	collecting := sessionCollecting()
 	entries, _ := parseLeaderboardEntries(int(s.ID), latestCarUpdates)
 	applyPositionChanges(entries, int(s.ID))
-	if collecting {
-		recordPositionChangeFeeds(s.ID, entries)
-	}
 	stateMutex.Unlock()
 	interval := cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS
 	if interval <= 0 {

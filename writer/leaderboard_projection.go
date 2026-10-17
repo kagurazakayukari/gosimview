@@ -150,7 +150,6 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 	// 3) 已提交 UDP 历史（分段可能由日志补全）
 	if values := carLapDataMap[slot]; len(values) > 0 {
 		last := values[len(values)-1]
-		p.entry.Laps = last.Laps
 		if last.Completed != 0 {
 			p.entry.StatusMask |= 1
 		}
@@ -202,12 +201,19 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 		p.displayed = best.segments
 	}
 
-	// ValidLaps：恢复基线 + 本会话内同身份的 stint，避免双计数，也不混入同槽位的旧车手。
-	validLaps := 0
+	// Laps / ValidLaps 按本会话已提交的圈自己数，和原版一致：
+	// 每完成一圈都算 laps（含无效圈），只有干净圈算 validLaps。
+	// 不采用 UDP 报文里的 laps 字段：原版也不采用（实测报文写 57/3/3/0，
+	// 帧内仍然 1/2/3/4），而且 AC 那边的字段口径与我们不一致。
+	stintLaps, validLaps := 0, 0
 	for _, stint := range sessionStints {
 		if stint.GameCarID == slot && stint.UserID == conn.UserID {
+			stintLaps += stint.Laps
 			validLaps += stint.ValidLaps
 		}
+	}
+	if uint16(stintLaps) > p.entry.Laps {
+		p.entry.Laps = uint16(stintLaps)
 	}
 	if uint16(validLaps) > p.entry.ValidLaps {
 		p.entry.ValidLaps = uint16(validLaps)
@@ -221,6 +227,7 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 			}
 		}
 		if !known {
+			p.entry.Laps = uint16(score.Laps + stintLaps)
 			p.entry.ValidLaps = uint16(score.ValidLaps + validLaps)
 		}
 	}
