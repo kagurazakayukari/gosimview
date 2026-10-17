@@ -111,6 +111,12 @@ func dispatchSessionResource(w http.ResponseWriter, r *http.Request, sessionID i
 	case strings.HasPrefix(resourceType, "result/stints/user/"):
 		uid, cid := parseUserCar(resourceType)
 		handleSessionStints(w, sessionID, uid, cid, 0)
+	case resourceType == "cars":
+		// 原版 /api/ac/session/{id}/cars：该会话用过的车
+		handleSessionCars(w, sessionID)
+	case resourceType == "stints":
+		// 原版 /api/ac/session/{id}/stints：该会话全部 stint（不带 result/ 前缀）
+		handleSessionAllStints(w, sessionID)
 	default:
 		sendErrorResponse(w, http.StatusNotFound, "未知的会话资源", "session")
 	}
@@ -750,4 +756,87 @@ func parseUserCar(s string) (int, int) {
 		}
 	}
 	return uid, cid
+}
+
+// handleSessionCars 返回该会话用过的车（原版 /api/ac/session/{id}/cars）。
+func handleSessionCars(w http.ResponseWriter, sessionID int) {
+	rows, err := db.Query(`SELECT DISTINCT c.car_id, c.name, COALESCE(c.display_name, ''),
+		COALESCE(c.manufacturer, ''), COALESCE(c.car_class, '')
+		FROM session_stint ss JOIN car c ON ss.car_id = c.car_id
+		WHERE ss.session_id = ?`, sessionID)
+	if err != nil {
+		logger.Printf("会话车辆查询失败: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "车辆数据查询失败", "cars")
+		return
+	}
+	defer rows.Close()
+
+	cars := []ACCar{}
+	for rows.Next() {
+		var c ACCar
+		if err := rows.Scan(&c.CarID, &c.Name, &c.DisplayName, &c.Manufacturer, &c.CarClass); err != nil {
+			logger.Printf("会话车辆行扫描失败: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "车辆数据解析失败", "cars")
+			return
+		}
+		cars = append(cars, c)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Printf("会话车辆行迭代错误: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "车辆数据处理失败", "cars")
+		return
+	}
+	sendSuccessResponse(w, "会话车辆数据获取成功", "cars", cars)
+}
+
+// sessionStintRow 是原版 /api/ac/session/{id}/stints 的单条记录。
+// 字段顺序与 session_stint 表一致，时间列可空。
+type sessionStintRow struct {
+	SessionStintID int    `json:"session_stint_id"`
+	UserID         int    `json:"user_id"`
+	TeamMemberID   int    `json:"team_member_id"`
+	SessionID      int    `json:"session_id"`
+	CarID          int    `json:"car_id"`
+	GameCarID      int    `json:"game_car_id"`
+	Laps           int    `json:"laps"`
+	ValidLaps      int    `json:"valid_laps"`
+	BestLapID      int    `json:"best_lap_id"`
+	IsFinished     int    `json:"is_finished"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at"`
+}
+
+// handleSessionAllStints 返回该会话全部 stint（原版 /api/ac/session/{id}/stints，无 result/ 前缀）。
+func handleSessionAllStints(w http.ResponseWriter, sessionID int) {
+	rows, err := db.Query(`SELECT session_stint_id, COALESCE(user_id, 0), COALESCE(team_member_id, 0),
+		COALESCE(session_id, 0), COALESCE(car_id, 0), COALESCE(game_car_id, 0),
+		COALESCE(laps, 0), COALESCE(valid_laps, 0), COALESCE(best_lap_id, 0),
+		COALESCE(is_finished, 0),
+		COALESCE(DATE_FORMAT(started_at, '%Y-%m-%d %H:%i:%s'), ''),
+		COALESCE(DATE_FORMAT(finished_at, '%Y-%m-%d %H:%i:%s'), '')
+		FROM session_stint WHERE session_id = ? ORDER BY session_stint_id ASC`, sessionID)
+	if err != nil {
+		logger.Printf("会话 stint 查询失败: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "stint 查询失败", "session_stints")
+		return
+	}
+	defer rows.Close()
+
+	stints := []sessionStintRow{}
+	for rows.Next() {
+		var s sessionStintRow
+		if err := rows.Scan(&s.SessionStintID, &s.UserID, &s.TeamMemberID, &s.SessionID, &s.CarID,
+			&s.GameCarID, &s.Laps, &s.ValidLaps, &s.BestLapID, &s.IsFinished, &s.StartedAt, &s.FinishedAt); err != nil {
+			logger.Printf("会话 stint 行扫描失败: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "stint 数据解析失败", "session_stints")
+			return
+		}
+		stints = append(stints, s)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Printf("会话 stint 行迭代错误: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "stint 数据处理失败", "session_stints")
+		return
+	}
+	sendSuccessResponse(w, "会话 stint 数据获取成功", "session_stints", stints)
 }

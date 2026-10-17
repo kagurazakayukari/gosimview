@@ -17,6 +17,8 @@ const pitStoppedSpeedMS = 0.1
 // hasPitDetection 统一分段条件：KN5 或 AI 判据可用时，以区内停车为准；
 // 两者都不可用才允许日志换胎分段。
 func hasPitDetection() bool {
+	pitGeometryMu.RLock()
+	defer pitGeometryMu.RUnlock()
 	return len(pitBoundary) >= 3 || pitLaneFallback != nil
 }
 

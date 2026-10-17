@@ -74,10 +74,7 @@ func handleACEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			// 有实时推送时优先使用（可能比库里的更新）
-			if live := hubLiveSession(id); live != nil && live.SessionID >= session.SessionID {
-				session = *live
-			}
+			// 实时帧已经回到 Writer 自己的 /live，http 不再持有实时推送状态，只用库里的最新会话。
 			sessions = append(sessions, session)
 		}
 		sendSuccessResponse(w, "最新事件会话获取成功", "sessions", sessions)
@@ -148,10 +145,28 @@ func queryEvents(ids []int) []ACEventResponse {
 	return events
 }
 
-// collectLiveEvents 只返回有新鲜 writer 推送的未结束赛事。
-// event.active 是持久化的赛事标记，不能证明 writer 或 AC 当前在线。
+// collectLiveEvents 返回未结束且有近期活动的赛事。
+// 实时帧在 Writer 的 /live，http 只能用库里的 session 状态判断“是否在跑”。
 func collectLiveEvents() []ACEventResponse {
-	return queryEvents(hubLiveEventIDs())
+	rows, err := db.Query(`SELECT DISTINCT event_id FROM session
+		WHERE COALESCE(is_finished, 0) = 0 ORDER BY event_id DESC`)
+	if err != nil {
+		logger.Printf("活跃赛事查询失败: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	ids := make([]int, 0, 8)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return queryEvents(ids)
 }
 
 // 处理AC活跃事件请求
@@ -686,6 +701,59 @@ func handleACTracks(w http.ResponseWriter, r *http.Request) {
 }
 
 // 处理AC圈速摘要请求
+// stintLapDetail 是原版 /api/ac/lap/{id} 的单圈明细结构。
+type stintLapDetail struct {
+	StintLapID int64   `json:"stint_lap_id"`
+	StintID    int64   `json:"stint_id"`
+	Sector1    int64   `json:"sector_1"`
+	Sector2    int64   `json:"sector_2"`
+	Sector3    int64   `json:"sector_3"`
+	Grip       float64 `json:"grip"`
+	Tyre       string  `json:"tyre"`
+	Time       int64   `json:"time"`
+	Cuts       int64   `json:"cuts"`
+	Crashes    int64   `json:"crashes"`
+	CarCrashes int64   `json:"car_crashes"`
+	MaxSpeed   int64   `json:"max_speed"`
+	AvgSpeed   int64   `json:"avg_speed"`
+	FinishedAt string  `json:"finished_at"` // stint_lap.finished_at 是 timestamp(6)
+}
+
+// handleACLapDetail 对应原版 /api/ac/lap/{stint_lap_id}：只返回单圈明细。
+func handleACLapDetail(w http.ResponseWriter, r *http.Request) {
+	idText := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/ac/lap/"), "/")
+	if idText == "" || strings.Contains(idText, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	lapID, err := strconv.Atoi(idText)
+	if err != nil {
+		sendErrorResponse(w, http.StatusBadRequest, "无效的单圈ID", "stint_lap")
+		return
+	}
+
+	lap := stintLapDetail{}
+	err = db.QueryRow(`SELECT stint_lap_id, COALESCE(stint_id, 0), COALESCE(sector_1, 0), COALESCE(sector_2, 0),
+		COALESCE(sector_3, 0), COALESCE(grip, 0), COALESCE(tyre, ''), COALESCE(time, 0),
+		COALESCE(cuts, 0), COALESCE(crashes, 0), COALESCE(car_crashes, 0),
+		COALESCE(max_speed, 0), COALESCE(avg_speed, 0),
+		COALESCE(DATE_FORMAT(finished_at, '%Y-%m-%d %H:%i:%s'), '')
+		FROM stint_lap WHERE stint_lap_id = ?`, lapID).Scan(
+		&lap.StintLapID, &lap.StintID, &lap.Sector1, &lap.Sector2, &lap.Sector3,
+		&lap.Grip, &lap.Tyre, &lap.Time, &lap.Cuts, &lap.Crashes, &lap.CarCrashes,
+		&lap.MaxSpeed, &lap.AvgSpeed, &lap.FinishedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			sendErrorResponse(w, http.StatusNotFound, "单圈未找到", "stint_lap")
+			return
+		}
+		logger.Printf("查询单圈明细失败: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "单圈查询失败", "stint_lap")
+		return
+	}
+	sendSuccessResponse(w, "单圈明细获取成功", "stint_lap", lap)
+}
+
 func handleACLapSummary(w http.ResponseWriter, r *http.Request) {
 	lapID := strings.TrimPrefix(r.URL.Path, "/api/ac/lap/summary/")
 
@@ -1281,9 +1349,7 @@ func handleACEventDetails(w http.ResponseWriter, r *http.Request) {
 			sendErrorResponse(w, http.StatusNotFound, "未找到会话数据", "session")
 			return
 		}
-		if live := hubLiveSession(eventID); live != nil && live.SessionID >= session.SessionID {
-			session = *live
-		}
+		// 实时帧归 Writer，http 只返回库里的最新会话。
 		sendSuccessResponse(w, "事件会话数据获取成功", "session", session)
 		return
 	case "sessions":

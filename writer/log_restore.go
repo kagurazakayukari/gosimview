@@ -17,6 +17,32 @@ var restoredSessionLogPath string
 var recoveredLogSessionID int64
 var restoredSessionLogSize int64
 
+// entryListLocked 表示 server_cfg.ini 的 LOCKED_ENTRY_LIST=1：槽位与车手一一对应。
+func entryListLocked() bool {
+	return globalDBWriter != nil && globalDBWriter.ServerCfg != nil && globalDBWriter.ServerCfg.LockedEntryList == 1
+}
+
+// entryForGUID 按 GUID 反查 entry_list 条目。
+// entry_list 里的 GUID 可以是分号分隔的多人共享车组，取第一个可用值匹配。
+// 未锁定车单时车手可以选任意槽位，所以身份装饰不能只靠槽位下标。
+func entryForGUID(guid string) (EntryListDriver, bool) {
+	if guid == "" {
+		return EntryListDriver{}, false
+	}
+	entryListMutex.Lock()
+	defer entryListMutex.Unlock()
+	for _, driver := range globalEntryList {
+		if firstGUID(driver.GUID) == guid {
+			return driver, true
+		}
+	}
+	return EntryListDriver{}, false
+}
+
+// seedConnectionsFromEntryList 已移除：车是一辆一辆加入的。
+// entry_list 定义的是**槽位**（车号 + DRIVERNAME + GUID，锁定车单时一一对应），
+// 但没上场的车不应该出现在排行榜里；名单仍靠日志连接块与 UDP NewConnection。
+
 // restoreConnectionsFromSessionLog 恢复原 handleSessionInfoMessage 的启动职责。
 // 连接记录按文件顺序恢复各槽位最后一位车手；槽位取 DRIVER ACCEPTED FOR CAR，
 // 不能用状态行的编号或 SesID 代替。无完圈的已连接车手同样需要恢复。
@@ -63,6 +89,12 @@ func restoreConnectionsFromSessionLog() error {
 			continue
 		}
 		entry := globalEntryList[slot]
+		// 锁定车单时槽位即车手条目；未锁定时车手可任选槽位，只能按 GUID 反查。
+		if !entryListLocked() {
+			if byGUID, ok := entryForGUID(content[indices[8]:indices[9]]); ok {
+				entry = byGUID
+			}
+		}
 		conn := &ConnectionInfo{
 			CarID: slot, DriverName: name, DriverGUID: content[indices[8]:indices[9]],
 			CarModel: cleanRequestedCarModel(content[indices[6]:indices[7]]), CarSkin: entry.Skin,
@@ -81,6 +113,8 @@ func restoreConnectionsFromSessionLog() error {
 		}
 		globalConnections[slot] = conn
 	}
+	// 不铺未上场的车：整场都没上线的不显示（entry_list 只做身份装饰）。
+	// 上线过又断开的已有 NewConnection 记录，ConnectionStatus 置 2 保留在榜上。
 	latestFile = file
 	// 原 collectCarUpdates 按最后一条 SESSION: 定位当前节。
 	// 先回放该节已生成的成绩，再接着处理新增字节。

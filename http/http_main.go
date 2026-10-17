@@ -93,23 +93,9 @@ func main() {
 		logger.Printf("警告: 已配置 ssl.cert.file/private.key.file，但当前未启用 HTTPS（仍以明文 HTTP 监听）")
 	}
 
-	// 直播 WebSocket 端口：writer.http.port，为 0 时退回 ac.server.udp.local.port
-	lbPort := cfg.Writer.HTTP.Port
-	if lbPort == 0 {
-		lbPort = cfg.ACServer.UDP.LocalPort
-	}
-
-	// 主 HTTP 端口已通过 setupRoutes 提供 /live；两者相同则不重复绑定
-	if lbPort > 0 && lbPort != port {
-		wsMux := http.NewServeMux()
-		wsMux.HandleFunc("/live", handleACEventWebSocket)
-		addr := listenAddr(host, lbPort)
-		go func() {
-			logger.Printf("WebSocket服务器监听地址: %s", addr)
-			if err := http.ListenAndServe(addr, wsMux); err != nil {
-				logger.Printf("WebSocket服务器启动失败: %v", err)
-			}
-		}()
+	// 实时帧由 Writer 自己的 /live 提供（原版就是这个结构），http 不再开第二个 WS 监听。
+	if cfg.Writer.HTTP.Port > 0 && cfg.Writer.HTTP.Port != port {
+		logger.Printf("提示: writer.http.port=%d 由 Writer 进程监听 /live，http 不再转发", cfg.Writer.HTTP.Port)
 	}
 
 	// 启动主HTTP服务器

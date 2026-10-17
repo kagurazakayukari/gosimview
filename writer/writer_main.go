@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -63,13 +64,9 @@ var (
 	// 数据收集控制
 	dataCollectionEnabled bool = false
 	// 周期 UDP 在文件恢复完成后才进入当前采集状态。
-	recoveryReady bool
-	// 新节初始化失败时保留真实通知，重试时不能把旧节当作新节继续采集。
-	pendingNewSession *udp.SessionInfo
+	recoveryReady     bool
 	pendingSessionEnd bool
 	pendingEndMessage *udp.EndSession
-	// 新节首次到达时固定的起点基准；重试沿用同一基准，避免 now-旧 elapsed 漂移。
-	pendingNewSessionStartTime time.Time
 	// 当前采集会话的轻量签名，用于判定探活响应是否仍是同一节。
 	activeSessionSignature string
 	// 全局变量用于暂存车辆信息，带互斥锁保证并发安全
@@ -89,15 +86,21 @@ var (
 	lastFileModTime time.Time // 新增：用于跟踪日志文件的最后修改时间
 	// 静态会话ID计数器，用于模拟环境
 	staticSessionIDCounter int64
-	// 维修区边界
-	pitBoundary [][3]float32
-	// 已加载边界的赛道标识（track|config），避免重复生成
+	// 维修区几何。慢速构建在后台执行，读侧只取一次受保护的快照。
+	pitGeometryMu        sync.RWMutex
+	pitBoundary          [][3]float32
 	pitBoundaryLoadedFor string
-	// 凸包不可用时的降级判据（pit_lane 折线 + NSP 区间），同一赛道只加载一次
-	pitLaneFallback *kn5conv.PitLaneWindow
+	pitLaneFallback      *kn5conv.PitLaneWindow
+	trackLeftWall        [][2]float32
+	trackRightWall       [][2]float32
+	pitLoadMu            sync.Mutex
+	pitLoadingKeys       = make(map[string]bool)
+	pitGeometryCache     = make(map[string]pitGeometry)
+	pitRequestedKey      string
 	// 新增：用于实时发送遥测数据的全局变量
-	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
-	wsMutex          sync.Mutex
+	latestCarUpdates  = make(map[udp.CarID]udp.CarUpdate)
+	lastActivityTouch time.Time
+	wsMutex           sync.Mutex
 )
 
 // 定义结构体
@@ -280,6 +283,9 @@ type Session struct {
 // ServerConfig 服务器配置结构体
 type ServerConfig struct {
 	Name                 string
+	Track                string // server_cfg.ini 的 TRACK，可能带相对路径
+	TrackConfig          string // CONFIG_TRACK
+	LockedEntryList      int    // LOCKED_ENTRY_LIST：1 槽位与车手一一对应，0 车手可任选槽位
 	Slots                int
 	Port                 int
 	HTTP                 string
@@ -569,7 +575,8 @@ func handleCarInfoMessage(msg udp.CarInfo, last *time.Time) {
 	slot := int(msg.CarID)
 	conn := globalConnections[slot]
 	if conn == nil {
-		conn = &ConnectionInfo{CarID: slot, TrackStatus: 3}
+		// 槽位轮询发现的在场车：默认按正常路面，等越线或车辆更新再改。
+		conn = &ConnectionInfo{CarID: slot, TrackStatus: 0}
 		globalConnections[slot] = conn
 	}
 	conn.DriverName, conn.DriverGUID, conn.CarModel, conn.CarSkin = msg.DriverName, string(msg.DriverGUID), msg.CarModel, msg.CarSkin
@@ -662,6 +669,31 @@ func initializeConnectionIdentity(conn *ConnectionInfo) {
 	conn.TeamID = int(getTeamIDByCarID(conn.CarID))
 }
 
+// activeACClient 是当前 UDP 客户端，供需要回发报文的地方（如欢迎语）使用。
+var activeACClient *udp.AssettoServerUDP
+
+// sendWelcomeChat 给新连上的车手发欢迎语（游戏聊天窗）。
+// 原文案带直播地址，但这是发进 AC 聊天窗的，不需要写地址，所以只留两行说明。
+// 调用者持有 stateMutex；发包失败只记日志，不影响连接处理。
+func sendWelcomeChat(slot int) {
+	if activeACClient == nil {
+		return
+	}
+	name := ""
+	if conn := globalConnections[slot]; conn != nil {
+		name = conn.DriverName
+	}
+	text := "Welcome " + name + " !\n" + "All your session activity in this server are tracked using SimView\n"
+	msg, err := udp.NewSendChat(udp.CarID(slot), text)
+	if err != nil {
+		logger.Printf("拼欢迎语失败(slot=%d): %v", slot, err)
+		return
+	}
+	if err := activeACClient.SendMessage(msg); err != nil {
+		logger.Printf("发送欢迎语失败(slot=%d): %v", slot, err)
+	}
+}
+
 func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	*last = time.Now()
 	slot := int(msg.CarID)
@@ -688,7 +720,32 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	delete(latestCarUpdates, msg.CarID)
 	conn := &ConnectionInfo{CarID: slot, DriverName: msg.DriverName, DriverGUID: string(msg.DriverGUID), CarModel: msg.CarModel, CarSkin: msg.CarSkin, DriverInitials: msg.DriverInitials, CarName: msg.CarName, ConnectedAt: time.Now(), ConnectionStatus: 1, TrackStatus: 3, TrackStatusLastChangedTime: time.Now()}
 	globalConnections[slot] = conn
+	// entry_list 的用法取决于 LOCKED_ENTRY_LIST：
+	// 1 = 槽位与车手一一对应，直接取 slot 对应条目；
+	// 0 = 车手可选任意车，只能按 GUID 反查自己的条目。
+	if entryListLocked() {
+		entryListMutex.Lock()
+		entry, ok := globalEntryList[slot]
+		entryListMutex.Unlock()
+		if ok {
+			if entry.Skin != "" {
+				conn.CarSkin = entry.Skin
+			}
+			if entry.Team != "" {
+				conn.CarName = entry.Team
+			}
+		}
+	} else if entry, ok := entryForGUID(conn.DriverGUID); ok {
+		if entry.Team != "" {
+			conn.CarName = entry.Team
+		}
+		if entry.Skin != "" {
+			conn.CarSkin = entry.Skin
+		}
+	}
 	initializeConnectionIdentity(conn)
+	// 原版在 NewConnection 时发一条欢迎聊天（EventSendChat 202），文案里带直播链接。
+	sendWelcomeChat(slot)
 	if sessionCollecting() && conn.UserID > 0 {
 		globalDBWriter.InsertSessionFeed(&SessionFeed{SessionID: globalSession.ID, Type: 2, Detail: feedDetail(slot, nil), Time: time.Now()})
 		if previous != nil && conn.TeamID > 0 && previous.UserID > 0 && previous.UserID != conn.UserID {
@@ -732,12 +789,21 @@ func completePendingSessionEnd() error {
 		return err
 	}
 	if pendingEndMessage != nil {
-		data, err := readSessionDataFromJSON(filepath.Join(cfg.Game.Path, string(*pendingEndMessage)))
-		if err != nil {
-			// 官方结束通知足以收尾；辅助结果文件缺失或损坏不能永久阻塞下一节。
-			logger.Printf("结束成绩文件不可用，已观测圈保留并继续收尾: %v", err)
-		} else if err := importResultLaps(data); err != nil {
-			return err
+		// EndSession 的载荷是结果文件名，可以是空的；空值 join 后会变成 game.path 目录，
+		// 读目录只会得到 “Incorrect function”，不要当错误刷日志。
+		if name := strings.TrimSpace(string(*pendingEndMessage)); name != "" {
+			path := filepath.Join(cfg.Game.Path, name)
+			if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+				logger.Printf("结束成绩文件路径是目录，跳过回填: %s", path)
+			} else {
+				data, err := readSessionDataFromJSON(path)
+				if err != nil {
+					// 官方结束通知足以收尾；辅助结果文件缺失或损坏不能永久阻塞下一节。
+					logger.Printf("结束成绩文件不可用，已观测圈保留并继续收尾: %v", err)
+				} else if err := importResultLaps(data); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return finishCurrentSession()
@@ -836,26 +902,18 @@ func importResultLaps(data *SessionData) error {
 }
 
 // 初始化会话使用同一条路径，启动接入已有比赛与换节都可采集。
+// handleNewSessionMessage 按原版 870664e 的做法：直接建会话，失败只记日志，
+// 不保留待办重试——下一节服务器会再发 NewSession。
 func handleNewSessionMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
-	// 新到达的真实通知取代过时待办；内部重试不重新计算时间基准。
-	pendingNewSession = &msg
-	pendingNewSessionStartTime = last.Add(-time.Duration(msg.ElapsedMilliseconds) * time.Millisecond)
-	retryPendingNewSession()
-}
-
-func retryPendingNewSession() {
-	recoveryReady = false
-	pending := *pendingNewSession
-	if err := initializeSession(pending, true, pendingNewSessionStartTime); err != nil {
+	start := last.Add(-time.Duration(msg.ElapsedMilliseconds) * time.Millisecond)
+	if err := initializeSession(msg, true, start); err != nil {
 		logger.Printf("新会话初始化失败: %v", err)
 		return
 	}
-	pendingNewSession = nil
-	pendingNewSessionStartTime = time.Time{}
 	// 新节由服务器主动通知；ini 和会话初始化成功后进入新节采集。
 	recoveryReady = true
-	activeSessionSignature = sessionInfoSignature(pending)
+	activeSessionSignature = sessionInfoSignature(msg)
 }
 
 func updateEventFromSessionInfo(msg udp.SessionInfo) error {
@@ -890,13 +948,16 @@ func updateEventFromSessionInfo(msg udp.SessionInfo) error {
 	if err != nil {
 		return err
 	}
-	changedEvent := globalEvent == nil || globalEvent.ID != event.ID
 	globalEvent = event
-	if !entryListLoaded || changedEvent {
+	// entry_list 在服务器运行期间固定；只有文件变了（服务器重启/改配置）才重读。
+	// 指纹必须先算再判断，否则下一次调用会因为指纹还是空的再重读一遍。
+	listChanged := entryListChanged(cfg.Game.Path)
+	if !entryListLoaded || listChanged {
 		if err := globalDBWriter.LoadEntryList(cfg.Game.Path); err != nil {
 			return err
 		}
 		entryListLoaded = true
+		entryListStamp = entryListStampFor(cfg.Game.Path)
 	}
 	return nil
 }
@@ -961,6 +1022,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool, startTime time.Time
 	bestLapTimes = make(map[int]int)
 	classBestTimes = make(map[string]int)
 	sessionStints = make([]*SessionStint, 0)
+	lastActivityTouch = time.Time{}
 	lastFileSize, lastLineIdx, partialLine, globalNextSessionLineIdx = 0, 0, "", -1
 	latestFile, _ = findLatestSessionLogFile(logDir)
 	// 历史日志不属于本次采集；从接入时的文件末尾开始。
@@ -977,7 +1039,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool, startTime time.Time
 		conn.StintStartedAt = time.Time{}
 		initializeConnectionIdentity(conn)
 	}
-	loadPitBoundary(msg.Track, msg.TrackConfig)
+	ensurePitBoundary(normalizeTrackName(msg.Track), msg.TrackConfig)
 	logger.Printf("当前事件 %d，会话 %d: %s", event.ID, session.ID, session.Name)
 	return nil
 }
@@ -1016,6 +1078,8 @@ func finishCurrentSession() error {
 	pendingSessionEnd = false
 	pendingEndMessage = nil
 	dataCollectionEnabled = false
+	// 节已收尾：清空签名，下一节即使名称/类型重复也会重新接入（靠 EndSession 划边界）。
+	activeSessionSignature = ""
 	lapDataMutex.Lock()
 	carLapData = make(map[int][]udp.CarUpdate)
 	lapTelemetryReady = make(map[int]bool)
@@ -1091,6 +1155,20 @@ func handleCollisionWithEnvMessage(msg udp.CollisionWithEnvironment, last *time.
 }
 
 // 车辆更新事件处理函数
+func touchSessionActivity(now time.Time) {
+	if globalSession == nil || globalSession.ID == 0 || globalSession.IsFinished != 0 {
+		return
+	}
+	if !lastActivityTouch.IsZero() && now.Sub(lastActivityTouch) < 10*time.Second {
+		return
+	}
+	lastActivityTouch = now
+	globalSession.LastActivity = now
+	if err := globalDBWriter.UpdateSessionActivity(globalSession.ID, now); err != nil {
+		logger.Printf("刷新会话活动时间失败(session=%d): %v", globalSession.ID, err)
+	}
+}
+
 func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
 	if !recoveryReady || globalSession == nil || globalSession.ID == 0 {
@@ -1109,14 +1187,117 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	observeRacePosition(updateMsg, *lastDataTime)
 	collectLapSample(updateMsg)
 
-	if len(pitBoundary) >= 3 {
-		inPit := pointInPolygon([2]float32{updateMsg.Pos.X, updateMsg.Pos.Z}, pitBoundary)
-		observePitVisit(carID, inPit, updateMsg, time.Now())
-	} else if pitLaneFallback != nil {
+	pitGeometryMu.RLock()
+	boundary := pitBoundary
+	fallback := pitLaneFallback
+	leftWall, rightWall := trackLeftWall, trackRightWall
+	pitGeometryMu.RUnlock()
+	inPit := false
+	hasPit := true
+	if len(boundary) >= 3 {
+		inPit = pointInPolygon([2]float32{updateMsg.Pos.X, updateMsg.Pos.Z}, boundary)
+	} else if fallback != nil {
 		// 凸包不可用时按“pit_lane 折线 + NSP 区间”判，横向容差仍是近似。
-		inPit := pitLaneFallback.Contains(updateMsg.Pos.X, updateMsg.Pos.Z, updateMsg.NormalisedSplinePos)
+		inPit = fallback.Contains(updateMsg.Pos.X, updateMsg.Pos.Z, updateMsg.NormalisedSplinePos)
+	} else {
+		hasPit = false
+	}
+	if hasPit {
 		observePitVisit(carID, inPit, updateMsg, time.Now())
 	}
+	// 冲出赛道只改非维修区状态；维修区内原版全程 PIT_LANE(3)，不做覆盖。
+	if !inPit {
+		applyOffTrackStatus(carID, updateMsg.Pos.X, updateMsg.Pos.Z, leftWall, rightWall)
+	}
+}
+
+// applyOffTrackStatus 按“车到可驶路面的距离”判冲出赛道：
+// 左墙点 + 反向右墙点拼成路面多边形，多边形内部距离为 0；
+// 在多边形外时算到最近边的距离，超过 2 米置 OFF_TRACK(1)，否则复位为 ON_TRACK(0)。
+// 路面边界未就绪时不动状态，不把“未知”当成“在赛道上”。
+func applyOffTrackStatus(slot int, x, z float32, left, right [][2]float32) {
+	conn := globalConnections[slot]
+	if conn == nil || len(left) < 3 || len(right) < 3 {
+		return
+	}
+	point := [2]float32{x, z}
+	status := uint8(0)
+	if !pointInWallRing(point, left, right) {
+		if distanceToWallRing(point, left, right) > offTrackThresholdM {
+			status = 1
+		}
+	}
+	if conn.TrackStatus == status {
+		return
+	}
+	conn.TrackStatus = status
+	conn.TrackStatusLastChangedTime = time.Now()
+	if status == 1 {
+		logger.Printf("车辆 %d 冲出赛道 near nsp: %.3f", slot, latestCarUpdates[udp.CarID(slot)].NormalisedSplinePos)
+	}
+}
+
+// pointInWallRing 判断点是否在“左墙 + 反向右墙”围成的路面多边形内。
+func pointInWallRing(p [2]float32, left, right [][2]float32) bool {
+	inside := false
+	check := func(i, j int) {
+		a := left[i]
+		b := left[j]
+		if (a[1] > p[1]) != (b[1] > p[1]) &&
+			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
+			inside = !inside
+		}
+	}
+	for i := 0; i < len(left); i++ {
+		check(i, (i+1)%len(left))
+	}
+	check2 := func(i, j int) {
+		a := right[i]
+		b := right[j]
+		if (a[1] > p[1]) != (b[1] > p[1]) &&
+			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
+			inside = !inside
+		}
+	}
+	for i := 0; i < len(right); i++ {
+		check2(i, (i+1)%len(right))
+	}
+	// 两侧封口：首尾各连一条横边。
+	for _, seg := range [][2][2]float32{{left[0], right[0]}, {left[len(left)-1], right[len(right)-1]}} {
+		a, b := seg[0], seg[1]
+		if (a[1] > p[1]) != (b[1] > p[1]) &&
+			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
+			inside = !inside
+		}
+	}
+	return inside
+}
+
+// distanceToWallRing 返回点到路面多边形最近边的距离。
+func distanceToWallRing(p [2]float32, left, right [][2]float32) float32 {
+	best := float32(math.MaxFloat32)
+	consider := func(a, b [2]float32) {
+		dx, dz := b[0]-a[0], b[1]-a[1]
+		if dx == 0 && dz == 0 {
+			return
+		}
+		t := ((p[0]-a[0])*dx + (p[1]-a[1])*dz) / (dx*dx + dz*dz)
+		if t < 0 {
+			t = 0
+		} else if t > 1 {
+			t = 1
+		}
+		px, pz := a[0]+t*dx, a[1]+t*dz
+		d := float32(math.Hypot(float64(p[0]-px), float64(p[1]-pz)))
+		if d < best {
+			best = d
+		}
+	}
+	for i := 0; i < len(left); i++ {
+		consider(left[i], left[(i+1)%len(left)])
+		consider(right[i], right[(i+1)%len(right)])
+	}
+	return best
 }
 
 // getTrackLength 安全获取当前事件赛道长度，缺失时返回 0（避免 nil 解引用）
@@ -1133,45 +1314,117 @@ func getTrackLength() int {
 	return tc.Length
 }
 
-// loadPitBoundary 调用 kn5conv 生成/读取当前赛道的维修区边界（同一赛道只处理一次）。
-// 生成的 SVG 同时写入 cache.path/live-track-maps，供 HTTP 端赛道地图使用。
-func loadPitBoundary(trackName, configName string) {
+// normalizeTrackName 把 server_cfg.ini 里的 TRACK 归一成赛道目录名。
+// AC/CM 会写成 csp/2744/../H/../sx_lemans 这种带相对路径的值，只取最后一段有效目录。
+func normalizeTrackName(raw string) string {
+	parts := strings.Split(strings.ReplaceAll(raw, "\\", "/"), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		p := strings.TrimSpace(parts[i])
+		if p == "" || p == "." || p == ".." {
+			continue
+		}
+		return p
+	}
+	return ""
+}
+
+type pitGeometry struct {
+	boundary [][3]float32
+	fallback *kn5conv.PitLaneWindow
+	// left/right 是赛车线左右墙点（水平坐标），拼成路面多边形用于冲出赛道判定。
+	left  [][2]float32
+	right [][2]float32
+}
+
+// offTrackThresholdM 与原版一致：车到可驶路面的水平距离超过 2 米算冲出赛道。
+const offTrackThresholdM float32 = 2.0
+
+// ensurePitBoundary 在后台加载赛道几何，同一 key 只构建一份；构建过程不持业务状态锁。
+func ensurePitBoundary(trackName, configName string) {
+	trackName = normalizeTrackName(trackName)
 	if trackName == "" {
+		return
+	}
+	key := trackName + "|" + strings.TrimSpace(configName)
+	pitLoadMu.Lock()
+	pitRequestedKey = key
+	if geometry, ok := pitGeometryCache[key]; ok {
+		pitGeometryMu.Lock()
+		pitBoundary, pitLaneFallback = geometry.boundary, geometry.fallback
+		trackLeftWall, trackRightWall = geometry.left, geometry.right
+		pitBoundaryLoadedFor = key
+		pitGeometryMu.Unlock()
+		pitLoadMu.Unlock()
+		return
+	}
+	if pitLoadingKeys[key] {
+		pitGeometryMu.Lock()
 		pitBoundary = nil
-		pitBoundaryLoadedFor = ""
 		pitLaneFallback = nil
+		trackLeftWall, trackRightWall = nil, nil
+		pitBoundaryLoadedFor = ""
+		pitGeometryMu.Unlock()
+		pitLoadMu.Unlock()
 		return
 	}
-	key := trackName + "|" + configName
-	if pitBoundaryLoadedFor == key && hasPitDetection() {
-		return
-	}
+	pitLoadingKeys[key] = true
+	// 新赛道请求后立即撤下旧判据，避免用上一赛道的几何判定本节进站。
+	pitGeometryMu.Lock()
 	pitBoundary = nil
-	pitBoundaryLoadedFor = ""
 	pitLaneFallback = nil
+	trackLeftWall, trackRightWall = nil, nil
+	pitBoundaryLoadedFor = ""
+	pitGeometryMu.Unlock()
+	pitLoadMu.Unlock()
+
+	go func() {
+		boundary, fallback, leftWall, rightWall, err := buildPitGeometry(trackName, strings.TrimSpace(configName))
+		pitLoadMu.Lock()
+		delete(pitLoadingKeys, key)
+		if err == nil {
+			pitGeometryCache[key] = pitGeometry{boundary: boundary, fallback: fallback, left: leftWall, right: rightWall}
+			if pitRequestedKey == key {
+				pitGeometryMu.Lock()
+				pitBoundary, pitLaneFallback = boundary, fallback
+				trackLeftWall, trackRightWall = leftWall, rightWall
+				pitBoundaryLoadedFor = key
+				pitGeometryMu.Unlock()
+			}
+		}
+		pitLoadMu.Unlock()
+		if err != nil {
+			logger.Printf("加载维修区几何失败(%s): %v", key, err)
+		}
+	}()
+}
+
+func buildPitGeometry(trackName, configName string) ([][3]float32, *kn5conv.PitLaneWindow, [][2]float32, [][2]float32, error) {
+	// 冲出赛道的路面边界与维修区判据同时构建、同一份缓存：两者都来自同一条赛道的几何。
+	leftWall, rightWall, edgesErr := kn5conv.LoadTrackEdges(cfg.Game.Path, trackName, configName)
+	if edgesErr != nil {
+		logger.Printf("加载路面边界失败(%s|%s): %v", trackName, configName, edgesErr)
+		leftWall, rightWall = nil, nil
+	}
+
 	var boundary [][3]float32
 	var err error
 	if cfg.App.Server.CachePath != "" {
 		boundary, err = kn5conv.BatchProcess(cfg.Game.Path, cfg.App.Server.CachePath, trackName, configName)
-	}
-	if err == nil && len(boundary) >= 3 {
-		pitBoundary = boundary
-		pitBoundaryLoadedFor = key
-		logger.Printf("维修区边界已加载: %s, 顶点数: %d", key, len(boundary))
-		return
+		if err == nil && len(boundary) >= 3 {
+			return boundary, nil, leftWall, rightWall, nil
+		}
 	}
 	if err != nil {
-		logger.Printf("生成/读取维修区边界失败(%s): %v", key, err)
+		logger.Printf("生成/读取维修区边界失败(%s|%s): %v", trackName, configName, err)
 	}
-	// 凸包拿不到（赛道内容缺 KN5/pit 网格不合规）时降级到 pit_lane 折线判据。
-	fallback, ferr := kn5conv.LoadPitLaneWindow(cfg.Game.Path, trackName, configName)
-	if ferr != nil {
-		logger.Printf("维修区降级判据也不可用(%s)，不做进站判定: %v", key, ferr)
-		return
+	fallback, fallbackErr := kn5conv.LoadPitLaneWindow(cfg.Game.Path, trackName, configName)
+	if fallbackErr != nil {
+		if err != nil {
+			return nil, nil, leftWall, rightWall, fmt.Errorf("KN5 判据: %v; AI fallback: %w", err, fallbackErr)
+		}
+		return nil, nil, leftWall, rightWall, fallbackErr
 	}
-	pitLaneFallback = fallback
-	pitBoundaryLoadedFor = key
-	logger.Printf("维修区改用降级判据(pit_lane 折线 %d 点): %s", len(fallback.Points), key)
+	return nil, fallback, leftWall, rightWall, nil
 }
 
 var currentLogFile string = ""
@@ -1184,10 +1437,6 @@ var disconnectRegex = regexp.MustCompile(`.*driver disconnected: (.*?) \[[^\]]*\
 
 func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	*last = time.Now()
-	if pendingNewSession != nil {
-		retryPendingNewSession()
-		return
-	}
 	if pendingSessionEnd && globalSession != nil && globalSession.ID > 0 {
 		// 结束通知尚未落地：先提交待处理圈再收尾；失败保留状态等下次探活。
 		if err := completePendingSessionEnd(); err != nil {
@@ -1196,8 +1445,10 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 		return
 	}
 	// 已采集且仍是同一节的探活响应：只刷新时间，不重跑恢复；
+	// 节已结束（EndSession 收尾过）就不算同一节，必须重新接入建新会话。
 	// 增量日志的临时错误不能把整个 recoveryReady 关掉。
-	if recoveryReady && globalSession != nil && globalSession.ID > 0 && sessionInfoSignature(msg) == activeSessionSignature {
+	if recoveryReady && globalSession != nil && globalSession.ID > 0 && globalSession.IsFinished == 0 &&
+		!pendingSessionEnd && sessionInfoSignature(msg) == activeSessionSignature {
 		return
 	}
 	recoveryReady = false
@@ -1208,15 +1459,22 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 	}
 	// 沿用原查询路径接入已有会话，只启用解析，不 INSERT 新 session。
 	if err := adoptCurrentSession(msg); err != nil {
-		logger.Printf("接入已有会话失败: %v", err)
+		if errors.Is(err, errNoExistingSession) {
+			// 正常时序：先收到 SESSION_INFO，等 NEW_SESSION 建会话。
+			logger.Printf("%v", err)
+		} else {
+			logger.Printf("接入已有会话未完成: %v", err)
+		}
 		return
 	}
 	if err := restoreConnectionsFromSessionLog(); err != nil {
 		logger.Printf("恢复会话日志失败: %v", err)
 		return
 	}
-	// 中途接入与新节一样需要地图/维修区边界，不能只在 NEW_SESSION 时加载。
-	loadPitBoundary(msg.Track, msg.TrackConfig)
+	// 中途接入与新节一样需要地图/维修区边界，但不能在 UDP 回调里同步解析：
+	// 冷缓存首次解析 KN5 PITLINE + 生成赛道地图要几十秒，会把后续报文全部顶住。
+	// 只登记，交给主循环握手完成后加载。
+	ensurePitBoundary(normalizeTrackName(msg.Track), msg.TrackConfig)
 	activeSessionSignature = sessionInfoSignature(msg)
 	recoveryReady = true
 	// 恢复阶段就收到过结束通知：接入后立即按真实结束状态收尾，不进入新节采集。
@@ -1229,6 +1487,9 @@ func handleSessionInfoMessage(msg udp.SessionInfo, last *time.Time) {
 
 // sessionInfoSignature 是会话的轻量标识（赛道|配置|名称|数据库类型），
 // 用来判定探活响应是否仍是当前采集中的同一节。
+// sessionInfoSignature 是判断“是否同一节”的轻量标识。
+// 节边界不靠它：每一节结束时服务器都会发 EndSession，收尾时把 activeSessionSignature 清空，
+// 下一节即使名称/类型重复（第二个正赛、回到练习）也会重新接入。
 func sessionInfoSignature(msg udp.SessionInfo) string {
 	return strings.Join([]string{msg.Track, msg.TrackConfig, msg.Name, strconv.Itoa(databaseSessionType(msg))}, "|")
 }
@@ -1238,11 +1499,46 @@ func handleErrorMessage(errorMsg udp.ServerError, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
 }
 
-// 版本消息处理函数
+// 版本消息处理函数。
+// AC 只在新连接到插件时发 Version（也就是服务器刚起来/刚重启），
+// 所以每次收到都重新比对 server_cfg.ini 与 entry_list.ini，变了才重读。
 func handleVersionMessage(versionMsg udp.Version, lastDataTime *time.Time) {
 	*lastDataTime = time.Now()
-	// 处理版本信息
 	logger.Printf("AC服务器版本信息: %+v", versionMsg)
+	reloadServerConfigIfChanged()
+}
+
+// reloadServerConfigIfChanged 比对两份配置文件的指纹，变了才重读并重新预热赛道。
+// 普通重启而不改配置时不会重复解析，也不会重新生成赛道几何（缓存直接命中）。
+func reloadServerConfigIfChanged() {
+	configChanged := serverCfgChanged(cfg.Game.Path)
+	entryChanged := entryListChanged(cfg.Game.Path)
+	if !configChanged && !entryChanged {
+		return
+	}
+	if configChanged {
+		if err := globalDBWriter.LoadServerConfig(cfg.Game.Path); err != nil {
+			logger.Printf("重新加载服务器配置失败: %v", err)
+			return
+		}
+	}
+	if entryChanged || configChanged || !entryListLoaded {
+		if err := globalDBWriter.LoadEntryList(cfg.Game.Path); err != nil {
+			logger.Printf("重新加载车单失败: %v", err)
+			return
+		}
+		entryListLoaded = true
+		entryListStamp = entryListStampFor(cfg.Game.Path)
+	}
+	if configChanged {
+		serverCfgStamp = serverCfgStampFor(cfg.Game.Path)
+	}
+	sc := globalDBWriter.ServerCfg
+	if sc == nil {
+		return
+	}
+	logger.Printf("服务器配置变更已生效: 赛道 %s|%s，车单 %d 条", sc.Track, sc.TrackConfig, len(globalEntryList))
+	ensurePitBoundary(sc.Track, sc.TrackConfig)
 }
 
 // 从JSON文件读取完整的session数据
@@ -1270,6 +1566,9 @@ func createUDPClient(host string, localPort, serverPort int, lastDataTime *time.
 		defer stateMutex.Unlock()
 		// 探活/新节/结束通知是初始化与收尾入口；文件恢复前不处理车辆事件，
 		// 但结束通知必须送达，否则恢复阶段收到的 END 会被丢弃。
+		// 活动时间按报文刷新（原版这个动作就在包分发器里），要放在恢复就绪门槛之前：
+		// 本进程活着且会话未结束就算活着，和当前是否在采集无关。
+		touchSessionActivity(time.Now())
 		if !recoveryReady {
 			switch msg.Event() {
 			case udp.EventVersion, udp.EventSessionInfo, udp.EventNewSession, udp.EventEndSession, udp.EventError:
@@ -1526,6 +1825,12 @@ func main() {
 		logger.Printf("server_cfg.ini验证失败: %v", err)
 		return
 	}
+	// 启动即预热赛道几何：server_cfg.ini 里已经写了 TRACK / CONFIG_TRACK，
+	// 不必等会话握手。解析要几十秒，放后台跑，不阻塞 UDP 与广播。
+	if sc := dbWriter.ServerCfg; sc != nil && sc.Track != "" {
+		logger.Printf("启动预热赛道几何: %s|%s", sc.Track, sc.TrackConfig)
+		ensurePitBoundary(sc.Track, sc.TrackConfig)
+	}
 	// 用 server_cfg.ini 的 session 时长初始化 event 默认值（模仿原版写入 event 表）
 	if sc := dbWriter.ServerCfg; sc != nil {
 		globalEvent.PracticeDuration = sc.PracticeDuration
@@ -1556,15 +1861,14 @@ func main() {
 		udp.RealtimePosIntervalMs = cfg.ACServer.UDP.Realtime.Update.Interval.MS
 	}
 	var acClient *udp.AssettoServerUDP
-	var wsDone <-chan struct{}
 	var retryDone <-chan struct{}
 	var logDone <-chan struct{}
+	var liveDone <-chan struct{}
 	defer func() {
 		stop()
 		if acClient != nil {
 			acClient.Close()
 		}
-		closeWebSocket()
 		if retryDone != nil {
 			<-retryDone
 		}
@@ -1580,8 +1884,8 @@ func main() {
 			logger.Printf("退出前仍有 %d 个完圈待提交: %v", len(pendingLaps), err)
 		}
 		stateMutex.Unlock()
-		if wsDone != nil {
-			<-wsDone
+		if liveDone != nil {
+			<-liveDone
 		}
 	}()
 	var reconnectInterval = 3 * time.Second
@@ -1589,6 +1893,20 @@ func main() {
 	// 待处理圈的后台重试独立于 UDP 连接与探活节奏。
 	retryDone = startPendingLapRetry(ctx)
 	logDone = startSessionLogPoll(ctx)
+
+	// Writer 自己提供 /live（与原版一致），生命周期独立于 UDP 与采集状态：
+	// 页面先连上等着，没会话就暂不出帧，不因握手卡住而拒绝连接。
+	{
+		port := cfg.Writer.HTTP.Port
+		if port == 0 {
+			port = cfg.ACServer.UDP.LocalPort
+		}
+		if done, lerr := startLiveServer(ctx, port); lerr != nil {
+			logger.Printf("Live WebSocket 服务启动失败: %v", lerr)
+		} else {
+			liveDone = done
+		}
+	}
 
 	// 连接循环 - 支持重连
 outerLoop:
@@ -1608,6 +1926,7 @@ outerLoop:
 		sessionInfoChan := make(chan struct{}, 1)
 		versionInfoChan := make(chan struct{}, 1)
 		acClient, err = createUDPClient(acHost, acLocalPort, acPort, &lastDataTime, sessionInfoChan, versionInfoChan)
+		activeACClient = acClient
 		if err != nil {
 			logger.Printf("创建UDP连接失败: %v, 将在%d秒后重试", err, reconnectInterval/time.Second)
 			if !waitWriterContext(ctx, reconnectInterval) {
@@ -1633,6 +1952,10 @@ outerLoop:
 
 		// 发送GetSessionInfo请求并实现超时重试逻辑
 		retryInterval := 3 * time.Second
+		// 握手重试上限：870664e 以前是无限阻塞等 Version，现在改成限次。
+		// 冷缓存下首次解析赛道几何（KN5 PITLINE + 赛道地图）可能超过 30 秒，
+		// 而会话初始化就在 UDP 回调里，会把后面的 SessionInfo 顶住，3 次不够。
+		handshakeAttempts := 30
 		retryCount := 0
 
 		for {
@@ -1647,11 +1970,14 @@ outerLoop:
 				return
 			case <-sessionInfoChan:
 				stateMutex.RLock()
-				ready := recoveryReady && globalEvent != nil && globalEvent.ID > 0
+				// 870664e 那版只等信号，不看恢复标志；现在仍接受同一个 SessionInfo 即可开工，
+				// 只要 session 和 event 都已就位，不把 recoveryReady 当握手前提。
+				ready := globalSession != nil && globalSession.ID > 0 && globalSession.IsFinished == 0 && globalEvent != nil && globalEvent.ID > 0
 				stateMutex.RUnlock()
 				if !ready {
+					recoveryReady = false
 					retryCount++
-					if retryCount >= 3 {
+					if retryCount >= handshakeAttempts {
 						goto sessionInfoTimeout
 					}
 					if !waitWriterContext(ctx, retryInterval) {
@@ -1660,10 +1986,15 @@ outerLoop:
 					continue
 				}
 				logger.Println("成功接收SessionInfo")
+				// 握手成功即视为可服务：870664e 那版就是拿到 SessionInfo 直接开工，
+				// 不额外要求恢复流程把 recoveryReady 置过。
+				stateMutex.Lock()
+				recoveryReady = true
+				stateMutex.Unlock()
 				goto sessionInfoReceived
 			case <-time.After(10 * time.Second):
 				retryCount++
-				if retryCount >= 3 {
+				if retryCount >= handshakeAttempts {
 					logger.Println("获取SessionInfo超时，放弃重试")
 					goto sessionInfoTimeout
 				}
@@ -1681,48 +2012,48 @@ outerLoop:
 	sessionInfoReceived:
 		logger.Println("已获取SessionInfo，开始主循环")
 
+		// 赛道几何（KN5 PITLINE + 地图）在后台加载：冷缓存要几十秒。
+		// 注意不能持 stateMutex：广播 tick 也要那把锁，一拿就是几十秒，页面只能干等。
+		// loadPitBoundary 内部最后才赋值，读到 nil 的短暂窗口等价于“暂未启用维修区判定”。
+		// 赛道几何已在启动时预热；这里不再重复。
+
 		if err := acClient.SendMessage(udp.NewEnableRealtimePosInterval(udp.RealtimePosIntervalMs)); err != nil {
 			logger.Printf("开启车辆更新失败: %v", err)
-		}
-		// WebSocket 生命周期独立于 UDP 重连，只启动一个读取/重连协程。
-		if wsDone == nil {
-			wsDone = startWebSocketReconnect(ctx)
 		}
 		interval := cfg.Writer.HTTP.Leaderboard.Broadcast.Interval.MS
 		if interval <= 0 {
 			interval = 2000
 		}
+		// 只保留广播节拍和槽位轮询。车是否掉线以 AC 的 ConnectionClosed 为准，
+		// 本进程不按“多久没收到包”自己判失联：UDP 无连接状态，
+		// AC 重启后同一个 socket 仍能收到新包，靠 Version 重读配置即可。
 		broadcast := time.NewTicker(time.Duration(interval) * time.Millisecond)
-		heartbeat := time.NewTicker(10 * time.Second)
+		// 原版每 3 秒扫一个槽位：GetCarInfo(槽位) 加一次 GetSessionInfo 探活，
+		// 槽位递增到底再回 0。用来发现已经在场上的车（Writer 中途启动时没有 NewConnection 可等）。
+		probe := time.NewTicker(3 * time.Second)
+		probeSlot := 0
 		for {
 			select {
 			case <-ctx.Done():
 				broadcast.Stop()
-				heartbeat.Stop()
+				probe.Stop()
 				return
 			case <-broadcast.C:
-				buildAndSendWebSocketMessage()
-			case <-heartbeat.C:
-				stateMutex.Lock()
-				stale := time.Since(lastDataTime) > 30*time.Second
-				if stale {
-					recoveryReady = false
-					// 失联间隔不构成完整圈，重连后重新等一次完圈。
-					for slot := range globalConnections {
-						resetLapSamples(slot)
-					}
+				publishLiveFrame()
+			case <-probe.C:
+				if err := acClient.SendMessage(udp.GetCarInfo{CarID: udp.CarID(probeSlot)}); err != nil {
+					logger.Printf("槽位探测失败(slot=%d): %v", probeSlot, err)
 				}
-				stateMutex.Unlock()
-				if stale {
-					logger.Println("UDP超过30秒未收报，重新连接并恢复当前会话")
-					broadcast.Stop()
-					heartbeat.Stop()
-					acClient.Close()
-					continue outerLoop
-				}
-				// 同一恢复入口也重试临时数据库/日志失败，不跳过恢复步骤。
 				if err := acClient.SendMessage(udp.NewGetSessionInfo()); err != nil {
 					logger.Printf("会话探活请求失败: %v", err)
+				}
+				maxSlots := 50
+				if globalDBWriter.ServerCfg != nil && globalDBWriter.ServerCfg.MaxCarSlots > 0 {
+					maxSlots = globalDBWriter.ServerCfg.MaxCarSlots
+				}
+				probeSlot++
+				if probeSlot >= maxSlots {
+					probeSlot = 0
 				}
 			}
 		}

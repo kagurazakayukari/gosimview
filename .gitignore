@@ -89,3 +89,6 @@ assetto-corsa-server-udp2ws-master/
 # 忽略脚本文件
 commit.ps1
 commit.sh
+
+# 跳过原版发布包目录（逆向参考素材，不入库）
+simview/

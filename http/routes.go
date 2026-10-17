@@ -33,6 +33,8 @@ func setupRoutes() {
 	http.HandleFunc("/api/ac/track/", methodMiddleware(handleACTrack, "GET"))
 	http.HandleFunc("/api/ac/lap/summary/", methodMiddleware(handleACLapSummary, "GET"))
 	http.HandleFunc("/api/ac/lap/telemetry/", methodMiddleware(handleACLapTelemetry, "GET"))
+	// 原版 /api/ac/lap/{stint_lap_id}：单圈明细（子路径由上面两条更具体的前缀接管）
+	http.HandleFunc("/api/ac/lap/", methodMiddleware(handleACLapDetail, "GET"))
 	http.HandleFunc("/api/ac/session/", methodMiddleware(handleACSession, "GET"))
 	http.HandleFunc("/api/ac/event", methodMiddleware(handleACEventDetails, "GET"))
 	http.HandleFunc("/api/ac/event/", methodMiddleware(handleACEventDetails, "GET"))
@@ -40,7 +42,6 @@ func setupRoutes() {
 	http.HandleFunc("/api/ac/bestlap/", methodMiddleware(handleACBestLap, "GET"))
 	http.HandleFunc("/images/ac/track/", handleTrackResource)
 	http.HandleFunc("/images/ac/car/", handleCarResource)
-	http.HandleFunc("/live", handleACEventWebSocket)
 
 	logger.Println("路由配置完成")
 }

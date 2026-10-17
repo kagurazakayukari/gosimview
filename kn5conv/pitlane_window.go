@@ -69,6 +69,50 @@ func LoadPitLaneWindow(gamePath, trackName, configName string) (*PitLaneWindow, 
 	return w, nil
 }
 
+// LoadTrackEdges 返回赛车线左右墙点（水平坐标）。
+// 每个节点用相邻节点（中心差分）求方向，法线取 (dz,-dx) 一侧；
+// 这一侧才与 .ai 的左宽/右宽对应，反了会把宽窄两侧互换。
+func LoadTrackEdges(gamePath, trackName, configName string) (left, right [][2]float32, err error) {
+	_, layout, err := resolveTrackDirs(gamePath, trackName, configName)
+	if err != nil {
+		return nil, nil, err
+	}
+	details, err := parseFastLaneAI(filepath.Join(layout, "ai", "fast_lane.ai"))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(details) < 3 {
+		return nil, nil, fmt.Errorf("赛车线不足三个点")
+	}
+
+	left = make([][2]float32, 0, len(details))
+	right = make([][2]float32, 0, len(details))
+	for i := range details {
+		prev := details[(i+len(details)-1)%len(details)].Position
+		next := details[(i+1)%len(details)].Position
+		dx := next[0] - prev[0]
+		dz := next[2] - prev[2]
+		length := math.Hypot(float64(dx), float64(dz))
+		if length <= 0 {
+			continue
+		}
+		nx := float32(float64(dz) / length)
+		nz := float32(-float64(dx) / length)
+
+		pos := details[i].Position
+		// 左右宽由已解析的墙点与赛车线距离得到，不重复读 detail 字段。
+		leftWidth := float32(math.Hypot(float64(details[i].WallLeft[0]-pos[0]), float64(details[i].WallLeft[2]-pos[2])))
+		rightWidth := float32(math.Hypot(float64(details[i].WallRight[0]-pos[0]), float64(details[i].WallRight[2]-pos[2])))
+
+		left = append(left, [2]float32{pos[0] + nx*leftWidth, pos[2] + nz*leftWidth})
+		right = append(right, [2]float32{pos[0] - nx*rightWidth, pos[2] - nz*rightWidth})
+	}
+	if len(left) < 3 {
+		return nil, nil, fmt.Errorf("赛车线墙点不足")
+	}
+	return left, right, nil
+}
+
 // resolveTrackDirs 解析赛道内容目录，Writer 的凸包路径与降级判据共用：
 // 先 <game>/content/tracks/<track>/<config>，再游戏根目录同级的 content/tracks/...
 // （原版日志里的 “main content folder”）。trackDir 供 models_<config>.ini 与 KN5 使用，

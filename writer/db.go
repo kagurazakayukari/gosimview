@@ -8,7 +8,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -361,6 +363,9 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 
 	w.ServerCfg = &ServerConfig{
 		Name:                 cfg.Section("SERVER").Key("NAME").String(),
+		Track:                normalizeTrackName(cfg.Section("SERVER").Key("TRACK").String()),
+		TrackConfig:          strings.TrimSpace(cfg.Section("SERVER").Key("CONFIG_TRACK").String()),
+		LockedEntryList:      cfg.Section("SERVER").Key("LOCKED_ENTRY_LIST").MustInt(0),
 		Slots:                cfg.Section("SERVER").Key("SLOTS").MustInt(16),
 		Port:                 cfg.Section("SERVER").Key("UDP_PORT").MustInt(9600),
 		HTTP:                 cfg.Section("HTTP").Key("HOST").String(),
@@ -386,14 +391,61 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 	return nil
 }
 
+// entryListStamp 是 entry_list.ini 的内容指纹。
+// 名单在服务器运行期间不会变，只有服务器重新开启/改配置才会换；
+// 用指纹判断，避免每个 session 都把整份名单重读一遍。
+var entryListStamp string
+
+// serverCfgStamp 是 server_cfg.ini 的内容指纹，用途同 entryListStamp。
+var serverCfgStamp string
+
+// fileStamp 返回文件内容指纹；文件不存在或暂时不可读时返回空串。
+func fileStamp(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// entryListChanged 判断 entry_list.ini 是否变了；首次调用总是返回 true。
+func entryListStampFor(gamePath string) string {
+	return fileStamp(filepath.Join(gamePath, "cfg", "entry_list.ini"))
+}
+
+func serverCfgStampFor(gamePath string) string {
+	for _, path := range []string{
+		filepath.Join(gamePath, "cfg", "server_cfg.ini"),
+		filepath.Join(gamePath, "server_cfg.ini"),
+	} {
+		if stamp := fileStamp(path); stamp != "" {
+			return stamp
+		}
+	}
+	return ""
+}
+
+// entryListChanged/serverCfgChanged 只读取指纹，不在读取失败前消费它。
+func entryListChanged(gamePath string) bool {
+	stamp := entryListStampFor(gamePath)
+	return stamp != "" && stamp != entryListStamp
+}
+
+func serverCfgChanged(gamePath string) bool {
+	stamp := serverCfgStampFor(gamePath)
+	return stamp != "" && stamp != serverCfgStamp
+}
+
 // LoadEntryList 加载参赛列表
 func (w *DBWriter) LoadEntryList(gamePath string) error {
 	entryListPath := filepath.Join(gamePath, "cfg", "entry_list.ini")
 	// 加载INI文件
 	entrylist, err := ini.LoadSources(ini.LoadOptions{IgnoreInlineComment: true}, entryListPath)
 	if err != nil {
-		fatalLogger.Fatalf("无法加载entry_list.ini: %v", err)
+		return fmt.Errorf("无法加载entry_list.ini: %w", err)
 	}
+	newEntryList := make(map[int]EntryListDriver)
 
 	carSections := make([]*ini.Section, 0)
 	for _, section := range entrylist.Sections() {
@@ -403,7 +455,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 	}
 
 	if len(carSections) == 0 {
-		fatalLogger.Fatalf("entry_list.ini缺少[CAR_*]部分")
+		return fmt.Errorf("entry_list.ini缺少[CAR_*]部分")
 	}
 
 	// 以 [CAR_n] 的 n 作为槽位（UDP 的 CarID 即该槽位），按槽位升序处理
@@ -413,10 +465,10 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		name := section.Name()
 		index, err := strconv.Atoi(strings.TrimPrefix(name, "CAR_"))
 		if err != nil {
-			fatalLogger.Fatalf("无效的CAR_节名称: %s", name)
+			return fmt.Errorf("无效的CAR_节名称: %s", name)
 		}
 		if _, dup := sectionBySlot[index]; dup {
-			fatalLogger.Fatalf("重复的CAR_节: %s", name)
+			return fmt.Errorf("重复的CAR_节: %s", name)
 		}
 		sectionBySlot[index] = section
 		slots = append(slots, index)
@@ -424,7 +476,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 	sort.Ints(slots)
 	for i := 1; i < len(slots); i++ {
 		if slots[i] != slots[i-1]+1 {
-			fatalLogger.Fatalf("CAR_节索引不连续: 找到 %d 和 %d", slots[i-1], slots[i])
+			return fmt.Errorf("CAR_节索引不连续: 找到 %d 和 %d", slots[i-1], slots[i])
 		}
 	}
 
@@ -445,16 +497,16 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 
 		// 验证必填字段
 		if !cfg.ACServer.Event.Team.Enable && driver.Name == "" {
-			fatalLogger.Fatalf("%s缺少DRIVERNAME字段", section.Name())
+			return fmt.Errorf("%s缺少DRIVERNAME字段", section.Name())
 		}
 		if driver.Car == "" {
-			fatalLogger.Fatalf("%s缺少MODEL字段", section.Name())
+			return fmt.Errorf("%s缺少MODEL字段", section.Name())
 		}
 		if driver.Ballast < 0 {
-			fatalLogger.Fatalf("%s BALLAST不能为负数", section.Name())
+			return fmt.Errorf("%s BALLAST不能为负数", section.Name())
 		}
 		if driver.Restrictor < 0 {
-			fatalLogger.Fatalf("%s RESTRICTOR不能为负数", section.Name())
+			return fmt.Errorf("%s RESTRICTOR不能为负数", section.Name())
 		}
 
 		config := &Car{
@@ -468,7 +520,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		// FindOrCreateCarID 已把车辆写进缓存（同一指针，后续字段修改自动生效）
 		carID, err := w.FindOrCreateCarID(config)
 		if err != nil {
-			fatalLogger.Fatalf("获取CarID失败: %v", err)
+			return fmt.Errorf("获取CarID失败: %w", err)
 		}
 		config.ID = carID
 		// 获取完整的车辆信息（查不到只告警，不终止启动；模拟模式不读库）
@@ -500,14 +552,14 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 			// 分割GUID列表
 			guids := strings.Split(driver.GUID, ";")
 			if len(guids) < 2 && cfg.ACServer.Event.Team.Enable {
-				fatalLogger.Fatalf("车队成员需要至少2个有效的GUID，当前只找到%d个", len(guids))
+				return fmt.Errorf("车队成员需要至少2个有效的GUID，当前只找到%d个", len(guids))
 			}
 			for _, guid := range guids {
 				guid = strings.TrimSpace(guid)
 				if guid != "" && driver.Name != "" && len(guid) == 17 && strings.HasPrefix(guid, "7656") {
 					steam64ID, err := strconv.ParseInt(guid, 10, 64)
 					if err != nil {
-						fatalLogger.Fatalf("无效的GUID %s: %v", guid, err)
+						return fmt.Errorf("无效的GUID %s: %w", guid, err)
 					}
 					user := &User{
 						Steam64ID: steam64ID,
@@ -515,7 +567,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 					}
 					userID, newUser, err := w.FindOrCreateUser(user)
 					if err != nil {
-						fatalLogger.Fatalf("创建/查询用户 %s 失败: %v", driver.Name, err)
+						return fmt.Errorf("创建/查询用户 %s 失败: %w", driver.Name, err)
 					}
 					if newUser {
 						logger.Printf("新用户 %s (ID: %d)", driver.Name, userID)
@@ -527,21 +579,21 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		}
 
 		if cfg.ACServer.Event.Team.Enable && driver.Team == "" {
-			fatalLogger.Fatalf("%s缺少TEAM字段", section.Name())
+			return fmt.Errorf("%s缺少TEAM字段", section.Name())
 		}
 
 		if driver.Skin == "" {
-			fatalLogger.Fatalf("%s缺少SKIN字段", section.Name())
+			return fmt.Errorf("%s缺少SKIN字段", section.Name())
 		}
 		// 团队事件处理
 		if cfg.ACServer.Event.Team.Enable && driver.GUID != "" {
 			// TEAM 字段：UseNumber 时为 "编号|车队名"，否则整串即车队名
 			teamName, teamNo := parseEntryTeam(driver.Team, cfg.ACServer.Event.Team.UseNumber)
 			if teamName == "" {
-				fatalLogger.Fatalf("无效的车队格式 %s: %s. 预期 'no.|Team Name'", driver.Name, driver.Team)
+				return fmt.Errorf("无效的车队格式 %s: %s. 预期 'no.|Team Name'", driver.Name, driver.Team)
 			}
 			if cfg.ACServer.Event.Team.UseNumber && teamNo <= 0 {
-				fatalLogger.Fatalf("%s TEAM字段缺少合法车号: %s", section.Name(), driver.Team)
+				return fmt.Errorf("%s TEAM字段缺少合法车号: %s", section.Name(), driver.Team)
 			}
 
 			// 创建团队
@@ -556,7 +608,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 			}
 			teamID, err := w.FindOrCreateTeam(team)
 			if err != nil {
-				fatalLogger.Fatalf("创建车队 '%s' 失败: %v", teamName, err)
+				return fmt.Errorf("创建车队 '%s' 失败: %w", teamName, err)
 			}
 			cacheTeam(team)
 
@@ -565,14 +617,19 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 			if !w.SimulateSQL {
 				rows, err := w.DB.Query("SELECT user_id FROM team_member WHERE team_id = ?", teamID)
 				if err != nil {
-					fatalLogger.Fatalf("查询团队成员失败: %v", err)
+					return fmt.Errorf("查询团队成员失败: %w", err)
 				}
 				for rows.Next() {
 					var userID int
 					if err := rows.Scan(&userID); err != nil {
-						fatalLogger.Fatalf("扫描团队成员失败: %v", err)
+						rows.Close()
+						return fmt.Errorf("扫描团队成员失败: %w", err)
 					}
 					existingUserIDs[userID] = true
+				}
+				if err := rows.Err(); err != nil {
+					rows.Close()
+					return fmt.Errorf("遍历团队成员失败: %w", err)
 				}
 				rows.Close()
 			}
@@ -590,7 +647,7 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 					if !found {
 						_, err := w.executeSQL("UPDATE team_member SET active = 0 WHERE team_id = ? AND user_id = ?", teamID, uid)
 						if err != nil {
-							fatalLogger.Fatalf("更新成员状态失败: %v", err)
+							return fmt.Errorf("更新成员状态失败: %w", err)
 						}
 					}
 				}
@@ -608,20 +665,18 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 					}
 					memberID, err := w.FindOrCreateTeamMember(teamMember)
 					if err != nil {
-						fatalLogger.Fatalf("创建团队成员失败: %v", err)
+						return fmt.Errorf("创建团队成员失败: %w", err)
 					}
 					teamMember.ID = memberID
 					cacheTeamMember(teamMember)
 				}
 			}
 		}
-		entryListMutex.Lock()
-		if globalEntryList == nil {
-			globalEntryList = make(map[int]EntryListDriver)
-		}
-		globalEntryList[slot] = driver
-		entryListMutex.Unlock()
+		newEntryList[slot] = driver
 	}
+	entryListMutex.Lock()
+	globalEntryList = newEntryList
+	entryListMutex.Unlock()
 	logger.Println("entry_list.ini文件验证成功")
 	return nil
 }
@@ -1269,6 +1324,12 @@ func (w *DBWriter) FindSessionStintsBySessionID(sessionID int64) ([]*SessionStin
 	}
 
 	return stints, nil
+}
+
+// UpdateSessionActivity 刷新运行中会话的活动时间，不改结束状态。
+func (w *DBWriter) UpdateSessionActivity(sessionID int64, at time.Time) error {
+	_, err := w.executeSQL("UPDATE session SET last_activity = ? WHERE session_id = ? AND is_finished = 0", at, sessionID)
+	return err
 }
 
 // UpdateSession 更新会话信息

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -13,6 +14,19 @@ import (
 
 	"gosimview/udp"
 )
+
+// errNoExistingSession 表示 SESSION_INFO 先到、但该事件还没有 session。
+// 这是正常的时序，不是错误，调用方据此打普通信息而不是“失败”。
+var errNoExistingSession = errors.New("no existing session")
+
+// noSessionForEvent 带事件号的“还没有 session”提示；Is 让它可被 errors.Is 识别。
+type noSessionForEvent struct{ eventID int }
+
+func (e noSessionForEvent) Error() string {
+	return fmt.Sprintf("事件 %d 还没有可接入的 session（等服务器发 NewSession）", e.eventID)
+}
+
+func (e noSessionForEvent) Is(target error) bool { return target == errNoExistingSession }
 
 // recoveredScore 保存日志里已经发生的当前节成绩；它不代表新采集的一圈。
 type recoveredScore struct {
@@ -332,8 +346,9 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 
 // 接入当前会话只查已有 session，不向数据库创建新 session。
 func adoptCurrentSession(msg udp.SessionInfo) error {
-	if globalSession != nil && globalSession.ID > 0 {
-		dataCollectionEnabled = globalSession.IsFinished == 0
+	// 当前节仍在跑：直接沿用；已结束的节不能复用，按最新会话/新建处理。
+	if globalSession != nil && globalSession.ID > 0 && globalSession.IsFinished == 0 {
+		dataCollectionEnabled = true
 		return nil
 	}
 	var session *Session
@@ -343,8 +358,9 @@ func adoptCurrentSession(msg udp.SessionInfo) error {
 		if err != nil {
 			return err
 		}
-		if session == nil {
-			return fmt.Errorf("事件 %d 无已有 session，等待服务器新开 session", globalEvent.ID)
+		if session == nil || session.IsFinished != 0 {
+			// 没有会话或最新会话已结束：SESSION_INFO 不能复活旧节，等待 NEW_SESSION。
+			return noSessionForEvent{eventID: globalEvent.ID}
 		}
 	} else {
 		// 只有内存的模拟 ID，不执行 INSERT，不伪装成已写入数据库。
