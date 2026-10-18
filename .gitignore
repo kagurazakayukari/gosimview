@@ -87,10 +87,6 @@ SimView-Manual.pdf
 ac-server-udp-client-0.0.8/
 assetto-corsa-server-udp2ws-master/
 
-# 按项目要求不提交的分布式 Live 验证测试
-/config/public_url_test.go
-/http/live_proxy_test.go
-
 # 忽略脚本文件
 commit.ps1
 commit.sh
