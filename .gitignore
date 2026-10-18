@@ -18,8 +18,9 @@ config/*.toml
 !go.mod
 !go.sum
 
-# 忽略SQL文件
+# 忽略SQL文件（Writer 的增量迁移需纳入版本控制）
 *.sql
+!writer/migrations/*.sql
 
 # 忽略临时文件
 *.tmp

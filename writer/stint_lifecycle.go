@@ -64,7 +64,7 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 	if startedAt.IsZero() {
 		return nil, fmt.Errorf("车辆 %d 的 stint 起点缺失", slot)
 	}
-	stint = &SessionStint{UserID: conn.UserID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
+	stint = &SessionStint{UserID: conn.UserID, DriverIdentityID: conn.DriverIdentityID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
 	if globalEvent.TeamEvent == 1 {
 		for _, member := range globalTeamMembers {
 			if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
@@ -82,14 +82,16 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 // persistStint 将已观测的内存段写库，失败不丢弃其身份或原始起点。
 // 调用者持有 stateMutex。
 func persistStint(stint *SessionStint) error {
-	if stint.ID != 0 {
-		return nil
+	if stint.ID == 0 {
+		id, err := globalDBWriter.CreateSessionStint(stint)
+		if err != nil {
+			return err
+		}
+		stint.ID = int(id)
 	}
-	id, err := globalDBWriter.CreateSessionStint(stint)
-	if err != nil {
-		return err
+	if stint.DriverIdentityID > 0 {
+		return globalDBWriter.LinkSessionStintDriverIdentity(stint.ID, stint.DriverIdentityID)
 	}
-	stint.ID = int(id)
 	return nil
 }
 

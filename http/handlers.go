@@ -340,7 +340,22 @@ func handleACUsers(w http.ResponseWriter, r *http.Request) {
 			args[i] = id
 		}
 
-		query = fmt.Sprintf("SELECT user_id, name, COALESCE(country, '') FROM user WHERE user_id IN (%s) ORDER BY user_id ASC", strings.Join(placeholders, ","))
+		if sessionID := strings.TrimSpace(r.URL.Query().Get("session_id")); sessionID != "" {
+			if _, err := strconv.Atoi(sessionID); err != nil {
+				sendErrorResponse(w, http.StatusBadRequest, "无效的session_id", "users")
+				return
+			}
+			query = fmt.Sprintf(`SELECT u.user_id,
+				COALESCE(NULLIF((SELECT sdi.driver_name FROM session_stint_driver_identity ssdi
+					JOIN session_driver_identity sdi ON sdi.driver_identity_id = ssdi.driver_identity_id
+					JOIN session_stint ss ON ss.session_stint_id = ssdi.session_stint_id
+					WHERE ss.session_id = ? AND ss.user_id = u.user_id
+					ORDER BY ss.started_at DESC, ss.session_stint_id DESC LIMIT 1), ''), u.name),
+				COALESCE(u.country, '') FROM user u WHERE u.user_id IN (%s) ORDER BY u.user_id ASC`, strings.Join(placeholders, ","))
+			args = append([]interface{}{sessionID}, args...)
+		} else {
+			query = fmt.Sprintf("SELECT user_id, name, COALESCE(country, '') FROM user WHERE user_id IN (%s) ORDER BY user_id ASC", strings.Join(placeholders, ","))
+		}
 	} else {
 		// 如果没有提供ID参数，返回所有用户
 		query = "SELECT user_id, name, COALESCE(country, '') FROM user ORDER BY user_id ASC"

@@ -10,11 +10,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,6 +30,9 @@ import (
 
 // 模拟执行结果(simResult)、可空列扫描工具(nstr/nint/nf64/ntime)、
 // SQL 脚本安全切分见 db_support.go。
+
+//go:embed migrations/*.sql
+var goMigrations embed.FS
 
 // DBWriter 数据库操作结构体
 type DBWriter struct {
@@ -87,10 +92,43 @@ func NewDBWriter(dsn string, simulate bool) (*DBWriter, error) {
 		SimulateSQL: simulate,
 	}
 
-	// 不自动执行 SQL schema：原版 dump 含 DROP TABLE，误执行会清空真实数据。
-	// 需要初始化时由调用方显式调用 ApplySchema()（只会执行非破坏性语句）。
+	// 只执行 GoSimView 自有的幂等增量迁移，不触碰原版 schema dump。
+	if !simulate {
+		if err := dbWriter.ensureGoSchema(); err != nil {
+			logFile.Close()
+			db.Close()
+			return nil, err
+		}
+	}
 
 	return dbWriter, nil
+}
+
+// ensureGoSchema 创建 GoSimView 自有的增量表；DDL 可重复执行，不修改原版表。
+func (w *DBWriter) ensureGoSchema() error {
+	files, err := goMigrations.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("读取 GoSimView 数据库迁移失败: %w", err)
+	}
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".sql") {
+			continue
+		}
+		script, err := goMigrations.ReadFile(path.Join("migrations", file.Name()))
+		if err != nil {
+			return fmt.Errorf("读取迁移 %s 失败: %w", file.Name(), err)
+		}
+		for _, raw := range splitSQLStatements(string(script)) {
+			stmt := cleanSQLStatement(raw)
+			if stmt == "" {
+				continue
+			}
+			if _, err := w.DB.Exec(stmt); err != nil {
+				return fmt.Errorf("执行迁移 %s 失败: %w", file.Name(), err)
+			}
+		}
+	}
+	return nil
 }
 
 // ApplySchema 显式应用 SQL schema 文件（不会自动调用）。
@@ -726,6 +764,41 @@ func (w *DBWriter) CreateSession(session *Session) (int64, error) {
 	return session.ID, nil
 }
 
+// InsertSessionDriverIdentity 保存一次真实 NewConnection 的不可变身份快照。
+// 同一槽位换人时追加新行，绝不覆盖此前连接的历史身份。
+func (w *DBWriter) InsertSessionDriverIdentity(identity *SessionDriverIdentity) (int64, error) {
+	if identity == nil || identity.SessionID <= 0 || identity.UserID <= 0 {
+		return 0, fmt.Errorf("session driver identity 无效")
+	}
+	connectedAt := identity.ConnectedAt
+	if connectedAt.IsZero() {
+		connectedAt = time.Now()
+	}
+	result, err := w.executeSQL(`INSERT INTO session_driver_identity
+		(session_id, game_car_id, user_id, driver_name, connected_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		identity.SessionID, identity.GameCarID, identity.UserID, identity.DriverName, connectedAt)
+	if err != nil {
+		return 0, fmt.Errorf("保存 session 车手身份失败: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("读取 session 车手身份 ID 失败: %w", err)
+	}
+	identity.ID = id
+	return id, nil
+}
+
+// LinkSessionStintDriverIdentity 把一个 session_stint 绑定到创建它时的身份快照。
+func (w *DBWriter) LinkSessionStintDriverIdentity(stintID int, identityID int64) error {
+	if stintID <= 0 || identityID <= 0 {
+		return nil
+	}
+	_, err := w.executeSQL(`INSERT INTO session_stint_driver_identity (session_stint_id, driver_identity_id) VALUES (?, ?)
+		ON DUPLICATE KEY UPDATE driver_identity_id = VALUES(driver_identity_id)`, stintID, identityID)
+	return err
+}
+
 // CreateSessionStint 创建SessionStint。
 // 字段语义：stint.CarID 为数据库 car_id，stint.GameCarID 为 UDP 槽位号。
 // 可选外键（user_id / team_member_id / car_id / best_lap_id）缺省时写 NULL 而不是 0。
@@ -770,6 +843,11 @@ func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 			return 0, err
 		}
 		stint.ID = int(stintID)
+	}
+	if stint.DriverIdentityID > 0 {
+		if err := w.LinkSessionStintDriverIdentity(stint.ID, stint.DriverIdentityID); err != nil {
+			return 0, fmt.Errorf("绑定 session stint 身份失败: %w", err)
+		}
 	}
 
 	return int64(stint.ID), nil

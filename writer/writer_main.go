@@ -325,18 +325,29 @@ type Car struct {
 
 // SessionStint 会话阶段结构体
 type SessionStint struct {
-	ID           int       `db:"session_stint_id" json:"id"`
-	UserID       int       `db:"user_id" json:"user_id"`
-	TeamMemberID int       `db:"team_member_id" json:"team_member_id"`
-	SessionID    int       `db:"session_id" json:"session_id"`
-	CarID        int       `db:"car_id" json:"car_id"`
-	GameCarID    int       `db:"game_car_id" json:"game_car_id"`
-	Laps         int       `db:"laps" json:"laps"`
-	ValidLaps    int       `db:"valid_laps" json:"valid_laps"`
-	BestLapID    int       `db:"best_lap_id" json:"best_lap_id"`
-	IsFinished   int       `db:"is_finished" json:"is_finished"`
-	StartedAt    time.Time `db:"started_at" json:"started_at"`
-	FinishedAt   time.Time `db:"finished_at" json:"finished_at"`
+	ID               int       `db:"session_stint_id" json:"id"`
+	DriverIdentityID int64     `db:"driver_identity_id" json:"driver_identity_id"`
+	UserID           int       `db:"user_id" json:"user_id"`
+	TeamMemberID     int       `db:"team_member_id" json:"team_member_id"`
+	SessionID        int       `db:"session_id" json:"session_id"`
+	CarID            int       `db:"car_id" json:"car_id"`
+	GameCarID        int       `db:"game_car_id" json:"game_car_id"`
+	Laps             int       `db:"laps" json:"laps"`
+	ValidLaps        int       `db:"valid_laps" json:"valid_laps"`
+	BestLapID        int       `db:"best_lap_id" json:"best_lap_id"`
+	IsFinished       int       `db:"is_finished" json:"is_finished"`
+	StartedAt        time.Time `db:"started_at" json:"started_at"`
+	FinishedAt       time.Time `db:"finished_at" json:"finished_at"`
+}
+
+// SessionDriverIdentity 保存一次真实 NewConnection 的 user_id 与当时姓名。
+type SessionDriverIdentity struct {
+	ID          int64
+	SessionID   int64
+	GameCarID   int
+	UserID      int
+	DriverName  string
+	ConnectedAt time.Time
 }
 
 // StintLap 阶段圈速结构体
@@ -598,6 +609,7 @@ type PitVisit struct {
 
 type ConnectionInfo struct {
 	UserID                     int
+	DriverIdentityID           int64
 	CarDBID                    int
 	TeamID                     int
 	CarID                      int
@@ -732,18 +744,31 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 				conn.CarSkin = entry.Skin
 			}
 			if entry.Team != "" {
-				conn.CarName = entry.Team
+				conn.CarName, _ = parseEntryTeam(entry.Team, cfg != nil && cfg.ACServer.Event.Team.UseNumber)
 			}
 		}
 	} else if entry, ok := entryForGUID(conn.DriverGUID); ok {
 		if entry.Team != "" {
-			conn.CarName = entry.Team
+			conn.CarName, _ = parseEntryTeam(entry.Team, cfg != nil && cfg.ACServer.Event.Team.UseNumber)
 		}
 		if entry.Skin != "" {
 			conn.CarSkin = entry.Skin
 		}
 	}
 	initializeConnectionIdentity(conn)
+	// 每次真实连接都追加一份 session 身份快照，供历史结果页按场次恢复当时的车手名。
+	// 日志恢复和 CarInfo 轮询不会走这里，因此不会伪造旧连接历史。
+	if sessionCollecting() && globalDBWriter != nil && globalSession != nil && conn.UserID > 0 {
+		identity := &SessionDriverIdentity{
+			SessionID: int64(globalSession.ID), GameCarID: slot, UserID: conn.UserID,
+			DriverName: conn.DriverName, ConnectedAt: conn.ConnectedAt,
+		}
+		if _, err := globalDBWriter.InsertSessionDriverIdentity(identity); err != nil {
+			logger.Printf("保存连接身份快照失败(slot=%d): %v", slot, err)
+		} else {
+			conn.DriverIdentityID = identity.ID
+		}
+	}
 	// 原版在 NewConnection 时发一条欢迎聊天（EventSendChat 202），文案里带直播链接。
 	sendWelcomeChat(slot)
 	if sessionCollecting() && conn.UserID > 0 {
