@@ -799,6 +799,16 @@ func (w *DBWriter) LinkSessionStintDriverIdentity(stintID int, identityID int64)
 	return err
 }
 
+// SetSessionLiveEndpoint 将 session 所属节点与其公开 HTTP 地址写入 GoSimView 扩展表。
+func (w *DBWriter) SetSessionLiveEndpoint(sessionID int64, nodeID, publicHTTPURL string) error {
+	if sessionID <= 0 || nodeID == "" {
+		return nil
+	}
+	_, err := w.executeSQL(`INSERT INTO session_live_endpoint (session_id, node_id, public_http_url) VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE node_id = VALUES(node_id), public_http_url = VALUES(public_http_url), updated_at = CURRENT_TIMESTAMP(6)`, sessionID, nodeID, publicHTTPURL)
+	return err
+}
+
 // CreateSessionStint 创建SessionStint。
 // 字段语义：stint.CarID 为数据库 car_id，stint.GameCarID 为 UDP 槽位号。
 // 可选外键（user_id / team_member_id / car_id / best_lap_id）缺省时写 NULL 而不是 0。
@@ -1276,7 +1286,7 @@ func (w *DBWriter) InsertSessionFeed(feed *SessionFeed) error {
 	return err
 }
 
-// FindLatestSessionByEventID 查找指定事件的最新会话（finish_time/start_time 等允许为 NULL）
+// FindLatestSessionByEventID 查找当前节点拥有的指定事件最新会话（finish_time/start_time 等允许为 NULL）。
 func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
 	// 模拟模式不读真实 session：假 session id 可能撞上真实行
 	if w.SimulateSQL {
@@ -1284,10 +1294,11 @@ func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
 	}
 
 	session := &Session{}
-	query := `SELECT session_id, event_id, type, name, track_time, start_time, duration_min, elapsed_ms, laps, weather, air_temp, road_temp, start_grip, current_grip, is_finished, finish_time, last_activity, http_port 
-			 FROM session 
-			 WHERE event_id = ? 
-			 ORDER BY start_time DESC 
+	query := `SELECT s.session_id, s.event_id, s.type, s.name, s.track_time, s.start_time, s.duration_min, s.elapsed_ms, s.laps, s.weather, s.air_temp, s.road_temp, s.start_grip, s.current_grip, s.is_finished, s.finish_time, s.last_activity, s.http_port
+			 FROM session s
+			 LEFT JOIN session_live_endpoint sle ON sle.session_id = s.session_id
+			 WHERE s.event_id = ? AND (sle.node_id = ? OR (? = '' AND sle.node_id IS NULL))
+			 ORDER BY s.start_time DESC
 			 LIMIT 1`
 	var (
 		sid          sql.NullInt64
@@ -1314,6 +1325,7 @@ func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
 		&startTime, &durationMin, &elapsedMs, &laps,
 		&weather, &airTemp, &roadTemp, &startGrip,
 		&currentGrip, &isFinished, &finishTime, &lastActivity, &httpPort,
+		globalNodeID(), globalNodeID(),
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

@@ -1027,6 +1027,11 @@ func initializeSession(msg udp.SessionInfo, newSession bool, startTime time.Time
 			return err
 		}
 	}
+	if cfg.App.Server.NodeID != "" {
+		if err := globalDBWriter.SetSessionLiveEndpoint(session.ID, cfg.App.Server.NodeID, cfg.App.Server.PublicURL); err != nil {
+			return fmt.Errorf("保存 session live endpoint 失败: %w", err)
+		}
+	}
 	globalSession = session
 	dataCollectionEnabled = true
 	carLapDataMap = make(map[int][]CarLapData)

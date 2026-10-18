@@ -123,6 +123,8 @@ type ACSession struct {
 	FinishTime   TimeWithTimezone `json:"finish_time"`
 	LastActivity TimeWithTimezone `json:"last_activity"`
 	HttpPort     int              `json:"http_port"`
+	LiveURL      string           `json:"-"`
+	LiveNodeID   string           `json:"-"`
 }
 
 // sessionTypeName 将数据库中存储的数值会话类型转换为原版前端使用的字符串。

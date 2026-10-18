@@ -389,6 +389,11 @@ func adoptCurrentSession(msg udp.SessionInfo) error {
 			}
 		}
 	}
+	if cfg.App.Server.NodeID != "" {
+		if err := globalDBWriter.SetSessionLiveEndpoint(session.ID, cfg.App.Server.NodeID, cfg.App.Server.PublicURL); err != nil {
+			return fmt.Errorf("保存 session live endpoint 失败: %w", err)
+		}
+	}
 	globalSession = session
 	dataCollectionEnabled = session.IsFinished == 0
 	// 续用已有 stint，避免接入后另起一条并丢失已有计数。

@@ -93,9 +93,9 @@ func main() {
 		logger.Printf("警告: 已配置 ssl.cert.file/private.key.file，但当前未启用 HTTPS（仍以明文 HTTP 监听）")
 	}
 
-	// 实时帧由 Writer 自己的 /live 提供（原版就是这个结构），http 不再开第二个 WS 监听。
-	if cfg.Writer.HTTP.Port > 0 && cfg.Writer.HTTP.Port != port {
-		logger.Printf("提示: writer.http.port=%d 由 Writer 进程监听 /live，http 不再转发", cfg.Writer.HTTP.Port)
+	// 浏览器连接当前节点 HTTP 的 /live；HTTP 将它代理到配对 Writer。
+	if writerPort := cfg.Writer.HTTP.Port; writerPort > 0 && writerPort != port {
+		logger.Printf("Live WebSocket 代理: %s/live -> 127.0.0.1:%d/live", listenAddr(host, port), writerPort)
 	}
 
 	// 启动主HTTP服务器
@@ -165,6 +165,17 @@ func connectDB(config *config.Config) error {
 	}
 
 	logger.Println("数据库连接成功")
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS session_live_endpoint (
+		session_id INT NOT NULL,
+		node_id VARCHAR(128) NOT NULL,
+		public_http_url VARCHAR(2048) NOT NULL,
+		updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+		PRIMARY KEY (session_id),
+		CONSTRAINT fk_session_live_endpoint_session FOREIGN KEY (session_id)
+			REFERENCES session (session_id) ON DELETE CASCADE ON UPDATE NO ACTION
+	) ENGINE=InnoDB`); err != nil {
+		return fmt.Errorf("创建 session_live_endpoint 扩展表失败: %w", err)
+	}
 
 	// 注意：HTTP 进程不再执行 schema（原版 schema 含 DROP TABLE，会在启动时破坏数据）。
 	// 建表/迁移由 Writer 侧的显式 ApplySchema 负责。

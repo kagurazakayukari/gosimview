@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"gosimview/config"
 )
 
 // 说明：本文件的接口契约来自原版 SimView 前端（result.js/analysis.js）。
@@ -27,15 +29,15 @@ const sessionSelectColumns = `s.session_id, s.event_id, s.type, COALESCE(s.track
 	COALESCE(s.elapsed_ms, 0), COALESCE(s.laps, 0), COALESCE(s.weather, ''), COALESCE(s.air_temp, 0),
 	COALESCE(s.road_temp, 0), COALESCE(s.start_grip, -1), COALESCE(s.current_grip, -1),
 	COALESCE(s.is_finished, 0), COALESCE(CAST(UNIX_TIMESTAMP(s.finish_time) * 1000000 AS SIGNED), 0),
-	COALESCE(CAST(UNIX_TIMESTAMP(s.last_activity) * 1000000 AS SIGNED), 0), COALESCE(s.http_port, 0)`
+	COALESCE(CAST(UNIX_TIMESTAMP(s.last_activity) * 1000000 AS SIGNED), 0), COALESCE(s.http_port, 0),
+	COALESCE((SELECT sle.public_http_url FROM session_live_endpoint sle WHERE sle.session_id = s.session_id), ''),
+	COALESCE((SELECT sle.node_id FROM session_live_endpoint sle WHERE sle.session_id = s.session_id), '')`
 
 // rowScanner 同时适配 *sql.Row 与 *sql.Rows
 type rowScanner interface {
 	Scan(dest ...interface{}) error
 }
 
-// defaultHTTPPort 会话未记录 http_port 时用于连接实时排行榜 WebSocket 的端口：
-// writer.http.port -> ac.server.udp.local.port -> app.server.port
 func defaultHTTPPort() int {
 	if cfg == nil {
 		return 0
@@ -43,22 +45,40 @@ func defaultHTTPPort() int {
 	if cfg.Writer.HTTP.Port > 0 {
 		return cfg.Writer.HTTP.Port
 	}
-	if cfg.ACServer.UDP.LocalPort > 0 {
-		return cfg.ACServer.UDP.LocalPort
-	}
-	return cfg.App.Server.Port
+	return cfg.ACServer.UDP.LocalPort
 }
 
 // scanSessionRow 扫描一行会话数据
 func scanSessionRow(sc rowScanner) (ACSession, error) {
 	var s ACSession
+	var nodeID string
+	var publicHTTPURL string
 	err := sc.Scan(&s.SessionID, &s.EventID, &s.Type, &s.TrackTime, &s.Name, &s.StartTime,
 		&s.DurationMin, &s.ElapsedMs, &s.Laps, &s.Weather, &s.AirTemp, &s.RoadTemp,
-		&s.StartGrip, &s.CurrentGrip, &s.IsFinished, &s.FinishTime, &s.LastActivity, &s.HttpPort)
+		&s.StartGrip, &s.CurrentGrip, &s.IsFinished, &s.FinishTime, &s.LastActivity, &s.HttpPort, &publicHTTPURL, &nodeID)
 	if err != nil {
 		return s, err
 	}
-	if s.HttpPort == 0 {
+	s.LiveURL = publicHTTPURL
+	s.LiveNodeID = nodeID
+	if cfg != nil && cfg.App.Server.NodeID != "" {
+		if nodeID == cfg.App.Server.NodeID {
+			s.HttpPort = cfg.App.Server.Port
+			if publicHTTPURL != "" {
+				if port, err := config.PublicHTTPPort(publicHTTPURL); err == nil {
+					s.HttpPort = port
+				}
+			}
+		} else if publicHTTPURL != "" {
+			if port, err := config.PublicHTTPPort(publicHTTPURL); err == nil {
+				s.HttpPort = port
+			} else {
+				s.HttpPort = 0
+			}
+		} else {
+			s.HttpPort = 0
+		}
+	} else if s.HttpPort == 0 {
 		s.HttpPort = defaultHTTPPort()
 	}
 	return s, nil

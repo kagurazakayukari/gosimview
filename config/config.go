@@ -67,7 +67,9 @@ type AppConfig struct {
 	Server struct {
 		Host       string `toml:"host"`
 		Port       int    `toml:"port"`
+		NodeID     string `toml:"node.id"`
 		PublicHost string `toml:"public.host"`
+		PublicURL  string `toml:"public.url"`
 		DocRoot    string `toml:"doc.root"`
 		CachePath  string `toml:"cache.path"`
 		Threads    int    `toml:"threads"`
@@ -300,7 +302,9 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	// 映射应用配置
 	config.App.Server.Host = getStringValue(config.App.RawConfig, "server.host")
 	config.App.Server.Port = getIntValue(config.App.RawConfig, "server.port")
+	config.App.Server.NodeID = getStringValue(config.App.RawConfig, "server.node.id")
 	config.App.Server.PublicHost = getStringValue(config.App.RawConfig, "server.public.host")
+	config.App.Server.PublicURL = getStringValue(config.App.RawConfig, "server.public.url")
 	config.App.Server.DocRoot = getStringValue(config.App.RawConfig, "server.doc.root")
 	config.App.Server.CachePath = getStringValue(config.App.RawConfig, "server.cache.path")
 	config.App.Server.Threads = getIntValue(config.App.RawConfig, "server.threads")
@@ -344,6 +348,10 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	// 节内的车名/GUID 是叶子键，直接取子表，不能从已拍平的 RawConfig 再取 map。
 	config.Overrides.CarClass = mapConfigStrings(collectConfigSection(rawConfig, "overrides.car.class"))
 	config.Overrides.UserCountry = mapConfigStrings(collectConfigSection(rawConfig, "overrides.user.country"))
+
+	if config.App.Server.PublicURL != "" && (config.App.Server.NodeID == "" || ValidatePublicHTTPURL(config.App.Server.PublicURL) != nil) {
+		return config, fmt.Errorf("设置 app.server.public.url 时必须设置 app.server.node.id，并使用绝对 HTTP(S) URL")
+	}
 
 	// 初始化空映射，避免nil指针错误
 	if config.Overrides.CarClass == nil {

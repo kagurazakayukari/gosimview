@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gosimview/config"
 )
 
 // parseIDList 解析逗号分隔的 ID 列表；空字符串返回空列表
@@ -1815,7 +1817,18 @@ func acEventHandler(w http.ResponseWriter, r *http.Request) {
 	if len(parts) >= 5 && parts[4] == "live" && len(parts[3]) > 0 {
 		eventId := parts[3]
 		// 验证eventId是数字
-		if _, err := strconv.Atoi(eventId); err == nil {
+		if id, err := strconv.Atoi(eventId); err == nil {
+			session, ok, lookupErr := latestSessionForEvent(id)
+			if lookupErr != nil {
+				logger.Printf("查找直播 session owner 失败(event=%d): %v", id, lookupErr)
+			} else if ok && session.LiveNodeID != "" && cfg != nil && session.LiveNodeID != cfg.App.Server.NodeID {
+				if session.LiveURL == "" || config.ValidatePublicHTTPURL(session.LiveURL) != nil {
+					http.Error(w, "该赛事所属节点没有配置可访问的 HTTP 地址", http.StatusServiceUnavailable)
+					return
+				}
+				http.Redirect(w, r, strings.TrimRight(session.LiveURL, "/")+"/ac/event/"+eventId+"/live", http.StatusTemporaryRedirect)
+				return
+			}
 			http.SetCookie(w, &http.Cookie{
 				Name:  "eventId",
 				Value: eventId,

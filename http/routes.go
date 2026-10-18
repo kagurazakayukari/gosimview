@@ -14,6 +14,8 @@ import (
 func setupRoutes() {
 	// 静态文件服务
 	fs = http.FileServer(http.Dir(docRoot))
+	// 各节点的公开入口按端口映射到对应 HTTP，/live 再代理到该节点的 Writer。
+	http.HandleFunc("/live", handleLiveProxy)
 	// 创建自定义处理器处理所有HTML文件和静态资源
 	http.HandleFunc("/", methodMiddleware(rootHandler, "GET"))
 	http.HandleFunc("/analysis/", methodMiddleware(analysisHandler, "GET"))
