@@ -64,12 +64,7 @@ func scanSessionRow(sc rowScanner) (ACSession, error) {
 	if cfg != nil && cfg.App.Server.NodeID != "" {
 		if nodeID == cfg.App.Server.NodeID {
 			s.HttpPort = cfg.App.Server.Port
-			if publicHTTPURL != "" {
-				if port, err := config.PublicHTTPPort(publicHTTPURL); err == nil {
-					s.HttpPort = port
-				}
-			}
-		} else if publicHTTPURL != "" {
+		} else if publicHTTPURL != "" && config.ValidatePublicHTTPURL(publicHTTPURL) == nil {
 			if port, err := config.PublicHTTPPort(publicHTTPURL); err == nil {
 				s.HttpPort = port
 			} else {

@@ -349,7 +349,7 @@ func ExtractConfigFromTOML(data []byte) (Config, error) {
 	config.Overrides.CarClass = mapConfigStrings(collectConfigSection(rawConfig, "overrides.car.class"))
 	config.Overrides.UserCountry = mapConfigStrings(collectConfigSection(rawConfig, "overrides.user.country"))
 
-	if config.App.Server.PublicURL != "" && (config.App.Server.NodeID == "" || ValidatePublicHTTPURL(config.App.Server.PublicURL) != nil) {
+	if config.App.Server.PublicURL != "" && (config.App.Server.NodeID == "" || func() bool { _, err := PublicHTTPPort(config.App.Server.PublicURL); return err != nil }()) {
 		return config, fmt.Errorf("设置 app.server.public.url 时必须设置 app.server.node.id，并使用绝对 HTTP(S) URL")
 	}
 
