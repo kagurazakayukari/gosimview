@@ -399,6 +399,15 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 		raceDurationType = 1 // 1 = 按圈数
 	}
 
+	// 槽位上界取自 AC 的 SERVER.MAX_CLIENTS：原版 Writer 就是从 server_cfg.ini 读这个键
+	// （FUN_1400864b0 把 stoi(MAX_CLIENTS) 写进配置对象 +0x2c，探测循环用它取模），
+	// 而 server_cfg.ini 里没有 MAX_CAR_SLOTS 这个键。缺失或越界一律报错，
+	// 不用猜测值兼容：探测越界槽位会向不存在的车发 GetCarInfo，也会把一轮轮询周期拉长。
+	maxClients := cfg.Section("SERVER").Key("MAX_CLIENTS").MustInt(0)
+	if maxClients < 1 || maxClients > 256 {
+		return fmt.Errorf("server_cfg.ini 的 SERVER.MAX_CLIENTS 缺失或超出 1..256 范围: %d", maxClients)
+	}
+
 	w.ServerCfg = &ServerConfig{
 		Name:                 cfg.Section("SERVER").Key("NAME").String(),
 		Track:                normalizeTrackName(cfg.Section("SERVER").Key("TRACK").String()),
@@ -410,7 +419,7 @@ func (w *DBWriter) LoadServerConfig(gamePath string) error {
 		HTTPPort:             cfg.Section("HTTP").Key("PORT").MustInt(8081),
 		AdminPassword:        cfg.Section("SERVER").Key("ADMIN_PASSWORD").String(),
 		Password:             cfg.Section("SERVER").Key("PASSWORD").String(),
-		MaxCarSlots:          cfg.Section("SERVER").Key("MAX_CAR_SLOTS").MustInt(50),
+		MaxCarSlots:          maxClients, // 字段名为历史遗留，实际承载 SERVER.MAX_CLIENTS
 		IdleTimeout:          cfg.Section("SERVER").Key("IDLE_TIMEOUT").MustInt(120),
 		VoteTimeout:          cfg.Section("SERVER").Key("VOTE_TIMEOUT").MustInt(60),
 		QualifyStandingType:  cfg.Section("SERVER").Key("QUALIFY_STANDING_TYPE").MustInt(0),
@@ -584,7 +593,6 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		}
 		// Process user data if GUID is present
 		var userIDs []int
-		var userInserted = false
 
 		if driver.GUID != "" {
 			// 分割GUID列表
@@ -611,7 +619,6 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 						logger.Printf("新用户 %s (ID: %d)", driver.Name, userID)
 					}
 					userIDs = append(userIDs, userID)
-					userInserted = true
 				}
 			}
 		}
@@ -691,8 +698,10 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 				}
 			}
 
-			// 创建或更新团队成员
-			if userInserted && len(userIDs) > 0 {
+			// 创建或更新团队成员。
+			// 名单只要解析出了 user 就对齐一次成员行：FindOrCreateTeamMember 是先查后插的幂等实现，
+			// 重启后用户已存在也能拿到 team_member_id，不依赖“本次是否新插用户”。
+			if len(userIDs) > 0 {
 				for _, userID := range userIDs {
 					teamMember := &TeamMember{
 						TeamID:    teamID,
@@ -815,6 +824,13 @@ func (w *DBWriter) SetSessionLiveEndpoint(sessionID int64, nodeID, publicHTTPURL
 func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 	if stint == nil {
 		return 0, fmt.Errorf("session_stint为空")
+	}
+
+	// 车队赛的 team_member_id 是成绩分组键：写成 NULL 会让这段成绩在车队榜里消失。
+	// 只认段上冻结的 TeamEvent，不看当前 globalEvent——旧会话的排队圈重试时可能已经换节。
+	if stint.TeamEvent == 1 && stint.TeamMemberID <= 0 {
+		return 0, fmt.Errorf("车队赛 session_stint 缺少 team_member_id（event=%d team=%d user=%d slot=%d）",
+			stint.EventID, stint.TeamID, stint.UserID, stint.GameCarID)
 	}
 
 	query := `INSERT INTO session_stint (session_id, user_id, team_member_id, car_id, game_car_id, laps, valid_laps, best_lap_id, is_finished, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -1320,12 +1336,11 @@ func (w *DBWriter) FindLatestSessionByEventID(eventID int) (*Session, error) {
 		lastActivity sql.NullTime
 		httpPort     sql.NullInt64
 	)
-	err := w.DB.QueryRow(query, eventID).Scan(
+	err := w.DB.QueryRow(query, eventID, globalNodeID(), globalNodeID()).Scan(
 		&sid, &eventIDCol, &sessionType, &name, &trackTime,
 		&startTime, &durationMin, &elapsedMs, &laps,
 		&weather, &airTemp, &roadTemp, &startGrip,
 		&currentGrip, &isFinished, &finishTime, &lastActivity, &httpPort,
-		globalNodeID(), globalNodeID(),
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

@@ -119,59 +119,32 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 			p.lastLap, p.hasLastLap = lapSectors{time: score.LastTime}, true
 		}
 	}
-	// 日志补充可能晚于 UDP 落库；同圈日志的 cuts/碰撞不得被较早快照覆盖。
-	logLaps := make(map[int]lapSectors)
-	savedLaps := make(map[int]lapSectors)
-	for _, saved := range carLapDataMap[slot] {
-		savedLaps[saved.LapTime] = lapSectors{cuts: int(saved.Cuts), crashes: int(saved.Crashes), carCrashes: int(saved.CarCrashes)}
-	}
-	// 2) 日志分段圈（Time>0 为已完成圈，末尾 Time==0 的是当前进行圈）
+	// 历史回放圈：接入前已经完成的圈逐条参与个人最快圈/最佳分段。
+	// 在线阶段不再写 Time，因此这里只会拿到回放历史，不会与已提交圈重复计入。
+	historyLaps := 0
 	for _, lap := range stintLapData[sessionID][slot] {
 		if lap.Time <= 0 {
 			continue
 		}
-		cand := lapSectors{time: lap.Time, segments: [3]int{lap.Sector1, lap.Sector2, lap.Sector3}, cuts: lap.Cuts, crashes: lap.Crashes, carCrashes: lap.CarCrashes}
-		if saved, ok := savedLaps[lap.Time]; ok {
-			cand.cuts = max(cand.cuts, saved.cuts)
-			cand.crashes = max(cand.crashes, saved.crashes)
-			cand.carCrashes = max(cand.carCrashes, saved.carCrashes)
-		}
-		logLaps[lap.Time] = cand
-		p.lastLap, p.hasLastLap = cand, true
-		consider(cand)
+		historyLaps++
+		consider(lapSectors{time: lap.Time, segments: [3]int{lap.Sector1, lap.Sector2, lap.Sector3}, cuts: lap.Cuts, crashes: lap.Crashes, carCrashes: lap.CarCrashes})
 	}
-	// 已有完整日志时以最新 cuts/碰撞为准，不能让旧 BEST 汇总重新放行无效圈。
-	if recoveredBest != nil {
-		if _, logged := logLaps[recoveredBest.time]; !logged {
-			consider(*recoveredBest)
-		}
+	// 恢复基线只在日志窗口内没有任何完成圈时兑底（官方 BEST 口径），
+	// 已有完成历史时以历史圈自身为准，不再按圈时判重。
+	if recoveredBest != nil && historyLaps == 0 {
+		consider(*recoveredBest)
 	}
-	invalidatedSavedLaps := 0
-	// 3) 已提交 UDP 历史（分段可能由日志补全）
+	// 已提交 UDP 历史：每条圈只用自己的冻结字段。
 	if values := carLapDataMap[slot]; len(values) > 0 {
 		last := values[len(values)-1]
 		if last.Completed != 0 {
 			p.entry.StatusMask |= 1
 		}
-		mergeLog := func(lap CarLapData) lapSectors {
-			cand := lapSectors{time: lap.LapTime, segments: [3]int{lap.Sector1, lap.Sector2, lap.Sector3}, cuts: int(lap.Cuts), crashes: int(lap.Crashes), carCrashes: int(lap.CarCrashes)}
-			if logged, ok := logLaps[lap.LapTime]; ok {
-				cand.segments = logged.segments
-				cand.cuts = max(cand.cuts, logged.cuts)
-				cand.crashes = max(cand.crashes, logged.crashes)
-				cand.carCrashes = max(cand.carCrashes, logged.carCrashes)
-			}
-			return cand
-		}
-		p.lastLap = mergeLog(last)
-		p.hasLastLap = true
 		for _, lap := range values {
-			merged := mergeLog(lap)
-			if lap.LapTime > 0 && lap.Cuts == 0 && lap.Crashes == 0 && lap.CarCrashes == 0 && !merged.valid() {
-				invalidatedSavedLaps++
-			}
-			consider(merged)
+			consider(lapSectors{time: lap.LapTime, segments: [3]int{lap.Sector1, lap.Sector2, lap.Sector3}, cuts: int(lap.Cuts), crashes: int(lap.Crashes), carCrashes: int(lap.CarCrashes)})
 		}
+		p.lastLap = lapSectors{time: last.LapTime, segments: [3]int{last.Sector1, last.Sector2, last.Sector3}, cuts: int(last.Cuts), crashes: int(last.Crashes), carCrashes: int(last.CarCrashes)}
+		p.hasLastLap = true
 	}
 
 	// 最快圈字段只写这一条圈自己的三段；没有分段就是 0（页面据此不显示总圈时）。
@@ -187,13 +160,12 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 		p.entry.LastLapTime = int32(p.lastLap.time)
 	}
 
-	// 当前日志圈的分段（Race 展示；Quali/Practice 页面用最快圈分段）。
-	if values := stintLapData[sessionID][slot]; len(values) > 0 {
-		if v := values[len(values)-1]; v.Time == 0 {
-			p.entry.CurrentLapS1 = uint32(maxZero(v.Sector1))
-			p.entry.CurrentLapS2 = uint32(maxZero(v.Sector2))
-			p.entry.CurrentLapS3 = uint32(maxZero(v.Sector3))
-		}
+	// 当前圈（未被 UDP 完圈消费的尾记录）的分段：Race 展示用；Quali/Practice 用最快圈分段。
+	// 在线阶段日志只写当前圈的 S1/S2，S3 在完圈时才由官方圈时推导，这里不伪造。
+	if v := currentLapForDisplay(sessionID, slot); v != nil {
+		p.entry.CurrentLapS1 = uint32(maxZero(v.Sector1))
+		p.entry.CurrentLapS2 = uint32(maxZero(v.Sector2))
+		p.entry.CurrentLapS3 = uint32(maxZero(v.Sector3))
 	}
 	if globalSession != nil && globalSession.Type == 2 {
 		p.displayed = [3]int{int(p.entry.CurrentLapS1), int(p.entry.CurrentLapS2), int(p.entry.CurrentLapS3)}
@@ -231,8 +203,6 @@ func buildSlotProjection(sessionID, slot int, conn *ConnectionInfo, update udp.C
 			p.entry.ValidLaps = uint16(score.ValidLaps + validLaps)
 		}
 	}
-	// 迟到日志只修正 Live 投影；不把已判无效的在线圈继续计作有效圈。
-	p.entry.ValidLaps = uint16(max(0, int(p.entry.ValidLaps)-invalidatedSavedLaps))
 	p.entry.Tyre = userTyres[conn.DriverName]
 	p.entry.TyreLength = uint8(len(p.entry.Tyre))
 	return p

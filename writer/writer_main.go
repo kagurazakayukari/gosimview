@@ -338,6 +338,13 @@ type SessionStint struct {
 	IsFinished       int       `db:"is_finished" json:"is_finished"`
 	StartedAt        time.Time `db:"started_at" json:"started_at"`
 	FinishedAt       time.Time `db:"finished_at" json:"finished_at"`
+
+	// 以下三个是运行时字段，不写库（session_stint 没有这三列）。
+	// 建段时把车队归属冻结在段上，重试解析 team_member 只认这份冻结值，
+	// 不看当时的 globalEvent 或新连接——否则旧会话排队圈会被归到当前节的队伍里。
+	TeamID    int `db:"-" json:"-"`
+	EventID   int `db:"-" json:"-"`
+	TeamEvent int `db:"-" json:"-"`
 }
 
 // SessionDriverIdentity 保存一次真实 NewConnection 的 user_id 与当时姓名。
@@ -474,11 +481,12 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	if !acceptLapCompletion(lapMsg, *completedCar, time.Now()) {
 		return
 	}
-	// 日志暂时读不到时本圈不丢：先按 UDP 观测入队，日志恢复后再补分段提交。
+	// 日志暂时读不到时本圈不丢：按已冻结的当前圈对象入队并重试写入。
+	// 原版不保证延迟回绑，重试只把日志读通，不再改用重试时的其他圈覆盖分段。
 	logPending := false
 	if err := collectCarUpdates(); err != nil {
 		logPending = true
-		logger.Printf("完圈前读取日志失败，本圈入队等待日志恢复: %v", err)
+		logger.Printf("完圈前读取日志失败，本圈分段可能缺失，入队重试: %v", err)
 	}
 	slot := int(lapMsg.CarID)
 	conn := globalConnections[slot]
@@ -496,22 +504,20 @@ func handleLapCompletedMessage(lapMsg udp.LapCompleted, lastDataTime *time.Time)
 	} else {
 		logger.Printf("完成圈抓地力数值无效: %v", grip)
 	}
+	// 原版 ae390/af330：完圈即消费该槽位的当前圈对象。官方圈时与 cuts 来自报文，
+	// S1/S2、碰撞与轮胎取自日志对该当前圈的写入；S3 由官方圈时推导。
+	// 消费后立刻清空该对象并继承轮胎，交给下一圈；不在日志侧另开一条圈序。
+	var snap StintLap
+	if cur := currentSlotLap(int(globalSession.ID), slot); cur != nil {
+		snap = *cur
+		*cur = StintLap{Tyre: snap.Tyre, StintID: snap.StintID}
+	}
 	lap := CarLapData{SessionID: globalSession.ID, CarID: slot, GameCarID: conn.CarDBID,
 		LapTime: int(lapMsg.LapTime), Cuts: lapMsg.Cuts, Laps: completedCar.Laps,
-		Completed: uint16(completedCar.Completed), Timestamp: time.Now()}
-	// 日志只补充完整圈的分段，保留 UDP 圈时这一权威值。
-	// 日志读取失败时先留空，待日志恢复后由 supplementPendingLapFromLog 补齐。
-	if !logPending {
-		for i := len(stintLapData[int(globalSession.ID)][slot]) - 1; i >= 0; i-- {
-			v := stintLapData[int(globalSession.ID)][slot][i]
-			if v.Time == lap.LapTime {
-				lap.Sector1, lap.Sector2, lap.Sector3, lap.Tyre = v.Sector1, v.Sector2, v.Sector3, v.Tyre
-				lap.Cuts = max(lap.Cuts, uint8(v.Cuts))
-				lap.Crashes, lap.CarCrashes = uint8(v.Crashes), uint8(v.CarCrashes)
-				break
-			}
-		}
-	}
+		Completed: uint16(completedCar.Completed), Timestamp: time.Now(),
+		Sector1: snap.Sector1, Sector2: snap.Sector2,
+		Sector3: derivedSector3(int(lapMsg.LapTime), snap.Sector1, snap.Sector2),
+		Crashes: uint8(snap.Crashes), CarCrashes: uint8(snap.CarCrashes), Tyre: snap.Tyre}
 	if lap.Tyre == "" {
 		lap.Tyre = userTyres[conn.DriverName]
 	}
@@ -560,6 +566,16 @@ func nullableLapID(id int) interface{} {
 		return nil
 	}
 	return id
+}
+
+// derivedSector3 按官方圈时推导 S3：原版在 ae390（UDP 完圈消费当前圈）里用 time-S1-S2 直接相减，
+// 随后由 af330 复位当前圈。分段缺失时那一步会得出一个看起来像真值的假分段；
+// 这里只在 S1/S2 都有效且时间足够时才计算，缺段保持 0（沿用项目现有缺失语义，不伪造分段）。
+func derivedSector3(lapTime, sector1, sector2 int) int {
+	if lapTime <= 0 || sector1 <= 0 || sector2 <= 0 || lapTime < sector1+sector2 {
+		return 0
+	}
+	return lapTime - sector1 - sector2
 }
 
 // UDP 类型保持原协议，数据库和原版网页使用 0/1/2。
@@ -718,6 +734,7 @@ func handleNewConnectionMessage(msg udp.SessionCarInfo, last *time.Time) {
 	}
 	previous := globalConnections[slot]
 	resetRaceTiming(slot)
+	delete(bandHint, slot) // 槽位换人/重连：四边形搜索起点重新学
 	if previous != nil && (previous.DriverGUID != string(msg.DriverGUID) || previous.CarModel != msg.CarModel) {
 		// 槽位换人或换车时，旧身份的实时成绩不能投影到新条目。
 		delete(carLapDataMap, slot)
@@ -1046,6 +1063,7 @@ func initializeSession(msg udp.SessionInfo, newSession bool, startTime time.Time
 	lastLapCompletions = make(map[int]lapCompletion)
 	pitObservations = make(map[int]*pitObservation)
 	positionObservations = make(map[int]*positionObservation)
+	bandHint = make(map[int]int) // 新节/新身份：四边形索引从头开始
 	activeStints = make(map[int]*SessionStint)
 	latestCarUpdates = make(map[udp.CarID]udp.CarUpdate)
 	resetAllRaceTiming()
@@ -1221,7 +1239,13 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	boundary := pitBoundary
 	fallback := pitLaneFallback
 	leftWall, rightWall := trackLeftWall, trackRightWall
+	geometryKey := pitBoundaryLoadedFor
 	pitGeometryMu.RUnlock()
+	// 搜索起点属于 stateMutex 下的车辆状态，后台几何线程不改它，避免异步预热与更新包竞争。
+	if bandHintGeometryKey != geometryKey {
+		bandHint = make(map[int]int)
+		bandHintGeometryKey = geometryKey
+	}
 	inPit := false
 	hasPit := true
 	if len(boundary) >= 3 {
@@ -1241,93 +1265,42 @@ func handleCarUpdateMessage(updateMsg udp.CarUpdate, lastDataTime *time.Time) {
 	}
 }
 
-// applyOffTrackStatus 按“车到可驶路面的距离”判冲出赛道：
-// 左墙点 + 反向右墙点拼成路面多边形，多边形内部距离为 0；
-// 在多边形外时算到最近边的距离，超过 2 米置 OFF_TRACK(1)，否则复位为 ON_TRACK(0)。
+// bandHint 保存每车上次命中的“四边形”节点索引，作为局部 quad 的搜索起点，
+// 对应原版写在车槽 +0x1d8 的那个缓存索引（只在命中时更新）。
+// 它只是数组下标，会话/身份/几何一变就整体清空，不做跨 key 继承。
+var bandHint = make(map[int]int)
+var bandHintGeometryKey string
+
+// applyOffTrackStatus 按原版 FUN_1400acca0 的口径维护 OFF_TRACK：
+// 先用“相邻两节点四边形”（FUN_14011d490）判带内外，带内直接清 0；
+// 带外才比“到最近墙点的距离”（FUN_14011da30，真实距离）与 2.0，
+// 且原版在带外 2 米内、以及已置 1 时都是 return，不清 0 也不重复置 1。
 // 路面边界未就绪时不动状态，不把“未知”当成“在赛道上”。
 func applyOffTrackStatus(slot int, x, z float32, left, right [][2]float32) {
 	conn := globalConnections[slot]
-	if conn == nil || len(left) < 3 || len(right) < 3 {
+	if conn == nil || len(left) < 3 || len(right) != len(left) {
 		return
 	}
 	point := [2]float32{x, z}
-	status := uint8(0)
-	if !pointInWallRing(point, left, right) {
-		if distanceToWallRing(point, left, right) > offTrackThresholdM {
-			status = 1
-		}
-	}
-	if conn.TrackStatus == status {
-		return
-	}
-	conn.TrackStatus = status
-	conn.TrackStatusLastChangedTime = time.Now()
-	if status == 1 {
-		logger.Printf("车辆 %d 冲出赛道 near nsp: %.3f", slot, latestCarUpdates[udp.CarID(slot)].NormalisedSplinePos)
-	}
-}
-
-// pointInWallRing 判断点是否在“左墙 + 反向右墙”围成的路面多边形内。
-func pointInWallRing(p [2]float32, left, right [][2]float32) bool {
-	inside := false
-	check := func(i, j int) {
-		a := left[i]
-		b := left[j]
-		if (a[1] > p[1]) != (b[1] > p[1]) &&
-			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
-			inside = !inside
-		}
-	}
-	for i := 0; i < len(left); i++ {
-		check(i, (i+1)%len(left))
-	}
-	check2 := func(i, j int) {
-		a := right[i]
-		b := right[j]
-		if (a[1] > p[1]) != (b[1] > p[1]) &&
-			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
-			inside = !inside
-		}
-	}
-	for i := 0; i < len(right); i++ {
-		check2(i, (i+1)%len(right))
-	}
-	// 两侧封口：首尾各连一条横边。
-	for _, seg := range [][2][2]float32{{left[0], right[0]}, {left[len(left)-1], right[len(right)-1]}} {
-		a, b := seg[0], seg[1]
-		if (a[1] > p[1]) != (b[1] > p[1]) &&
-			p[0] < (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0] {
-			inside = !inside
-		}
-	}
-	return inside
-}
-
-// distanceToWallRing 返回点到路面多边形最近边的距离。
-func distanceToWallRing(p [2]float32, left, right [][2]float32) float32 {
-	best := float32(math.MaxFloat32)
-	consider := func(a, b [2]float32) {
-		dx, dz := b[0]-a[0], b[1]-a[1]
-		if dx == 0 && dz == 0 {
+	idx, inside := kn5conv.BandContains(point, left, right, bandHint[slot])
+	if inside {
+		bandHint[slot] = idx
+		if conn.TrackStatus == 0 {
 			return
 		}
-		t := ((p[0]-a[0])*dx + (p[1]-a[1])*dz) / (dx*dx + dz*dz)
-		if t < 0 {
-			t = 0
-		} else if t > 1 {
-			t = 1
-		}
-		px, pz := a[0]+t*dx, a[1]+t*dz
-		d := float32(math.Hypot(float64(p[0]-px), float64(p[1]-pz)))
-		if d < best {
-			best = d
-		}
+		conn.TrackStatus = 0
+		conn.TrackStatusLastChangedTime = time.Now()
+		return
 	}
-	for i := 0; i < len(left); i++ {
-		consider(left[i], left[(i+1)%len(left)])
-		consider(right[i], right[(i+1)%len(right)])
+	if conn.TrackStatus == 1 {
+		// 原版：已判出界就不再重算，等回到带内再清。
+		return
 	}
-	return best
+	if kn5conv.NearestWallPoint(point, left, right) > offTrackThresholdM {
+		conn.TrackStatus = 1
+		conn.TrackStatusLastChangedTime = time.Now()
+		logger.Printf("车辆 %d 冲出赛道 near nsp: %.3f", slot, latestCarUpdates[udp.CarID(slot)].NormalisedSplinePos)
+	}
 }
 
 // getTrackLength 安全获取当前事件赛道长度，缺失时返回 0（避免 nil 解引用）
@@ -1361,12 +1334,12 @@ func normalizeTrackName(raw string) string {
 type pitGeometry struct {
 	boundary [][3]float32
 	fallback *kn5conv.PitLaneWindow
-	// left/right 是赛车线左右墙点（水平坐标），拼成路面多边形用于冲出赛道判定。
+	// left/right 是 AI 赛车线左右墙点，作为出界判定的局部四边形降级几何，不代表KN5实际路面。
 	left  [][2]float32
 	right [][2]float32
 }
 
-// offTrackThresholdM 与原版一致：车到可驶路面的水平距离超过 2 米算冲出赛道。
+// offTrackThresholdM 与原版AI降级机制一致：带外到最近墙点超过2米时置出界。
 const offTrackThresholdM float32 = 2.0
 
 // ensurePitBoundary 在后台加载赛道几何，同一 key 只构建一份；构建过程不持业务状态锁。

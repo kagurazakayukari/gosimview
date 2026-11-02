@@ -1256,14 +1256,16 @@ func handleACBestLap(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 应用层分页
-	start := (page - 1) * entries
-	end := start + entries
-	if end > len(allLaps) {
-		end = len(allLaps)
-	}
-	if start > len(allLaps) {
-		start = len(allLaps)
+	// 应用层分页：先用总条数反推页码上限再相乘，避免 (page-1)*entries 溢出为负后打穿切片。
+	// 页码语义不变（page >= 1，entries 默认 10 / 上限 100），越界页返回空列表。
+	total := len(allLaps)
+	start, end := total, total
+	if offset := page - 1; offset <= total/entries {
+		start = offset * entries
+		end = start + entries
+		if end > total {
+			end = total
+		}
 	}
 
 	// 处理查询结果

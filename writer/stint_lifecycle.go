@@ -64,13 +64,21 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 	if startedAt.IsZero() {
 		return nil, fmt.Errorf("车辆 %d 的 stint 起点缺失", slot)
 	}
+	// 占位段：先把身份、会话与车队归属冻结在段上，再落库。
+	// 缺 team_member 映射时不拒建段（否则调用方会连圈一起丢），
+	// 而是先把段放进 activeStints/sessionStints，由 persistStint 报错，
+	// 完圈照原样入队保存整圈与样本，提交时重试解析成员。
 	stint = &SessionStint{UserID: conn.UserID, DriverIdentityID: conn.DriverIdentityID, SessionID: int(globalSession.ID), CarID: conn.CarDBID, GameCarID: slot, StartedAt: startedAt}
-	if globalEvent.TeamEvent == 1 {
-		for _, member := range globalTeamMembers {
-			if member.UserID == conn.UserID && member.TeamID == conn.TeamID {
-				stint.TeamMemberID = member.ID
-				break
-			}
+	if globalEvent != nil {
+		stint.TeamEvent = globalEvent.TeamEvent
+		stint.EventID = globalEvent.ID
+	}
+	// 车队归属只认连接时由 getTeamIDByCarID 按槽位/名单算出的 conn.TeamID，
+	// 不在这里按 user 反抢别的队伍的成员。
+	stint.TeamID = conn.TeamID
+	if stint.TeamEvent == 1 {
+		if member := findTeamMemberForStint(stint); member != nil {
+			stint.TeamMemberID = member.ID
 		}
 	}
 	// 先保留已观测段的身份与起点；建段失败时完圈仍能绑定同一对象重试。
@@ -79,10 +87,37 @@ func ensureCurrentStint(slot int, observedAt time.Time) (*SessionStint, error) {
 	return stint, persistStint(stint)
 }
 
+// findTeamMemberForStint 按段上冻结的 (TeamID, UserID) 在成员缓存里找对应的 team_member。
+// 只认已存在的成员行，不自动造无授权成员；找不到返回 nil，由调用方报错。
+func findTeamMemberForStint(stint *SessionStint) *TeamMember {
+	if stint == nil || stint.TeamID <= 0 || stint.UserID <= 0 {
+		return nil
+	}
+	for _, member := range globalTeamMembers {
+		if member == nil || member.ID <= 0 {
+			continue
+		}
+		if member.TeamID == stint.TeamID && member.UserID == stint.UserID {
+			return member
+		}
+	}
+	return nil
+}
+
 // persistStint 将已观测的内存段写库，失败不丢弃其身份或原始起点。
 // 调用者持有 stateMutex。
 func persistStint(stint *SessionStint) error {
 	if stint.ID == 0 {
+		// 车队赛的成员解析只认段上冻结的 (TeamID, UserID)：
+		// 重试期间可能已经换节或换人，用当时的 globalEvent/新 conn 会把圈串到别的队伍。
+		if stint.TeamEvent == 1 && stint.TeamMemberID <= 0 {
+			member := findTeamMemberForStint(stint)
+			if member == nil {
+				return fmt.Errorf("车队赛 stint 缺少 team_member 映射（event=%d team=%d user=%d slot=%d）",
+					stint.EventID, stint.TeamID, stint.UserID, stint.GameCarID)
+			}
+			stint.TeamMemberID = member.ID
+		}
 		id, err := globalDBWriter.CreateSessionStint(stint)
 		if err != nil {
 			return err

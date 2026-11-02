@@ -70,7 +70,7 @@ func LoadPitLaneWindow(gamePath, trackName, configName string) (*PitLaneWindow, 
 }
 
 // LoadTrackEdges 返回赛车线左右墙点（水平坐标）。
-// 每个节点用相邻节点（中心差分）求方向，法线取 (dz,-dx) 一侧；
+// 每个节点用前一节点到当前节点求方向，法线取 (dz,-dx) 一侧；
 // 这一侧才与 .ai 的左宽/右宽对应，反了会把宽窄两侧互换。
 func LoadTrackEdges(gamePath, trackName, configName string) (left, right [][2]float32, err error) {
 	_, layout, err := resolveTrackDirs(gamePath, trackName, configName)
@@ -88,18 +88,19 @@ func LoadTrackEdges(gamePath, trackName, configName string) (left, right [][2]fl
 	left = make([][2]float32, 0, len(details))
 	right = make([][2]float32, 0, len(details))
 	for i := range details {
+		// 原版 FUN_140120630 用“前一节点 → 当前节点”的方向角（节点 0 回绕到末节点），
+		// 不用中心差分：中心差分会把弯心两侧的法线抹平，墙点偏到弯外。
 		prev := details[(i+len(details)-1)%len(details)].Position
-		next := details[(i+1)%len(details)].Position
-		dx := next[0] - prev[0]
-		dz := next[2] - prev[2]
+		pos := details[i].Position
+		dx := pos[0] - prev[0]
+		dz := pos[2] - prev[2]
 		length := math.Hypot(float64(dx), float64(dz))
 		if length <= 0 {
-			continue
+			return nil, nil, fmt.Errorf("赛车线节点 %d 与前节点水平坐标重合，无法构造对应墙点", i)
 		}
 		nx := float32(float64(dz) / length)
 		nz := float32(-float64(dx) / length)
 
-		pos := details[i].Position
 		// 左右宽由已解析的墙点与赛车线距离得到，不重复读 detail 字段。
 		leftWidth := float32(math.Hypot(float64(details[i].WallLeft[0]-pos[0]), float64(details[i].WallLeft[2]-pos[2])))
 		rightWidth := float32(math.Hypot(float64(details[i].WallRight[0]-pos[0]), float64(details[i].WallRight[2]-pos[2])))
@@ -111,6 +112,69 @@ func LoadTrackEdges(gamePath, trackName, configName string) (left, right [][2]fl
 		return nil, nil, fmt.Errorf("赛车线墙点不足")
 	}
 	return left, right, nil
+}
+
+// BandContains 按原版 FUN_14011d490 的口径判断点是否在路面带内：
+// 只测“相邻两节点（i-1, i）构成的四边形”，四条边做射线奇偶，命中即带内。
+// hint 是上次命中的节点索引，从它开始扫一圈再回到它（原版从车槽 +0x1d8 缓存的节点起扫）。
+func BandContains(p [2]float32, left, right [][2]float32, hint int) (int, bool) {
+	n := len(left)
+	if n < 3 || len(right) != n {
+		return 0, false
+	}
+	if hint < 0 || hint >= n {
+		hint = 0
+	}
+	for k := 0; k < n; k++ {
+		i := (hint + k) % n
+		if quadContains(p, left, right, i) {
+			return i, true
+		}
+	}
+	return hint, false
+}
+
+// quadContains 只判“节点 i-1 与 i 之间”那一段四边形，对应原版每段的四次射线测试。
+func quadContains(p [2]float32, left, right [][2]float32, i int) bool {
+	n := len(left)
+	j := (i - 1 + n) % n
+	crossings := 0
+	for _, e := range [4][2][2]float32{
+		{left[j], right[j]},  // 段起点横边
+		{right[j], right[i]}, // 右墙
+		{right[i], left[i]},  // 段终点横边
+		{left[i], left[j]},   // 左墙
+	} {
+		if rayHits(p, e[0], e[1]) {
+			crossings++
+		}
+	}
+	return crossings%2 == 1
+}
+
+// rayHits 是 FUN_14011cd50 的最小等价：从 p 向 +x 发水平射线，判是否与线段 ab 相交。
+// 两端点在 p.y 同侧时必然不相交，所以分母不会为 0。
+func rayHits(p, a, b [2]float32) bool {
+	if (a[1] > p[1]) == (b[1] > p[1]) {
+		return false
+	}
+	x := (b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1]) + a[0]
+	return p[0] < x
+}
+
+// NearestWallPoint 是原版 FUN_14011da30 的口径：到所有墙点（每节点左、右各一个）的最近距离，
+// 不是到折线边的距离。原版带外之后就是拿这个值与 2.0 比较（11da30 里是 SQRT 后的真距离）。
+func NearestWallPoint(p [2]float32, left, right [][2]float32) float32 {
+	best := float32(math.MaxFloat32)
+	for _, arr := range [][][2]float32{left, right} {
+		for _, q := range arr {
+			dx, dz := q[0]-p[0], q[1]-p[1]
+			if d := float32(math.Hypot(float64(dx), float64(dz))); d < best {
+				best = d
+			}
+		}
+	}
+	return best
 }
 
 // resolveTrackDirs 解析赛道内容目录，Writer 的凸包路径与降级判据共用：

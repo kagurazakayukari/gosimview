@@ -51,7 +51,8 @@ func observePitVisit(slot int, inPit bool, update udp.CarUpdate, now time.Time) 
 		pitObservations[slot] = &pitObservation{inPit: inPit, stopped: stopped}
 		if inPit {
 			conn.TrackStatus = 3
-		} else {
+		} else if conn.TrackStatus == 3 {
+			// 首次区外观测撤掉连接时的维修区占位状态，不覆盖已有出界判定。
 			conn.TrackStatus = 0
 		}
 		return
@@ -84,9 +85,14 @@ func observePitVisit(slot int, inPit bool, update udp.CarUpdate, now time.Time) 
 		if conn.StintStartedAt.IsZero() {
 			conn.StintStartedAt = now
 		}
-		if _, err := ensureCurrentStint(slot, now); err != nil {
+		stint, err := ensureCurrentStint(slot, now)
+		if stint == nil {
 			logger.Printf("进站停车后建立新 stint 失败(slot=%d): %v", slot, err)
 			return
+		}
+		if err != nil {
+			// 身份与起步时刻已有占位段保存，数据库失败由完圈队列重试，不能继续挡住完圈入队。
+			logger.Printf("进站起步 stint 已冻结，等待持久化重试(slot=%d): %v", slot, err)
 		}
 		obs.resumePending = false
 	}
@@ -109,9 +115,8 @@ func observePitVisit(slot int, inPit bool, update udp.CarUpdate, now time.Time) 
 		// 现场验证：真实赛道 sx_lemans 上沿维修道开进、停稳、开出，帧里依次是 0→3→3→…→0。
 		// 页面只对 PIT_LANE 加 lb-row-pit 高亮，发 2 会让行车中的车丢高亮。
 		conn.TrackStatus = 3
-	} else {
-		conn.TrackStatus = 0
 	}
+	// 区外连续观测不改出界状态；只有真实驶出维修区的上方分支清维修区状态。
 	obs.inPit, obs.stopped = inPit, stopped
 }
 

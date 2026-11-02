@@ -80,8 +80,11 @@ func generateLapTelemetry(carID int, trackLength int32, telemetryData []udp.CarU
 			return nil, fmt.Errorf("写入NSP失败: %v", err)
 		}
 
-		// 档位 - uint8（加1后存储，0 表示无效档位，与前端解析对应）
-		if err := binary.Write(buffer, binary.LittleEndian, uint8(data.Gear+1)); err != nil {
+		// 档位 - uint8：写报文原始字节，不加 1。
+		// 原始字节本身就按 0=倒挡、1=空挡、2=一挡……编码；analysis.js 里的 --gear 只是展示换算（2→1），
+		// 遇到 1（空挡）时沿用上一档。写端再加 1 会把 2 变成 3、展示成一档变二档。
+		// Live 帧同样按原值（leaderboard_projection 里 Gear = update.Gear&63），两处一致。
+		if err := binary.Write(buffer, binary.LittleEndian, uint8(data.Gear)); err != nil {
 			return nil, fmt.Errorf("写入档位失败: %v", err)
 		}
 

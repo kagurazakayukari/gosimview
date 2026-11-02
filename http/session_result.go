@@ -9,6 +9,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -100,6 +101,49 @@ func sessionIsTeamEvent(sessionID int) (bool, error) {
 		return false, err
 	}
 	return teamEvent.Valid && teamEvent.Int64 == 1, nil
+}
+
+// unassignedTeamStints 返回团队赛中未能关联 team_member 的 stint（车队归属未知）。
+func unassignedTeamStints(sessionID int) ([]int, error) {
+	rows, err := db.Query(`
+		SELECT ss.session_stint_id
+		FROM session_stint ss
+		LEFT JOIN team_member tm ON ss.team_member_id = tm.team_member_id
+		WHERE ss.session_id = ? AND tm.team_member_id IS NULL
+		ORDER BY ss.session_stint_id ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// requireTeamAssignment 团队赛榜单的前置校验：缺 team_member 直接失败，
+// 避免把多个车队归属未知的 stint 合并成 team_id=0 的一行假成绩。
+// 返回 false 时已经写出错误响应，调用方直接返回。
+func requireTeamAssignment(w http.ResponseWriter, sessionID int, dataField string) bool {
+	ids, err := unassignedTeamStints(sessionID)
+	if err != nil {
+		logger.Printf("查询团队归属失败(session=%d): %v", sessionID, err)
+		sendErrorResponse(w, http.StatusInternalServerError, "查询团队归属失败", dataField)
+		return false
+	}
+	if len(ids) == 0 {
+		return true
+	}
+	message := fmt.Sprintf("会话 %d 为团队赛，但 stint %v 缺少 team_member 关联，无法归属车队", sessionID, ids)
+	logger.Print(message)
+	sendErrorResponse(w, http.StatusInternalServerError, message, dataField)
+	return false
 }
 
 // dispatchSessionResource 分发 /api/ac/session/{id}/... 的各子资源
@@ -263,6 +307,9 @@ func handleRaceStandings(w http.ResponseWriter, sessionID int) {
 		sendErrorResponse(w, http.StatusInternalServerError, "查询失败", "standings")
 		return
 	}
+	if teamEvent && !requireTeamAssignment(w, sessionID, "standings") {
+		return
+	}
 	aggs, order, err := fetchSessionGroups(sessionID, teamEvent)
 	if err != nil {
 		logger.Printf("查询standings失败: %v", err)
@@ -312,15 +359,20 @@ func handleQualiStandings(w http.ResponseWriter, sessionID int) {
 		sendErrorResponse(w, http.StatusInternalServerError, "查询失败", "standings")
 		return
 	}
+	if teamEvent && !requireTeamAssignment(w, sessionID, "standings") {
+		return
+	}
+	// 从 session_stint 出发：只有无效圈或完全没有圈的车手也留在榜上（best 为 0，排尾）。
 	rows, err := db.Query(`
 		SELECT COALESCE(tm.team_id, 0) AS team_id, COALESCE(ss.user_id, 0) AS user_id,
 		       COALESCE(ss.car_id, 0) AS car_id, sl.stint_lap_id,
-		       COALESCE(sl.time, 0), COALESCE(sl.sector_1, 0), COALESCE(sl.sector_2, 0), COALESCE(sl.sector_3, 0)
-		FROM stint_lap sl
-		JOIN session_stint ss ON sl.stint_id = ss.session_stint_id
+		       sl.time, sl.sector_1, sl.sector_2, sl.sector_3
+		FROM session_stint ss
+		LEFT JOIN stint_lap sl ON sl.stint_id = ss.session_stint_id
+		     AND sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0 AND sl.time > 0
 		LEFT JOIN team_member tm ON ss.team_member_id = tm.team_member_id
-		WHERE ss.session_id = ? AND sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0 AND sl.time > 0
-		ORDER BY sl.stint_lap_id ASC`, sessionID)
+		WHERE ss.session_id = ?
+		ORDER BY ss.session_stint_id ASC, sl.stint_lap_id ASC`, sessionID)
 	if err != nil {
 		logger.Printf("查询quali standings失败: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "查询失败", "standings")
@@ -337,29 +389,39 @@ func handleQualiStandings(w http.ResponseWriter, sessionID int) {
 	var order []key
 	for rows.Next() {
 		var teamID, userID, carID int
-		var e standingQualiEntry
-		if err := rows.Scan(&teamID, &userID, &carID, &e.LapID, &e.BestLapTime, &e.Sector1, &e.Sector2, &e.Sector3); err != nil {
+		var lapID, lapTime, sec1, sec2, sec3 sql.NullInt64
+		if err := rows.Scan(&teamID, &userID, &carID, &lapID, &lapTime, &sec1, &sec2, &sec3); err != nil {
 			continue
 		}
 		k := key{teamID, userID, carID}
 		if teamEvent {
 			k = key{teamID: teamID}
 		}
-		e.TeamID, e.UserID, e.CarID = teamID, userID, carID
-		if teamEvent {
-			e.UserID = 0
-		}
 		b := bestByGroup[k]
 		if b == nil {
-			b = &best{entry: e}
+			b = &best{entry: standingQualiEntry{TeamID: teamID, UserID: userID, CarID: carID}}
+			if teamEvent {
+				b.entry.UserID = 0
+			}
 			bestByGroup[k] = b
 			order = append(order, k)
 		}
+		// 无效圈 / 无圈：实体保留，best 与 validLaps 都不因它增加
+		if !lapID.Valid || !lapTime.Valid || lapTime.Int64 <= 0 {
+			continue
+		}
 		b.validLaps++
-		if e.BestLapTime < b.entry.BestLapTime || b.entry.BestLapTime == 0 {
-			b.entry = e
-		} else if e.CarID != 0 && b.entry.CarID == 0 {
-			b.entry.CarID = e.CarID
+		if b.entry.BestLapTime == 0 || lapTime.Int64 < b.entry.BestLapTime {
+			b.entry.LapID = int(lapID.Int64)
+			b.entry.BestLapTime = lapTime.Int64
+			b.entry.Sector1 = sec1.Int64
+			b.entry.Sector2 = sec2.Int64
+			b.entry.Sector3 = sec3.Int64
+			if carID != 0 {
+				b.entry.CarID = carID
+			}
+		} else if carID != 0 && b.entry.CarID == 0 {
+			b.entry.CarID = carID
 		}
 	}
 
@@ -369,10 +431,23 @@ func handleQualiStandings(w http.ResponseWriter, sessionID int) {
 		e.ValidLaps = bestByGroup[k].validLaps
 		entries = append(entries, e)
 	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].BestLapTime < entries[j].BestLapTime })
+	// 有成绩的按最快圈升序，无成绩（0）排尾
+	sort.SliceStable(entries, func(i, j int) bool {
+		x, y := entries[i].BestLapTime, entries[j].BestLapTime
+		if (x == 0) != (y == 0) {
+			return y == 0
+		}
+		return x < y
+	})
 	if len(entries) > 0 {
 		sessionBest := entries[0].BestLapTime
 		for i := range entries {
+			if entries[i].BestLapTime == 0 {
+				// 无有效圈：差距不可比，统一用 -1
+				entries[i].Gap = -1
+				entries[i].Interval = -1
+				continue
+			}
 			entries[i].Gap = entries[i].BestLapTime - sessionBest
 			if i == 0 {
 				entries[i].Interval = 0
@@ -416,14 +491,22 @@ func handleSessionSectors(w http.ResponseWriter, sessionID int) {
 		sendErrorResponse(w, http.StatusInternalServerError, "查询失败", "sectors")
 		return
 	}
+	if teamEvent && !requireTeamAssignment(w, sessionID, "sectors") {
+		return
+	}
+	// 实体从 session_stint 出发；MIN 只取清洁圈（与 quali 同口径：cuts/crashes/car_crashes 均为 0），
+	// 无有效分段的实体保留为 0 行，由 fillSectorGaps 排尾。
 	rows, err := db.Query(`
 		SELECT COALESCE(tm.team_id, 0) AS team_id, COALESCE(ss.user_id, 0) AS user_id,
 		       COALESCE(ss.car_id, 0) AS car_id,
-		       MIN(NULLIF(sl.sector_1, 0)) AS s1,
-		       MIN(NULLIF(sl.sector_2, 0)) AS s2,
-		       MIN(NULLIF(sl.sector_3, 0)) AS s3
-		FROM stint_lap sl
-		JOIN session_stint ss ON sl.stint_id = ss.session_stint_id
+		       MIN(CASE WHEN sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0
+		                THEN NULLIF(sl.sector_1, 0) END) AS s1,
+		       MIN(CASE WHEN sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0
+		                THEN NULLIF(sl.sector_2, 0) END) AS s2,
+		       MIN(CASE WHEN sl.cuts = 0 AND sl.crashes = 0 AND sl.car_crashes = 0
+		                THEN NULLIF(sl.sector_3, 0) END) AS s3
+		FROM session_stint ss
+		LEFT JOIN stint_lap sl ON sl.stint_id = ss.session_stint_id
 		LEFT JOIN team_member tm ON ss.team_member_id = tm.team_member_id
 		WHERE ss.session_id = ?
 		GROUP BY tm.team_id, ss.user_id, ss.car_id`, sessionID)
@@ -470,15 +553,10 @@ func handleSessionSectors(w http.ResponseWriter, sessionID int) {
 	resp := sectorResponse{Sector1: []sectorResult{}, Sector2: []sectorResult{}, Sector3: []sectorResult{}}
 	for _, k := range order {
 		a := byKey[k]
-		if a.s1 > 0 {
-			resp.Sector1 = append(resp.Sector1, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s1})
-		}
-		if a.s2 > 0 {
-			resp.Sector2 = append(resp.Sector2, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s2})
-		}
-		if a.s3 > 0 {
-			resp.Sector3 = append(resp.Sector3, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s3})
-		}
+		// 无有效分段的实体也出榜（值 0），与其他榜单保持同一参赛名单
+		resp.Sector1 = append(resp.Sector1, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s1})
+		resp.Sector2 = append(resp.Sector2, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s2})
+		resp.Sector3 = append(resp.Sector3, sectorResult{TeamID: k.teamID, UserID: a.userID, CarID: a.carID, BestSectorTime: a.s3})
 	}
 	fillSectorGaps(resp.Sector1)
 	fillSectorGaps(resp.Sector2)
@@ -486,9 +564,21 @@ func handleSessionSectors(w http.ResponseWriter, sessionID int) {
 	sendSuccessResponse(w, "sectors获取成功", "sectors", resp)
 }
 
+// fillSectorGaps 补 gap/interval：有成绩的升序在前，值为 0 的排尾并标 -1。
 func fillSectorGaps(list []sectorResult) {
-	sort.SliceStable(list, func(i, j int) bool { return list[i].BestSectorTime < list[j].BestSectorTime })
+	sort.SliceStable(list, func(i, j int) bool {
+		x, y := list[i].BestSectorTime, list[j].BestSectorTime
+		if (x == 0) != (y == 0) {
+			return y == 0
+		}
+		return x < y
+	})
 	for i := range list {
+		if list[i].BestSectorTime <= 0 {
+			list[i].Gap = -1
+			list[i].Interval = -1
+			continue
+		}
 		if i == 0 {
 			continue
 		}
@@ -509,6 +599,9 @@ func handleSessionConsistency(w http.ResponseWriter, sessionID int) {
 	if err != nil {
 		logger.Printf("查询团队赛属性失败: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "查询失败", "laps")
+		return
+	}
+	if teamEvent && !requireTeamAssignment(w, sessionID, "laps") {
 		return
 	}
 	rows, err := db.Query(`
@@ -568,6 +661,9 @@ type pitstopEntry struct {
 
 func handleSessionPitstops(w http.ResponseWriter, sessionID int) {
 	teamEvent, _ := sessionIsTeamEvent(sessionID)
+	if teamEvent && !requireTeamAssignment(w, sessionID, "pitstops") {
+		return
+	}
 
 	// 团队赛需要 team_id：用会话内用户的 team_member 关系补全
 	teamByUser := map[int]int{}

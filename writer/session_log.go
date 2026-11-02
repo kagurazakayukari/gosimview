@@ -93,10 +93,8 @@ func parseLogMilliseconds(value string) int {
 	return min*60000 + sec*1000 + ms
 }
 
-// applyLogCuts 把日志里的切弯数落到“按 laptime 匹配的最近一条已完成圈”。
-// LAP 行之后紧跟的 LAP WITH CUTS 行会落在随后新建的空圈之后，这里必须回退查找
-// 已完成圈（Time>0），不能写到下圈的空记录上；匹配只依赖已累积的 stintLapData，
-// 因此 LAP 与 LAP WITH CUTS 允许落在不同的增量批次里。
+// applyLogCuts 仅用于接入前的历史日志回放，将紧跟 LAP 的 CUTS 写回最近完成的历史圈。
+// 在线路径不调用它：圈时、切弯和圈边界由 UDP 完圈提供，不拿日志圈时反查在线圈。
 func applyLogCuts(sid, slot, cuts, lapTime int) {
 	values := stintLapData[sid][slot]
 	for i := len(values) - 1; i >= 0; i-- {
@@ -109,6 +107,38 @@ func applyLogCuts(sid, slot, cuts, lapTime int) {
 		values[i].Cuts = cuts
 		return
 	}
+}
+
+// currentSlotLap 返回该槽位当前进行圈的记录（尾部 Time==0 的记录），必要时补一条空记录。
+// 在线阶段一圈只由 UDP 完圈结束（原版 ae390/af330），这里不会写入已完成的圈，
+// 因此历史回放的已完成圈不会被在线日志改写。
+func currentSlotLap(sid, slot int) *StintLap {
+	if stintLapData[sid] == nil {
+		stintLapData[sid] = make(map[int][]StintLap)
+	}
+	values := stintLapData[sid][slot]
+	if len(values) == 0 || values[len(values)-1].Time > 0 {
+		conn := globalConnections[slot]
+		if conn == nil {
+			return nil
+		}
+		values = append(values, StintLap{Tyre: userTyres[conn.DriverName], StintID: userStintIDs[conn.DriverName]})
+		stintLapData[sid][slot] = values
+	}
+	return &stintLapData[sid][slot][len(values)-1]
+}
+
+// currentLapForDisplay 只读当前圈（尾部 Time==0 的记录），不创建、不改写。
+// 投影发生在 stateMutex.RLock 下，不能调用会扩容切片的 currentSlotLap。
+func currentLapForDisplay(sid, slot int) *StintLap {
+	values := stintLapData[sid][slot]
+	if len(values) == 0 {
+		return nil
+	}
+	if last := &values[len(values)-1]; last.Time == 0 {
+		return last
+	}
+	return nil
 }
 
 // refreshRecoveredScores 在回放结束后按实际记录下来的已完成圈重算有效圈与最快圈。
@@ -173,16 +203,7 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 		stintLapData[sid] = make(map[int][]StintLap)
 	}
 	currentLap := func(slot int) *StintLap {
-		values := stintLapData[sid][slot]
-		if len(values) == 0 || values[len(values)-1].Time > 0 {
-			conn := globalConnections[slot]
-			if conn == nil {
-				return nil
-			}
-			values = append(values, StintLap{Tyre: userTyres[conn.DriverName], StintID: userStintIDs[conn.DriverName]})
-			stintLapData[sid][slot] = values
-		}
-		return &stintLapData[sid][slot][len(values)-1]
+		return currentSlotLap(sid, slot)
 	}
 	if !replay {
 		// 原连接日志是多行块；按整批匹配更新原断线判定使用的连接行号。
@@ -245,6 +266,11 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 			continue
 		}
 		if m := cutsLineRegex.FindStringSubmatch(line); len(m) >= 4 {
+			// 在线阶段 cuts 由完圈报文给出：不让日志行再去改写已完成圈（避免与报文比口径）。
+			// 只有回放需要它来恢复历史圈的有效性。
+			if !replay {
+				continue
+			}
 			slot := slotForLogName(m[1])
 			if slot >= 0 {
 				cuts, _ := strconv.Atoi(m[2])
@@ -271,6 +297,11 @@ func processSessionLogLinesAt(lines []string, replay bool, lineStart int) (int, 
 			continue
 		}
 		if m := lapLineRegex.FindStringSubmatch(line); len(m) == 5 {
+			// 在线阶段不消费 LAP 行：圈序只由 UDP 完圈驱动（原版 094170 仅处理 split/tyre），
+			// 否则日志与报文各开一条圈序，同一圈会被计两次。
+			if !replay {
+				continue
+			}
 			slot := slotForLogName(m[1])
 			if slot < 0 {
 				continue

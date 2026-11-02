@@ -48,16 +48,13 @@ func flushPendingLaps() error {
 	for len(pendingLaps) > 0 {
 		entry := pendingLaps[0]
 		if entry.needsLog {
-			// 日志尚未恢复：重读增量日志，成功后再补分段；仍失败则整队保留等下次重试。
+			// 原版在完圈那一刻消费当前圈对象，不保证任意延迟后还能把分段回绑到本圈。
+			// 这里只负责把日志读通，绝不再改写已冻结的分段，也不按圈时回找别圈。
 			if err := collectCarUpdates(); err != nil {
 				return fmt.Errorf("待处理圈等待日志恢复: %w", err)
 			}
-			supplementPendingLapFromLog(entry)
-			if entry.needsLog {
-				// 官方完圈优先落库；日志只有补充分段/碰撞，缺失时不阻塞成绩。
-				logger.Printf("待处理圈未匹配到日志分段，按官方完圈保存(slot=%d time=%d)", entry.slot, entry.record.Time)
-				entry.needsLog = false
-			}
+			entry.needsLog = false
+			logger.Printf("待处理圈按完圈时冻结的当前圈对象保存(slot=%d time=%d)", entry.slot, entry.record.Time)
 		}
 		if err := submitPendingLap(entry); err != nil {
 			return err
@@ -132,33 +129,9 @@ func submitPendingLap(entry *pendingLap) error {
 	return nil
 }
 
-// supplementPendingLapFromLog 用已读到内存的日志分段补齐待处理圈的分段/轮胎/碰撞。
-// 只按冻结的槽位与圈时匹配，不重新依赖 globalConnections 归属。调用者持有 stateMutex。
-func supplementPendingLapFromLog(entry *pendingLap) {
-	values := stintLapData[int(entry.sessionID)][entry.slot]
-	matched := false
-	for i := len(values) - 1; i >= 0; i-- {
-		v := values[i]
-		if v.Time <= 0 || v.Time != entry.record.Time {
-			continue
-		}
-		entry.record.Sector1, entry.record.Sector2, entry.record.Sector3 = v.Sector1, v.Sector2, v.Sector3
-		entry.record.Cuts = max(entry.record.Cuts, v.Cuts)
-		entry.carLap.Cuts = max(entry.carLap.Cuts, uint8(v.Cuts))
-		entry.record.Crashes, entry.record.CarCrashes = v.Crashes, v.CarCrashes
-		entry.carLap.Sector1, entry.carLap.Sector2, entry.carLap.Sector3 = v.Sector1, v.Sector2, v.Sector3
-		entry.carLap.Crashes, entry.carLap.CarCrashes = uint8(v.Crashes), uint8(v.CarCrashes)
-		if v.Tyre != "" {
-			entry.record.Tyre = v.Tyre
-			entry.carLap.Tyre = v.Tyre
-		}
-		matched = true
-		break
-	}
-	if matched {
-		entry.needsLog = false
-	}
-}
+// supplementPendingLapFromLog 已移除：它按圈时在日志里倒找分段，
+// 无法区分“日志超前/滞后、同圈时、UDP 丢包”这几种情况，会把别圈的分段/碰撞
+// 写到本圈上。分段现在在完圈那一刻随当前圈对象冻结，重试不再重新回绑。
 
 // startPendingLapRetry 周期性在后台重试待处理圈，不依赖 UDP 重发或探活节奏。
 // 与采集/探活共用 stateMutex，避免和车辆事件并发改动会话状态。
