@@ -1525,7 +1525,9 @@ func reloadServerConfigIfChanged() {
 			return
 		}
 	}
-	if entryChanged || configChanged || !entryListLoaded {
+	// 版本包先于会话信息到达，event 尚未持久化时不能创建带外键的车队。
+	// updateEventFromSessionInfo 会在保存 event 后完成首次车单加载。
+	if globalEvent != nil && globalEvent.ID > 0 && (entryChanged || configChanged || !entryListLoaded) {
 		if err := globalDBWriter.LoadEntryList(cfg.Game.Path); err != nil {
 			logger.Printf("重新加载车单失败: %v", err)
 			return

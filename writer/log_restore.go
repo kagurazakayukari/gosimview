@@ -23,7 +23,7 @@ func entryListLocked() bool {
 }
 
 // entryForGUID 按 GUID 反查 entry_list 条目。
-// entry_list 里的 GUID 可以是分号分隔的多人共享车组，取第一个可用值匹配。
+// entry_list 里的 GUID 可以是分号分隔的多人共享车组，每位成员都按精确 GUID 匹配。
 // 未锁定车单时车手可以选任意槽位，所以身份装饰不能只靠槽位下标。
 func entryForGUID(guid string) (EntryListDriver, bool) {
 	if guid == "" {
@@ -32,8 +32,10 @@ func entryForGUID(guid string) (EntryListDriver, bool) {
 	entryListMutex.Lock()
 	defer entryListMutex.Unlock()
 	for _, driver := range globalEntryList {
-		if firstGUID(driver.GUID) == guid {
-			return driver, true
+		for _, memberGUID := range strings.Split(driver.GUID, ";") {
+			if strings.TrimSpace(memberGUID) == guid {
+				return driver, true
+			}
 		}
 	}
 	return EntryListDriver{}, false

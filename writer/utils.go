@@ -179,7 +179,7 @@ func parseEntryTeam(raw string, useNumber bool) (name string, no int) {
 	}
 	parts := strings.SplitN(raw, "|", 2)
 	if len(parts) != 2 {
-		return "", 0
+		return raw, 0
 	}
 	no, err := strconv.Atoi(strings.TrimSpace(parts[0]))
 	teamName := strings.TrimSpace(parts[1])
@@ -251,7 +251,7 @@ func getUserIDByCarID(carID int) uint32 {
 }
 
 // getTeamIDByCarID 根据车辆槽位获取团队ID（团队赛事）。
-// 匹配规则：同一 event 下先按 entry_list 的车队名匹配，再退回按 entry_list 车型匹配团队车辆。
+// 锁定车单按槽位查条目，开放车单按当前连接 GUID 查条目；只按明确车队名关联。
 func getTeamIDByCarID(carID int) uint32 {
 	conn := peekConnection(carID)
 	if conn != nil && conn.TeamID > 0 {
@@ -261,13 +261,22 @@ func getTeamIDByCarID(carID int) uint32 {
 	entryListMutex.Lock()
 	entry, hasEntry := globalEntryList[carID]
 	entryListMutex.Unlock()
+	if !entryListLocked() {
+		if conn == nil {
+			return 0
+		}
+		entry, hasEntry = entryForGUID(conn.DriverGUID)
+	}
 	if !hasEntry {
 		return 0
 	}
 
 	useNumber := cfg != nil && cfg.ACServer.Event.Team.UseNumber
 	teamName, _ := parseEntryTeam(entry.Team, useNumber)
-	model := entry.Car
+	// TEAM 为空不代表可以按相同车型抢占其他车队。
+	if teamName == "" {
+		return 0
+	}
 
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
@@ -278,12 +287,6 @@ func getTeamIDByCarID(carID int) uint32 {
 		// 车队名直接命中
 		if teamName != "" && team.Name == teamName {
 			return uint32(team.ID)
-		}
-		// 退回到按车型匹配（team.CarID 是数据库 car_id）
-		if teamName == "" && model != "" {
-			if car, ok := globalCars[team.CarID]; ok && car != nil && car.Name == model {
-				return uint32(team.ID)
-			}
 		}
 	}
 	return 0

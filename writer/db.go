@@ -597,9 +597,6 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 		if driver.GUID != "" {
 			// 分割GUID列表
 			guids := strings.Split(driver.GUID, ";")
-			if len(guids) < 2 && cfg.ACServer.Event.Team.Enable {
-				return fmt.Errorf("车队成员需要至少2个有效的GUID，当前只找到%d个", len(guids))
-			}
 			for _, guid := range guids {
 				guid = strings.TrimSpace(guid)
 				if guid != "" && driver.Name != "" && len(guid) == 17 && strings.HasPrefix(guid, "7656") {
@@ -623,22 +620,17 @@ func (w *DBWriter) LoadEntryList(gamePath string) error {
 			}
 		}
 
-		if cfg.ACServer.Event.Team.Enable && driver.Team == "" {
-			return fmt.Errorf("%s缺少TEAM字段", section.Name())
-		}
-
 		if driver.Skin == "" {
 			return fmt.Errorf("%s缺少SKIN字段", section.Name())
 		}
 		// 团队事件处理
-		if cfg.ACServer.Event.Team.Enable && driver.GUID != "" {
+		// AC 车单不区分赛事模式；单成员和空 TEAM 都是合法输入。
+		// 空名称的槽位只保留个人身份，不创建虚构车队。
+		if cfg.ACServer.Event.Team.Enable && driver.GUID != "" && strings.TrimSpace(driver.Team) != "" {
 			// TEAM 字段：UseNumber 时为 "编号|车队名"，否则整串即车队名
 			teamName, teamNo := parseEntryTeam(driver.Team, cfg.ACServer.Event.Team.UseNumber)
 			if teamName == "" {
 				return fmt.Errorf("无效的车队格式 %s: %s. 预期 'no.|Team Name'", driver.Name, driver.Team)
-			}
-			if cfg.ACServer.Event.Team.UseNumber && teamNo <= 0 {
-				return fmt.Errorf("%s TEAM字段缺少合法车号: %s", section.Name(), driver.Team)
 			}
 
 			// 创建团队
@@ -828,7 +820,7 @@ func (w *DBWriter) CreateSessionStint(stint *SessionStint) (int64, error) {
 
 	// 车队赛的 team_member_id 是成绩分组键：写成 NULL 会让这段成绩在车队榜里消失。
 	// 只认段上冻结的 TeamEvent，不看当前 globalEvent——旧会话的排队圈重试时可能已经换节。
-	if stint.TeamEvent == 1 && stint.TeamMemberID <= 0 {
+	if stint.TeamEvent == 1 && stint.TeamID > 0 && stint.TeamMemberID <= 0 {
 		return 0, fmt.Errorf("车队赛 session_stint 缺少 team_member_id（event=%d team=%d user=%d slot=%d）",
 			stint.EventID, stint.TeamID, stint.UserID, stint.GameCarID)
 	}

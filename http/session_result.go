@@ -109,7 +109,7 @@ func unassignedTeamStints(sessionID int) ([]int, error) {
 		SELECT ss.session_stint_id
 		FROM session_stint ss
 		LEFT JOIN team_member tm ON ss.team_member_id = tm.team_member_id
-		WHERE ss.session_id = ? AND tm.team_member_id IS NULL
+		WHERE ss.session_id = ? AND ss.team_member_id > 0 AND tm.team_member_id IS NULL
 		ORDER BY ss.session_stint_id ASC`, sessionID)
 	if err != nil {
 		return nil, err
@@ -127,8 +127,8 @@ func unassignedTeamStints(sessionID int) ([]int, error) {
 	return ids, rows.Err()
 }
 
-// requireTeamAssignment 团队赛榜单的前置校验：缺 team_member 直接失败，
-// 避免把多个车队归属未知的 stint 合并成 team_id=0 的一行假成绩。
+// requireTeamAssignment 校验显式成员引用未悬空。
+// 空 TEAM 的个人段合法，榜单按 user/car 分开，不能并成 team_id=0 的假车队。
 // 返回 false 时已经写出错误响应，调用方直接返回。
 func requireTeamAssignment(w http.ResponseWriter, sessionID int, dataField string) bool {
 	ids, err := unassignedTeamStints(sessionID)
@@ -236,13 +236,13 @@ func fetchSessionGroups(sessionID int, teamEvent bool) (map[sessionGroup]*groupA
 			return nil, nil, err
 		}
 		key := sessionGroup{teamID: teamID, userID: userID, carID: carID}
-		if teamEvent {
+		if teamEvent && teamID > 0 {
 			key = sessionGroup{teamID: teamID}
 		}
 		a := aggs[key]
 		if a == nil {
 			a = &groupAgg{carID: carID, userID: userID}
-			if teamEvent {
+			if teamEvent && teamID > 0 {
 				a.userID = 0
 			}
 			aggs[key] = a
@@ -394,13 +394,13 @@ func handleQualiStandings(w http.ResponseWriter, sessionID int) {
 			continue
 		}
 		k := key{teamID, userID, carID}
-		if teamEvent {
+		if teamEvent && teamID > 0 {
 			k = key{teamID: teamID}
 		}
 		b := bestByGroup[k]
 		if b == nil {
 			b = &best{entry: standingQualiEntry{TeamID: teamID, UserID: userID, CarID: carID}}
-			if teamEvent {
+			if teamEvent && teamID > 0 {
 				b.entry.UserID = 0
 			}
 			bestByGroup[k] = b
@@ -531,13 +531,13 @@ func handleSessionSectors(w http.ResponseWriter, sessionID int) {
 			continue
 		}
 		k := key{teamID, userID, carID}
-		if teamEvent {
+		if teamEvent && teamID > 0 {
 			k = key{teamID: teamID}
 		}
 		a := byKey[k]
 		if a == nil {
 			a = &acc{carID: carID, userID: userID}
-			if teamEvent {
+			if teamEvent && teamID > 0 {
 				a.userID = 0
 			}
 			byKey[k] = a
@@ -629,13 +629,13 @@ func handleSessionConsistency(w http.ResponseWriter, sessionID int) {
 			continue
 		}
 		k := key{teamID, userID, carID}
-		if teamEvent {
+		if teamEvent && teamID > 0 {
 			k = key{teamID: teamID}
 		}
 		e := byKey[k]
 		if e == nil {
 			e = &consistencyEntry{TeamID: teamID, UserID: userID, CarID: carID, LapTimes: []int64{}}
-			if teamEvent {
+			if teamEvent && teamID > 0 {
 				e.UserID = 0
 			}
 			byKey[k] = e
@@ -752,14 +752,12 @@ func handleSessionStints(w http.ResponseWriter, sessionID, userID, carID, teamID
 	var rows *sql.Rows
 	var err error
 	if teamMode {
-		// 兼容 writer 可能把 team_member_id 记为 0 的情况，同时按 user_id 归属团队
+		// 仅按段上冻结的成员外键归队，不能把同一车手的个人段或别队段拉进来。
 		rows, err = db.Query(`SELECT session_stint_id, user_id, car_id, COALESCE(laps, 0), COALESCE(valid_laps, 0), best_lap_id
 			FROM session_stint
-			WHERE session_id = ? AND (
+			WHERE session_id = ? AND
 				team_member_id IN (SELECT team_member_id FROM team_member WHERE team_id = ?)
-				OR user_id IN (SELECT user_id FROM team_member WHERE team_id = ?)
-			)
-			ORDER BY session_stint_id ASC`, sessionID, teamID, teamID)
+			ORDER BY session_stint_id ASC`, sessionID, teamID)
 	} else {
 		rows, err = db.Query(`SELECT session_stint_id, user_id, car_id, COALESCE(laps, 0), COALESCE(valid_laps, 0), best_lap_id
 			FROM session_stint

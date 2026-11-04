@@ -110,7 +110,7 @@ func persistStint(stint *SessionStint) error {
 	if stint.ID == 0 {
 		// 车队赛的成员解析只认段上冻结的 (TeamID, UserID)：
 		// 重试期间可能已经换节或换人，用当时的 globalEvent/新 conn 会把圈串到别的队伍。
-		if stint.TeamEvent == 1 && stint.TeamMemberID <= 0 {
+		if stint.TeamEvent == 1 && stint.TeamID > 0 && stint.TeamMemberID <= 0 {
 			member := findTeamMemberForStint(stint)
 			if member == nil {
 				return fmt.Errorf("车队赛 stint 缺少 team_member 映射（event=%d team=%d user=%d slot=%d）",
